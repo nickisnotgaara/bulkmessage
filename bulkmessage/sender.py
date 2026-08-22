@@ -35,35 +35,77 @@ def _try_acquire_lock() -> Optional[Path]:
     lock_path = Path(config.LOCK_PATH)
     try:
         if lock_path.exists():
-            # Проверим, не умер ли предыдущий владелец
+            # Lock format: "<pid>:<hostname>" — hostname нужен чтоб различать
+            # контейнеры, у которых внутри всегда PID 1.
             try:
-                old_pid = int(lock_path.read_text(encoding="utf-8").strip())
-                # На Windows os.kill с pid не работает для проверки,
-                # но signal.SIGTERM = None для win32, так что простой подход:
-                # если процесс не существует — перезаписать.
-                if not _pid_alive(old_pid):
+                old_content = lock_path.read_text(encoding="utf-8").strip()
+                old_hostname = ""
+                if ":" in old_content:
+                    old_pid_str, old_hostname = old_content.split(":", 1)
+                    try:
+                        old_pid = int(old_pid_str)
+                    except ValueError:
+                        old_pid = 0
+                else:
+                    old_pid = 0
+                current_hostname = _container_hostname()
+                # Если hostname другой — это другой контейнер, проверим PID
+                if old_hostname and old_hostname != current_hostname:
+                    if _pid_alive(old_pid):
+                        log.error(
+                            f"⛔ Sender запущен в ДРУГОМ контейнере "
+                            f"(hostname={old_hostname}, PID={old_pid}). "
+                            f"Второй запуск отменён."
+                        )
+                        return None
+                    else:
+                        log.warning(
+                            f"⚠️  Stale lock от другого контейнера "
+                            f"(hostname={old_hostname}), перезаписываю"
+                        )
+                elif not _pid_alive(old_pid):
                     log.warning(
-                        f"⚠️  Stale lock от PID {old_pid} (процесс мёртв), перезаписываю"
+                        f"⚠️  Stale lock от PID {old_pid} (процесс мёртв), "
+                        f"перезаписываю"
                     )
                 else:
                     log.error(
-                        f"⛔ Sender уже запущен (PID {old_pid}, lock={lock_path}). "
+                        f"⛔ Sender уже запущен (PID={old_pid}, "
+                        f"hostname={old_hostname or '?'}, lock={lock_path}). "
                         f"Второй запуск отменён."
                     )
                     return None
             except (ValueError, OSError) as e:
                 log.warning(f"⚠️  Битый lock-файл ({e}), перезаписываю")
-        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+        # Пишем "<pid>:<hostname>" чтобы при следующем старте можно было отличить
+        lock_content = f"{os.getpid()}:{_container_hostname()}"
+        lock_path.write_text(lock_content, encoding="utf-8")
         return lock_path
     except (PermissionError, OSError) as e:
         log.error(f"⛔ Не могу создать lock-файл: {e}")
         return None
 
 
+def _container_hostname() -> str:
+    """Возвращает hostname контейнера (или имя машины если не в контейнере).
+
+    Используется для различения lock-ов из разных контейнеров, у которых
+    внутри всегда PID 1. Без hostname sender думает что любой PID 1 — это он.
+    """
+    try:
+        # В Docker hostname = container ID (первые 12 символов SHA256)
+        return os.environ.get("HOSTNAME", "") or __import__("socket").gethostname()
+    except Exception:
+        return "unknown"
+
+
 def _pid_alive(pid: int) -> bool:
     """True если процесс с PID существует (кросс-платформенно)."""
     if pid <= 0:
         return False
+    # Короткий путь: текущий процесс точно жив
+    if pid == os.getpid():
+        return True
     try:
         if os.name == "nt":
             # Windows: используем tasklist через subprocess или ctypes
@@ -103,12 +145,19 @@ def _release_lock(lock_path: Optional[Path]) -> None:
     if lock_path is None:
         return
     try:
-        # Удаляем только если наш PID
         if lock_path.exists():
             try:
+                # Проверяем, что lock создан НАШИМ процессом.
+                # Формат lock-а: "<pid>:<hostname>" (новый) или "<pid>" (старый).
+                content = lock_path.read_text(encoding="utf-8").strip()
                 our_pid = str(os.getpid())
-                if lock_path.read_text(encoding="utf-8").strip() == our_pid:
+                if content == our_pid:
                     lock_path.unlink()
+                elif ":" in content:
+                    file_pid, _ = content.split(":", 1)
+                    if file_pid == our_pid:
+                        lock_path.unlink()
+                # иначе: lock чужой — не трогаем
             except (OSError, ValueError):
                 pass
     except Exception as e:
