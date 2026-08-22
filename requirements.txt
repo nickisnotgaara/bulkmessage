@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+gspread>=6.0
+google-auth>=2.27
+requests>=2.31
+openpyxl>=3.1

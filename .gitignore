@@ -1,0 +1,116 @@
+# ============================================================
+# SECRETS / CREDENTIALS — никогда не должны попасть в репо
+# ============================================================
+
+# Environment files (содержат токены, chat_id, sheet_id)
+.env
+.env.local
+.env.docker
+.env.development
+.env.production
+*.env
+!.env.example
+
+# Google Service Account credentials
+credentials.json
+credentials-*.json
+*-credentials.json
+gcp-key.json
+service-account*.json
+
+# SSL / TLS / private keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+*.keystore
+
+# Любые файлы с токенами (защита на случай если забыл переименовать)
+*token*
+*secret*
+*password*
+*api-key*
+*apikey*
+
+# ============================================================
+# DATA — содержит реальные контакты, историю рассылок, ответы
+# ============================================================
+
+# Вся папка data/ (Excel с контактами, SQLite, логи, state, lock, dryrun)
+data/
+# Кроме плейсхолдеров для тестов
+!data/.gitkeep
+!data/Message_script.example.md
+
+# SQLite базы
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Логи
+*.log
+data/*.log
+
+# ============================================================
+# PYTHON
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# ============================================================
+# IDE / EDITORS
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# OS
+# ============================================================
+*.bak
+*.tmp
+*.orig
+*.rej
+
+# ============================================================
+# PROJECT-SPECIFIC
+# ============================================================
+# Lock-файл sender-а (защита от двойного запуска)
+data/sender.lock
+data/*.lock
+*.lock
+
+# Dry-run расписания (может содержать телефоны)
+data/dryrun_schedule.json
+data/dryrun_*.json
+
+# State-файлы рассылки (вдруг лежат не в data/)
+broadcast_state.json
+sender.lock
+*.state.json
