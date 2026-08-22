@@ -268,7 +268,14 @@ finally:
 with patch.object(config, "STATE_PATH", "Z:/nonexistent/path/state.json"):
     s = state.load_state()
     check("load_state на отсутствующем файле → пустой dict без падения",
-          s["sent_today"] == {})
+          s["sent_phones"] == set() if False else s["sent_today"] == {})
+
+# Защита от дублей: проверяем, что код в sender.py содержит guard
+sender_src_check = Path("bulkmessage/sender.py").read_text(encoding="utf-8")
+check("sender.py содержит защиту от дублей (crm.db пустая)",
+      "ЗАЩИТА ОТ ДУБЛЕЙ" in sender_src_check)
+check("sender.py проверяет BULK_SKIP_DUP_PROTECTION env",
+      "BULK_SKIP_DUP_PROTECTION" in sender_src_check)
 
 # ---------------------------------------------------------------------------
 # E. PHONE NORMALIZATION

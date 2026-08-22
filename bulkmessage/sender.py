@@ -452,6 +452,23 @@ def run() -> None:
     with db.db_conn() as conn:
         sent_phones = db.get_sent_phones(conn)
 
+    # ЗАЩИТА ОТ ДУБЛЕЙ: если crm.db пустая, но в Excel много контактов — это подозрительно.
+    # Скорее всего забыли залить базу с историей → все 4000+ контактов уйдут в рассылку
+    # повторно. Лучше остановиться и спросить.
+    if len(sent_phones) == 0 and len(all_contacts) > 100:
+        log.critical(
+            f"🛑 ЗАЩИТА ОТ ДУБЛЕЙ: crm.db ПУСТАЯ (0 уникальных контактов в истории), "
+            f"но в Excel {len(all_contacts)} контактов. Похоже, база с историей "
+            f"не залита на сервер. Если запустить — все контакты получат повторную "
+            f"рассылку. ОСТАНОВКА. Залейте crm.db: "
+            f"scp data/crm.db user@server:/opt/bulkmessage/data/crm.db"
+        )
+        log.critical("💡 Если это ДЕЙСТВИТЕЛЬНО первый запуск (никогда раньше не слали) — "
+                    "поставьте BULK_SKIP_DUP_PROTECTION=1 в .env.local и перезапустите.")
+        if not os.environ.get("BULK_SKIP_DUP_PROTECTION"):
+            return
+        log.warning("⚠️  BULK_SKIP_DUP_PROTECTION=1 — защита отключена, продолжаю")
+
     log.info("=" * 70)
     log.info("📊 СТАТИСТИКА ЗАПУСКА:")
     log.info(f"   • Excel-файл: {config.EXCEL_PATH}")
