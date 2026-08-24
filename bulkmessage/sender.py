@@ -827,13 +827,19 @@ def run() -> None:
                 target = current_state.get("target_today", config.TARGET_SUCCESS_PER_DAY)
                 log.info(f"  📈 Прогресс: {successful}/{target} успешных сегодня")
 
-            # Пауза между контактами
-            delay = random.uniform(config.DELAY_MIN, config.DELAY_MAX)
-            if random.random() < 0.10:
-                delay += random.uniform(30, 90)
-                log.info(f"  💤 Удлинённая пауза {_fmt_duration(delay)} (анти-бан)")
+            # Пауза между контактами:
+            # - Если контакт не доставлен (мёртвый) → короткая пауза (5-15 сек), быстро идём к next
+            # - Если доставлен → нормальная пауза (3-7 мин) — анти-бан
+            if not sent_ok:
+                delay = random.uniform(5, 15)
+                log.info(f"  ⏩ Пропускаем быстро ({_fmt_duration(delay)}) — контакт мёртвый")
             else:
-                log.info(f"  💤 Пауза между контактами: {_fmt_duration(delay)}")
+                delay = random.uniform(config.DELAY_MIN, config.DELAY_MAX)
+                if random.random() < 0.10:
+                    delay += random.uniform(30, 90)
+                    log.info(f"  💤 Удлинённая пауза {_fmt_duration(delay)} (анти-бан)")
+                else:
+                    log.info(f"  💤 Пауза между контактами: {_fmt_duration(delay)}")
             time.sleep(delay)
 
             total_sent = sum(current_state.get("sent_today", {}).values())
