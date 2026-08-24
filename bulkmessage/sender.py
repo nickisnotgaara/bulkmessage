@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from . import config, contacts, db, sheets, state, templates, wappi
+from . import config, contacts, db, bad_phones, sheets, state, templates, wappi
 from .sheets import sync_message_to_sheet
 from .wappi import ErrorKind
 
@@ -322,6 +322,10 @@ def _persist_failure(phone: str, name: str, category: str, channel: str,
                 last_error=detail[:500],
                 sent_at=None,
             )
+            # Если это PERMANENT — добавляем в bad_phones cache
+            if error_kind == "permanent" and phone and channel:
+                if bad_phones.mark_bad(phone, channel):
+                    log.debug(f"      📝 bad_phones: {phone} × {channel} помечен как мёртвый")
     except Exception as e:
         log.warning(f"      ⚠️ Не удалось записать failed в БД: {e}")
 
@@ -347,15 +351,25 @@ def _run_one_contact(
     category = contact.get("category", "") or "—"
     text = templates.build_message(contact, templates.load_templates())
 
+    # Если ВСЕ активные каналы уже в bad_phones — skip'аем сразу (0 API calls)
+    not_fully_bad = [ch for ch in channels if not bad_phones.is_fully_bad(phone, {ch}) and ch not in permanent_skipped.get(phone, set())]
+    if not not_fully_bad and channels:
+        log.info(
+            f"⏭️  SKIP {phone} ({name}, {category}) — все каналы в bad_phones cache. "
+            f"Без попыток."
+        )
+        return False
+
     available = [
         ch for ch in channels
         if state.channel_has_quota(current_state, ch)
         and ch not in permanent_skipped.get(phone, set())
+        and not bad_phones.is_bad(phone, ch)
     ]
     if not available:
         log.info(
             f"⏭️  SKIP {phone} ({name}, {category}) — нет доступных каналов "
-            f"(квоты/бэкофф/permanent). backoffs={backoffs}"
+            f"(квоты/бэкофф/permanent/bad_phones). backoffs={backoffs}"
         )
         return False
 
@@ -473,6 +487,14 @@ def run() -> None:
     # Подключаем Telegram-логгер (если задан токен в env)
     from . import tglog
     tglog.install_handler()
+
+    # Загружаем кэш мёртвых номеров (если файл есть) + миграция из crm.db
+    bad_phones.load()
+    migrated = bad_phones.migrate_from_db(set(wappi.active_channels()))
+    log.info(
+        f"Bad phones cache: {bad_phones.count()} контактов в кэше"
+        + (f" (мигрировано {migrated} из crm.db)" if migrated else "")
+    )
 
     templates_map = templates.load_templates()
     channels = wappi.active_channels()

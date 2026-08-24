@@ -177,6 +177,9 @@ DRY_RUN = os.environ.get("BULK_DRY_RUN", "0").strip().lower() in ("1", "true", "
 
 REPLY_SEPARATOR = "\n----------------\n"
 
+# Bad phones cache (для skip'а мёртвых номеров, см. bad_phones.py)
+BAD_PHONES_PATH = os.environ.get("BULK_BAD_PHONES_PATH", str(DATA_DIR / "bad_phones.json"))
+
 try:
     from zoneinfo import ZoneInfo
     _DEFAULT_TZ = ZoneInfo(os.environ.get("BULK_TIMEZONE", "Europe/Moscow"))

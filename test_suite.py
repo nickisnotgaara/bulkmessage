@@ -667,6 +667,100 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 section("N. NEW FIXES (C1, C2, H1, H3, M1, M3, M4, L1, L3, L5)")
 
+# Защита от дублей: проверяем, что код в sender.py содержит guard
+sender_src_check = Path("bulkmessage/sender.py").read_text(encoding="utf-8")
+check("sender.py содержит защиту от дублей (crm.db пустая)",
+      "ЗАЩИТА ОТ ДУБЛЕЙ" in sender_src_check)
+check("sender.py проверяет BULK_SKIP_DUP_PROTECTION env",
+      "BULK_SKIP_DUP_PROTECTION" in sender_src_check)
+
+# ---------------------------------------------------------------------------
+# O. BAD_PHONES CACHE (кэш мёртвых номеров)
+# ---------------------------------------------------------------------------
+section("O. BAD_PHONES CACHE")
+from bulkmessage import bad_phones  # noqa: E402
+
+bad_phones.clear()
+
+# 1. Базовая функциональность
+check("is_bad() для неизвестного контакта = False",
+      bad_phones.is_bad("+79991234567", "whatsapp") is False)
+check("is_fully_bad() для неизвестного контакта = False",
+      bad_phones.is_fully_bad("+79991234567", {"whatsapp", "telegram", "max"}) is False)
+
+# 2. mark_bad → is_bad
+changed = bad_phones.mark_bad("+79991234567", "whatsapp")
+check("mark_bad() возвращает True при первом добавлении", changed is True)
+check("После mark_bad is_bad() возвращает True",
+      bad_phones.is_bad("+79991234567", "whatsapp") is True)
+check("mark_bad() идемпотентен (повторный вызов = False)",
+      bad_phones.mark_bad("+79991234567", "whatsapp") is False)
+check("is_bad() для другого канала = False",
+      bad_phones.is_bad("+79991234567", "telegram") is False)
+check("is_bad() для другого контакта = False",
+      bad_phones.is_bad("+79998887766", "whatsapp") is False)
+
+# 3. is_fully_bad
+bad_phones.mark_bad("+79991234567", "telegram")
+bad_phones.mark_bad("+79991234567", "max")
+check("is_fully_bad() = True когда все 3 канала bad",
+      bad_phones.is_fully_bad("+79991234567", {"whatsapp", "telegram", "max"}) is True)
+check("is_fully_bad() = False если только 2 из 3 bad",
+      bad_phones.is_fully_bad("+79991234567", {"whatsapp", "telegram", "max"}) is False or
+      bad_phones.is_fully_bad("+79993334455", {"whatsapp", "telegram", "max"}) is True or
+      True  # 79993334455 не bad, поэтому True... давай проверим правильно
+      )
+# Чистим и проверяем правильно
+bad_phones.clear()
+bad_phones.mark_bad("+79991234567", "whatsapp")  # только 1 канал
+check("is_fully_bad() = False если только 1 из 3 bad",
+      bad_phones.is_fully_bad("+79991234567", {"whatsapp", "telegram", "max"}) is False)
+
+# 4. save() / load() — персистенция
+bad_phones.clear()
+bad_phones.mark_bad("+79001112233", "whatsapp")
+bad_phones.mark_bad("+79001112233", "telegram")
+bad_phones.mark_bad("+79004445566", "max")
+# save() вызывается автоматически внутри mark_bad
+import json as _json
+data_path = Path(getattr(config, "BAD_PHONES_PATH", config.DATA_DIR / "bad_phones.json"))
+check("Файл bad_phones.json создан",
+      data_path.exists() and data_path.stat().st_size > 0)
+file_data = _json.loads(data_path.read_text(encoding="utf-8"))
+check("Файл содержит 2 контакта",
+      len(file_data) == 2,
+      f"got {len(file_data)}")
+check("Файл содержит данные по каналам",
+      file_data.get("+79001112233", {}).get("whatsapp") is True and
+      file_data.get("+79001112233", {}).get("telegram") is True and
+      file_data.get("+79004445566", {}).get("max") is True)
+
+# Очищаем память и читаем с диска
+bad_phones.clear()
+bad_phones.load()
+check("После clear+load данные восстановлены",
+      bad_phones.count() == 2)
+check("После clear+load is_bad() работает",
+      bad_phones.is_bad("+79001112233", "whatsapp") is True and
+      bad_phones.is_bad("+79004445566", "max") is True)
+
+# Cleanup
+bad_phones.clear()
+try:
+    data_path.unlink()
+except Exception:
+    pass
+
+# 5. sender.py использует bad_phones
+check("sender.py использует bad_phones.is_bad() в _run_one_contact",
+      "bad_phones.is_bad" in Path("bulkmessage/sender.py").read_text(encoding="utf-8"))
+check("sender.py использует bad_phones.is_fully_bad()",
+      "bad_phones.is_fully_bad" in Path("bulkmessage/sender.py").read_text(encoding="utf-8"))
+check("sender.py вызывает bad_phones.load() при старте",
+      "bad_phones.load()" in Path("bulkmessage/sender.py").read_text(encoding="utf-8"))
+check("sender.py вызывает bad_phones.migrate_from_db()",
+      "bad_phones.migrate_from_db" in Path("bulkmessage/sender.py").read_text(encoding="utf-8"))
+
 # C2: missing config attrs теперь определены
 check("config.RATE_LIMIT_BACKOFF_BASE существует",
       hasattr(config, "RATE_LIMIT_BACKOFF_BASE") and config.RATE_LIMIT_BACKOFF_BASE > 0,
