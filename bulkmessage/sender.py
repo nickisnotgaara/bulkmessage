@@ -271,11 +271,7 @@ def _persist_success(phone: str, name: str, category: str, channel: str,
     """
     state.increment_channel_sent(current_state, channel)
     state.save_state(current_state)
-    # Считаем contact как "successful" ОДИН раз (при первой успешной отправке)
-    if not counted_successful:
-        state.increment_successful(current_state)
-        counted_successful = True
-    # Sync to Sheets happens outside this function
+    # NOTE: increment_successful() вызывается в _run_one_contact, не здесь
     try:
         with db.db_conn() as conn:
             contact_id = db.upsert_contact(conn, phone, name, category)
@@ -424,6 +420,11 @@ def _run_one_contact(
             )
             _persist_success(phone, name, category, channel, text, message_id, current_state)
             sent_any = True
+            # Считаем contact как "successful" ОДИН раз (при первой успешной отправке)
+            if not counted_successful:
+                state.increment_successful(current_state)
+                state.save_state(current_state)
+                counted_successful = True
             continue
 
         kind = wappi.classify_error(detail, http_status)
