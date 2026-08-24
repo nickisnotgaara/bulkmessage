@@ -204,6 +204,12 @@ def now_tz() -> datetime:
 ACTIVE_HOURS_START = int(os.environ.get("BULK_ACTIVE_HOURS_START", "0"))
 ACTIVE_HOURS_END = int(os.environ.get("BULK_ACTIVE_HOURS_END", "0"))
 
+# Target: сколько УСПЕШНЫХ контактов нужно в день (1+ канал доставлен = успех).
+# Sender работает пока не достигнет target, не кончатся контакты, или не выйдет из активного окна.
+TARGET_SUCCESS_PER_DAY = int(os.environ.get("BULK_TARGET_SUCCESS_PER_DAY", "60"))
+# Safety cap: максимум попыток в день (чтоб не долбить 24/7 если данные плохие).
+MAX_ATTEMPTS_PER_DAY = int(os.environ.get("BULK_MAX_ATTEMPTS_PER_DAY", "200"))
+
 
 def is_within_active_hours(dt: datetime | None = None) -> bool:
     """True если dt (или сейчас) попадает в [ACTIVE_HOURS_START, ACTIVE_HOURS_END).

@@ -271,6 +271,11 @@ def _persist_success(phone: str, name: str, category: str, channel: str,
     """
     state.increment_channel_sent(current_state, channel)
     state.save_state(current_state)
+    # Считаем contact как "successful" ОДИН раз (при первой успешной отправке)
+    if not counted_successful:
+        state.increment_successful(current_state)
+        counted_successful = True
+    # Sync to Sheets happens outside this function
     try:
         with db.db_conn() as conn:
             contact_id = db.upsert_contact(conn, phone, name, category)
@@ -384,6 +389,8 @@ def _run_one_contact(
     log.info("─" * 70)
 
     sent_any = False
+    # Маркер: уже инкрементировали successful_today для этого контакта (чтоб при 2+ успешных каналах не считать дважды)
+    counted_successful = False
 
     for channel in available:
         ch_count_sent = state.channel_sent_today(current_state, channel)
@@ -767,31 +774,45 @@ def run() -> None:
             if any(v > 0 for v in backoffs.values()):
                 _wait_for_backoffs(backoffs, log)
 
-            # Активное окно (например, 10:00-20:00 МСК): вне его спим до начала
+            # Активное окно (например, 10:00-22:00 МСК): вне его спим до начала
             if _wait_until_active_window(log):
                 # После ожидания сбрасываем состояние (мог начаться новый день)
                 current_state = state.load_state()
                 current_state = state.reset_daily_if_new_day(current_state)
 
-            # Если все квоты исчерпаны — ждём до полуночи
-            if state.all_quotas_exhausted(current_state, channels):
-                secs = _seconds_until_midnight()
+            # 🎯 ГЛАВНАЯ ЦЕЛЬ: достичь target_today успешных контактов
+            if state.target_reached(current_state):
+                successful = state.successful_today(current_state)
+                target = current_state.get("target_today", config.TARGET_SUCCESS_PER_DAY)
                 log.info(
-                    f"🛑 Все дневные квоты исчерпаны ({current_state.get('sent_today', {})}). "
-                    f"Ждём {secs / 3600:.1f}ч до полуночи..."
+                    f"🎯 ЦЕЛЬ ДОСТИГНУТА: {successful}/{target} успешных контактов сегодня. "
+                    f"Остановка до завтра."
                 )
-                # TG: уведомляем один раз за день (можно и спамить, но это WARNING)
                 tglog.send(
-                    f"🛑 Квоты исчерпаны за {secs / 3600:.1f}ч до полуночи: "
-                    f"{current_state.get('sent_today', {})}. "
-                    f"Жду до полуночи, потом продолжу.",
+                    f"🎯 Рассылка за {datetime.now().strftime('%Y-%m-%d')}: "
+                    f"{successful}/{target} успешных контактов. Цель достигнута!",
+                    "INFO",
+                )
+                break  # Done for today
+
+            # Safety cap: слишком много попыток за день
+            if state.max_attempts_reached(current_state):
+                attempts = state.attempts_today(current_state)
+                successful = state.successful_today(current_state)
+                log.info(
+                    f"🛑 Достигнут SAFETY CAP: {attempts} попыток за день, "
+                    f"{successful} успешных. Остановка."
+                )
+                tglog.send(
+                    f"🛑 SAFETY CAP: {attempts} попыток, {successful} успешных. "
+                    f"Остановка до завтра.",
                     "WARNING",
                 )
-                slept = 0.0
-                while slept < secs and not stop_requested["v"]:
-                    time.sleep(min(300, secs - slept))
-                    slept += 300
-                continue
+                break
+
+            # Учитываем попытку (счётчик attempts_today)
+            state.increment_attempts(current_state)
+            state.save_state(current_state)
 
             sent_ok = _run_one_contact(
                 contact, channels, backoffs, permanent_skipped, current_state
@@ -799,6 +820,11 @@ def run() -> None:
 
             if not sent_ok:
                 log.info(f"  ↪️ Не доставлено никому (нет доступных каналов)")
+            else:
+                # Логируем прогресс
+                successful = state.successful_today(current_state)
+                target = current_state.get("target_today", config.TARGET_SUCCESS_PER_DAY)
+                log.info(f"  📈 Прогресс: {successful}/{target} успешных сегодня")
 
             # Пауза между контактами
             delay = random.uniform(config.DELAY_MIN, config.DELAY_MAX)

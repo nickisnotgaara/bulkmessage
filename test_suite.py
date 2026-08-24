@@ -138,10 +138,13 @@ dt_1959 = datetime(2026, 8, 22, 19, 59, tzinfo=moscow)
 check("19:59 MSK → в окне", config.is_within_active_hours(dt_1959) is True)
 # 20:00 — ровно конец, ВНЕ (end exclusive)
 dt_20 = datetime(2026, 8, 22, 20, 0, tzinfo=moscow)
-check("20:00 MSK → вне окна (end exclusive)", config.is_within_active_hours(dt_20) is False)
+check("20:00 MSK → в окне (10-22)", config.is_within_active_hours(dt_20) is True)
 # Полночь — глубоко вне
 dt_midnight = datetime(2026, 8, 22, 0, 0, tzinfo=moscow)
 check("00:00 MSK → вне окна", config.is_within_active_hours(dt_midnight) is False)
+# 22:00 — вне (end exclusive)
+dt_22 = datetime(2026, 8, 22, 22, 0, tzinfo=moscow)
+check("22:00 MSK → вне окна (end exclusive)", config.is_within_active_hours(dt_22) is False)
 # Сколько ждать с 09:30?
 wait = config.seconds_until_active_window(datetime(2026, 8, 22, 9, 30, tzinfo=moscow))
 check(
@@ -152,11 +155,11 @@ check(
 # С 10:00 — 0
 wait0 = config.seconds_until_active_window(dt_10)
 check("Wait от 10:00 = 0", wait0 == 0, f"got {wait0}")
-# С 21:00 — ждать до завтрашнего 10:00 = 14ч = 50400с
-wait_late = config.seconds_until_active_window(dt_20)
+# С 22:00 — ждать до завтрашнего 10:00 = 12ч
+wait_late = config.seconds_until_active_window(dt_22)
 check(
-    "Wait от 20:00 = 14ч до следующего 10:00",
-    abs(wait_late - 14 * 3600) < 60,
+    "Wait от 22:00 = 12ч до следующего 10:00",
+    abs(wait_late - 12 * 3600) < 60,
     f"got {wait_late}с = {wait_late/3600:.1f}ч",
 )
 
@@ -244,6 +247,26 @@ try:
             "reset_daily_if_new_day НЕ трогает сегодняшние квоты",
             s7["sent_today"].get("whatsapp") == 42,
         )
+
+        # NEW: successful_today counter
+        s6["successful_today"] = 0
+        s6["attempts_today"] = 0
+        s6["target_today"] = 60
+        check("successful_today() = 0 на старте",
+              state.successful_today(s6) == 0)
+        state.increment_successful(s6)
+        check("increment_successful +1",
+              state.successful_today(s6) == 1)
+        check("target_reached() = False при 1/60",
+              state.target_reached(s6) is False)
+        s6["successful_today"] = 60
+        check("target_reached() = True при 60/60",
+              state.target_reached(s6) is True)
+        check("max_attempts_reached() = False при attempts < 200",
+              state.max_attempts_reached(s6) is False)
+        s6["attempts_today"] = 200
+        check("max_attempts_reached() = True при attempts = 200",
+              state.max_attempts_reached(s6) is True)
 finally:
     Path(tmp_state_path).unlink(missing_ok=True)
 
@@ -258,7 +281,13 @@ try:
         s = state.load_state()
         check(
             "load_state на битом JSON → пустой dict без падения",
-            s == {"sent_today": {}, "contacts_today": 0, "date": "", "last_index": 0},
+            s.get("sent_today") == {}
+            and s.get("contacts_today") == 0
+            and s.get("date") == ""
+            and s.get("last_index") == 0
+            and s.get("successful_today") == 0
+            and s.get("attempts_today") == 0
+            and s.get("target_today") == 60,
             f"got {s}",
         )
 finally:

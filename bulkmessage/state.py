@@ -18,10 +18,21 @@ def load_state() -> dict:
             data.setdefault("contacts_today", 0)
             data.setdefault("date", "")
             data.setdefault("last_index", 0)
+            data.setdefault("successful_today", 0)
+            data.setdefault("attempts_today", 0)
+            data.setdefault("target_today", config.TARGET_SUCCESS_PER_DAY)
             return data
         except Exception:
             pass
-    return {"sent_today": {}, "contacts_today": 0, "date": "", "last_index": 0}
+    return {
+        "sent_today": {},
+        "contacts_today": 0,
+        "date": "",
+        "last_index": 0,
+        "successful_today": 0,
+        "attempts_today": 0,
+        "target_today": config.TARGET_SUCCESS_PER_DAY,
+    }
 
 
 def save_state(state: dict) -> None:
@@ -39,6 +50,9 @@ def reset_daily_if_new_day(state: dict) -> dict:
         state["sent_today"] = {}
         state["contacts_today"] = 0
         state["last_index"] = 0
+        state["successful_today"] = 0
+        state["attempts_today"] = 0
+        state["target_today"] = config.TARGET_SUCCESS_PER_DAY
     return state
 
 
@@ -57,6 +71,35 @@ def channel_has_quota(state: dict, channel: str) -> bool:
 
 def all_quotas_exhausted(state: dict, channels: list[str]) -> bool:
     return not any(channel_has_quota(state, ch) for ch in channels)
+
+
+def successful_today(state: dict) -> int:
+    """Сколько УНИКАЛЬНЫХ контактов получили ≥1 успешную отправку сегодня."""
+    return int(state.get("successful_today", 0))
+
+
+def increment_successful(state: dict) -> None:
+    """Вызывается когда контакт получил хотя бы 1 успешный канал."""
+    state["successful_today"] = successful_today(state) + 1
+
+
+def attempts_today(state: dict) -> int:
+    """Сколько контактов пытались обработать сегодня (вкл. failed)."""
+    return int(state.get("attempts_today", 0))
+
+
+def increment_attempts(state: dict) -> None:
+    state["attempts_today"] = attempts_today(state) + 1
+
+
+def target_reached(state: dict) -> bool:
+    """True если достигли TARGET_SUCCESS_PER_DAY."""
+    return successful_today(state) >= int(state.get("target_today", config.TARGET_SUCCESS_PER_DAY))
+
+
+def max_attempts_reached(state: dict) -> bool:
+    """Safety cap: если сделали слишком много попыток за день."""
+    return attempts_today(state) >= config.MAX_ATTEMPTS_PER_DAY
 
 
 def contacts_processed_today(state: dict) -> int:
