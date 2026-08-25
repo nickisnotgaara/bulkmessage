@@ -183,6 +183,9 @@ REPLY_SEPARATOR = "\n----------------\n"
 # Bad phones cache (для skip'а мёртвых номеров, см. bad_phones.py)
 BAD_PHONES_PATH = os.environ.get("BULK_BAD_PHONES_PATH", str(DATA_DIR / "bad_phones.json"))
 
+# Failed contacts log (все 3 канала fail'нули сегодня, см. failed_contacts.py)
+FAILED_TODAY_PATH = os.environ.get("BULK_FAILED_TODAY_PATH", str(DATA_DIR / "failed_today.json"))
+
 try:
     from zoneinfo import ZoneInfo
     _DEFAULT_TZ = ZoneInfo(os.environ.get("BULK_TIMEZONE", "Europe/Moscow"))

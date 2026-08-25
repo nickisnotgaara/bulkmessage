@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from . import config, contacts, db, bad_phones, sheets, state, templates, wappi
+from . import config, contacts, db, bad_phones, failed_contacts, sheets, state, templates, wappi
 from .sheets import sync_message_to_sheet
 from .wappi import ErrorKind
 
@@ -459,6 +459,19 @@ def _run_one_contact(
         log.info(
             f"      ⏭️  {channel.upper()} [{kind.value}] — backoff={backoffs[channel]}с. "
             f"Деталь: {detail[:120]}"
+        )
+
+    # Если контакт НИГДЕ не доставлен (sent_any=False), помечаем как полностью мёртвый
+    # для экспорта (data/failed_today.json)
+    if not sent_any and available:
+        failed_channels = [ch for ch in available]
+        failed_contacts.mark_fully_failed(
+            phone=phone, name=name, category=category, channels_failed=failed_channels
+        )
+        log.info(
+            f"   ☠️ Контакт {phone} ({name}) полностью мёртв — "
+            f"fail'нули все {len(failed_channels)} канала. "
+            f"Записан в data/failed_today.json"
         )
 
     return sent_any

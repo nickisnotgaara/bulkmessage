@@ -930,6 +930,69 @@ check("config.LOCK_PATH определён",
       hasattr(config, "LOCK_PATH") and config.LOCK_PATH)
 
 # ---------------------------------------------------------------------------
+# P. FAILED_CONTACTS (полностью мёртвые контакты за день)
+# ---------------------------------------------------------------------------
+section("P. FAILED_CONTACTS (полностью мёртвые контакты за день)")
+from bulkmessage import failed_contacts  # noqa: E402
+
+failed_contacts.clear()
+failed_contacts.save()
+
+# load/save
+failed_contacts.mark_fully_failed("+79991234567", "Иван", "Покупатели", ["whatsapp", "telegram", "max"])
+check("mark_fully_failed добавляет контакт", failed_contacts.count() == 1)
+data = failed_contacts.get_today()
+check("get_today() возвращает dict", isinstance(data, dict) and "+79991234567" in data)
+check("entry содержит name", data["+79991234567"]["name"] == "Иван")
+check("entry содержит category", data["+79991234567"]["category"] == "Покупатели")
+check("entry содержит channels_failed", set(data["+79991234567"]["channels_failed"]) == {"whatsapp", "telegram", "max"})
+check("attempts=1 после первого mark", data["+79991234567"]["attempts"] == 1)
+
+# mark_fully_failed same phone increments attempts
+failed_contacts.mark_fully_failed("+79991234567", "Иван", "Покупатели", ["whatsapp"])
+check("attempts инкрементируется при повторном mark", data["+79991234567"]["attempts"] == 2)
+check("channels_failed мержится", "telegram" in data["+79991234567"]["channels_failed"])
+
+# mark_fully_failed для другого контакта
+failed_contacts.mark_fully_failed("+79998887766", "Петя", "Агенты", ["whatsapp", "max"])
+check("Второй контакт добавлен", failed_contacts.count() == 2)
+
+# get_with_all_channels_bad
+from bulkmessage import bad_phones
+bad_phones.clear()
+bad_phones.mark_bad("+79001112233", "whatsapp")
+bad_phones.mark_bad("+79001112233", "telegram")
+bad_phones.mark_bad("+79001112233", "max")
+bad_phones.mark_bad("+79003334444", "whatsapp")
+all_dead = failed_contacts.get_with_all_channels_bad({"whatsapp", "telegram", "max"})
+check("get_with_all_channels_bad находит тех у кого ВСЕ 3 fail",
+      "+79001112233" in all_dead and "+79003334444" not in all_dead)
+check("get_with_all_channels_bad не включает частично-мёртвых",
+      "+79003334444" not in all_dead)
+# Частично-мёртвый
+bad_phones.mark_bad("+79003334444", "telegram")
+all_dead = failed_contacts.get_with_all_channels_bad({"whatsapp", "telegram", "max"})
+check("После 2 fail'ов не считается полностью мёртвым",
+      "+79003334444" not in all_dead)
+
+# save/load round-trip
+failed_contacts.save()
+failed_contacts.clear()
+check("После clear count=0", failed_contacts.count() == 0)
+n = failed_contacts.load()
+check("load() восстанавливает данные", n == 2 and failed_contacts.count() == 2)
+check("После load get_today() содержит тот же телефон", "+79991234567" in failed_contacts.get_today())
+
+# Cleanup
+failed_contacts.clear()
+failed_contacts.save()
+import os as _os
+try:
+    _os.remove(str(config.FAILED_TODAY_PATH))
+except Exception:
+    pass
+
+# ---------------------------------------------------------------------------
 # O. TG BOT LOG (новый модуль tglog)
 # ---------------------------------------------------------------------------
 section("O. TG BOT LOG (модуль tglog)")
