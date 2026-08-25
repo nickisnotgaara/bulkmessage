@@ -828,10 +828,10 @@ def run() -> None:
                 log.info(f"  📈 Прогресс: {successful}/{target} успешных сегодня")
 
             # Пауза между контактами:
-            # - Если контакт не доставлен (мёртвый) → короткая пауза (5-15 сек), быстро идём к next
-            # - Если доставлен → нормальная пауза (3-7 мин) — анти-бан
+            # - sent_ok=True (1+ канал доставлен) → 5-7 мин (анти-бан)
+            # - sent_ok=False (все 3 канала fail) → 5-15 сек (сразу next)
             if not sent_ok:
-                delay = random.uniform(5, 15)
+                delay = random.uniform(config.FAILED_DELAY_MIN, config.FAILED_DELAY_MAX)
                 log.info(f"  ⏩ Пропускаем быстро ({_fmt_duration(delay)}) — контакт мёртвый")
             else:
                 delay = random.uniform(config.DELAY_MIN, config.DELAY_MAX)

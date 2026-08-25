@@ -158,6 +158,9 @@ BATCH_BREAK_MIN = int(os.environ.get("BULK_BATCH_BREAK_MIN", "0"))
 BATCH_BREAK_MAX = int(os.environ.get("BULK_BATCH_BREAK_MAX", "0"))
 DELAY_MIN = int(os.environ.get("BULK_DELAY_MIN", "8"))
 DELAY_MAX = int(os.environ.get("BULK_DELAY_MAX", "18"))
+# Пауза после FAILED контакта (мёртвый номер) — минимальная, чтоб быстро идти дальше
+FAILED_DELAY_MIN = int(os.environ.get("BULK_FAILED_DELAY_MIN", "5"))
+FAILED_DELAY_MAX = int(os.environ.get("BULK_FAILED_DELAY_MAX", "15"))
 
 # --- Backoff (для wire-up _next_backoff в sender.py) ---
 # При RATE_LIMIT (429 / flood wait) — экспоненциальный backoff от BASE до MAX.
