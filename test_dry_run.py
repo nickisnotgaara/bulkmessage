@@ -1,12 +1,12 @@
 """
 DRY-RUN СИМУЛЯЦИЯ РАССЫЛКИ (без единого реального вызова).
 
-Логика (после ребрендинга 22.08.2026):
-  • Каждый контакт → мгновенно во ВСЕ активные каналы (WA+TG+MAX).
+Логика (после миграции на Wazzup24):
+  • Каждый контакт → мгновенно во ВСЕ активные каналы (WA+TG+MAX+WABA).
   • Между контактами случайная пауза 5-15 мин.
   • Отправляем только в активном окне (BULK_ACTIVE_HOURS_START..END) в TZ МСК.
   • Вне окна — ждём до его начала.
-  • Дневной лимит = 60 на КАНАЛ (= 60 контактов × 3 канала = 180 сообщений).
+  • Дневной лимит per channel.
 
 Что делает:
   • Грузит конфиг, контакты из Excel, шаблоны из Message_script.md.
@@ -30,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, ".")
 
-from bulkmessage import config, contacts, db, templates, wappi
+from bulkmessage import config, contacts, db, templates, wazzup
 from bulkmessage.sender import _fmt_duration, _estimate_total_time
 
 
@@ -68,9 +68,9 @@ def simulate_broadcast(seed: int = 42) -> dict:
     start = _start_in_active_window()
 
     templates_map = templates.load_templates()
-    channels = wappi.active_channels()
+    channels = wazzup.active_channels()
     if not channels:
-        return {"error": "Нет активных каналов (проверьте WAPPI_*_TOKEN в .env.local)"}
+        return {"error": "Нет активных каналов (проверьте WAZZUP_*_CHANNEL_ID в .env.local)"}
 
     # Контакты
     try:
@@ -206,7 +206,7 @@ def main() -> int:
     print(f"  DRY_RUN:      {'ВКЛЮЧЁН' if config.DRY_RUN else 'выключен'}")
     print(f"  Timezone:     {config.TIMEZONE_NAME}")
     print(f"  Окно:         {config.ACTIVE_HOURS_START:02d}:00-{config.ACTIVE_HOURS_END:02d}:00")
-    print(f"  Каналы:       {wappi.active_channels()}")
+    print(f"  Каналы (Wazzup): {wazzup.active_channels()}")
     print(f"  Лимиты/канал: {config.CHANNEL_DAILY_LIMITS}")
     print(f"  Задержка:     {config.DELAY_MIN}-{config.DELAY_MAX}с "
           f"({_fmt_duration(config.DELAY_MIN)}-{_fmt_duration(config.DELAY_MAX)})")

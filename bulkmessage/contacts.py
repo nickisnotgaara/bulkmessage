@@ -6,7 +6,7 @@ from typing import Any
 
 from openpyxl import load_workbook
 
-from .wappi import normalize_phone
+from .wazzup import normalize_phone
 
 
 def _norm_header(h: Any) -> str:

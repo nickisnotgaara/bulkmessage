@@ -28,6 +28,13 @@ def db_conn() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """True если таблица содержит указанную колонку (для миграций)."""
+    c = conn.cursor()
+    c.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in c.fetchall())
+
+
 def init_db() -> None:
     with db_conn() as conn:
         c = conn.cursor()
@@ -73,19 +80,33 @@ def init_db() -> None:
                 contact_id INTEGER NOT NULL,
                 channel TEXT NOT NULL,
                 message TEXT NOT NULL,
-                wappi_message_id TEXT,
+                message_id TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
             )
             """
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_replies_contact ON replies(contact_id)")
-        # Уникальный индекс для защиты от дублей: один и тот же wappi_message_id
-        # для одного контакта+канала должен быть только один reply
+
+        # Legacy-migration: для БД, созданных до 2026-09-19, переименовать
+        # старую колонку wappi_message_id → message_id. Идемпотентно.
+        if _has_column(conn, "replies", "wappi_message_id"):
+            try:
+                c.execute(
+                    "ALTER TABLE replies RENAME COLUMN wappi_message_id TO message_id"
+                )
+                c.execute("DROP INDEX IF EXISTS idx_replies_unique_wappi")
+                conn.commit()
+            except Exception as e:
+                import logging
+                logging.getLogger("db").warning(
+                    f"legacy rename wappi_message_id failed: {e}"
+                )
+
         c.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_replies_unique_wappi "
-            "ON replies(contact_id, channel, wappi_message_id) "
-            "WHERE wappi_message_id IS NOT NULL"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_replies_unique_msg "
+            "ON replies(contact_id, channel, message_id) "
+            "WHERE message_id IS NOT NULL"
         )
         c.execute(
             """
@@ -116,6 +137,58 @@ def init_db() -> None:
             """
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_sheets_ops_done ON sheets_ops(done)")
+        # Phase 0.1: channel_reachability cache (pre-check results, TTL 24h)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_reachability (
+                phone TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                reachable INTEGER NOT NULL,
+                last_checked_at TEXT NOT NULL,
+                last_error TEXT,
+                PRIMARY KEY (phone, channel)
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reach_checked "
+            "ON channel_reachability(last_checked_at)"
+        )
+        # Phase 1.2: WABA templates registry (synced from Wazzup)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS waba_templates (
+                template_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                category TEXT,
+                language_code TEXT NOT NULL DEFAULT 'ru',
+                status TEXT NOT NULL,
+                last_synced_at TEXT NOT NULL,
+                last_error TEXT
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_waba_templates_status "
+            "ON waba_templates(status)"
+        )
+        # Phase 3.6: complaint events log (rolling 24h window)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS complaint_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel TEXT NOT NULL,
+                phone TEXT,
+                complaint_kind TEXT NOT NULL,
+                message_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_complaints_channel_time "
+            "ON complaint_events(channel, created_at)"
+        )
         conn.commit()
 
 
@@ -163,7 +236,7 @@ def get_sent_phones(conn: sqlite3.Connection) -> set[str]:
 
 
 def get_sent_phone_channels(conn: sqlite3.Connection) -> set[tuple[str, str]]:
-    """Пары (phone, channel), по которым сообщение реально ушло в Wappi
+    """Пары (phone, channel), по которым сообщение реально ушло через Wazzup24
     (status sent/delivered/read/answered). Используется для per-channel скипа:
     контакт пропускается в канале, только если в ЭТОМ канале уже был успех."""
     c = conn.cursor()
@@ -190,7 +263,7 @@ def insert_message(
 ) -> int:
     c = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
-    # Если передан message_id (значит сообщение реально ушло в Wappi),
+    # Если передан message_id (значит сообщение реально ушло через Wazzup),
     # автоматически проставляем sent_at = now, даже если вызывающий забыл.
     if message_id and not sent_at:
         sent_at = now
@@ -216,7 +289,6 @@ def update_message_status(
     delivered_at: bool = False,
     read_at: bool = False,
     answered_at: bool = False,
-    wappi_message_id: Optional[str] = None,
     last_error: Optional[str] = None,
 ) -> int:
     c = conn.cursor()
@@ -234,9 +306,6 @@ def update_message_status(
     if answered_at:
         sets.append("answered_at = COALESCE(answered_at, ?)")
         args.append(datetime.now(timezone.utc).isoformat())
-    if wappi_message_id:
-        sets.append("message_id = COALESCE(NULLIF(message_id, ''), ?)")
-        args.append(wappi_message_id)
     if last_error is not None:
         sets.append("last_error = ?")
         args.append(last_error)
@@ -256,7 +325,7 @@ def update_message_status(
     return c.rowcount
 
 
-def find_message_by_wappi_id(
+def find_message_by_message_id(
     conn: sqlite3.Connection, message_id: str
 ) -> Optional[sqlite3.Row]:
     c = conn.cursor()
@@ -290,27 +359,27 @@ def add_reply(
     contact_id: int,
     channel: str,
     message: str,
-    wappi_message_id: Optional[str] = None,
+    message_id: Optional[str] = None,
 ) -> int:
-    """Добавляет reply. Идемпотентно: если reply с таким wappi_message_id уже есть
+    """Добавляет reply. Идемпотентно: если reply с таким message_id уже есть
     для этого контакта+канала, не дублирует (возвращает id существующего)."""
     c = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
-    if wappi_message_id:
+    if message_id:
         # Проверяем — есть ли уже такой reply
         c.execute(
-            "SELECT id FROM replies WHERE contact_id = ? AND channel = ? AND wappi_message_id = ?",
-            (contact_id, channel, wappi_message_id),
+            "SELECT id FROM replies WHERE contact_id = ? AND channel = ? AND message_id = ?",
+            (contact_id, channel, message_id),
         )
         existing = c.fetchone()
         if existing:
             return existing["id"]
     c.execute(
         """
-        INSERT INTO replies (contact_id, channel, message, wappi_message_id, created_at)
+        INSERT INTO replies (contact_id, channel, message, message_id, created_at)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (contact_id, channel, message, wappi_message_id, now),
+        (contact_id, channel, message, message_id, now),
     )
     return c.lastrowid
 
@@ -377,3 +446,152 @@ def enqueue_sheet_op(op: str, payload: dict, message_pk: Optional[int] = None) -
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+
+
+# --- Channel reachability cache (Phase 0.1 + 2.1) ---
+
+
+def upsert_reachability(
+    conn: sqlite3.Connection,
+    phone: str,
+    channel: str,
+    reachable: bool,
+    last_error: Optional[str] = None,
+) -> None:
+    """Сохраняет результат pre-check в кэш reachability.
+
+    TTL=24ч читается приложением (state.py фильтрует по timestamp).
+    """
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO channel_reachability (phone, channel, reachable, last_checked_at, last_error)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(phone, channel) DO UPDATE SET
+            reachable = excluded.reachable,
+            last_checked_at = excluded.last_checked_at,
+            last_error = excluded.last_error
+        """,
+        (phone, channel, 1 if reachable else 0,
+         datetime.now(timezone.utc).isoformat(), last_error),
+    )
+
+
+def get_reachability(
+    conn: sqlite3.Connection, phone: str, channel: str
+) -> Optional[sqlite3.Row]:
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM channel_reachability WHERE phone = ? AND channel = ?",
+        (phone, channel),
+    )
+    return c.fetchone()
+
+
+def get_all_reachability_for_phone(
+    conn: sqlite3.Connection, phone: str
+) -> dict[str, sqlite3.Row]:
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT * FROM channel_reachability WHERE phone = ?", (phone,)
+    ).fetchall()
+    return {r["channel"]: r for r in rows}
+
+
+# --- WABA templates registry (Phase 1.2) ---
+
+
+def upsert_waba_template(
+    conn: sqlite3.Connection,
+    template_id: str,
+    name: str,
+    category: Optional[str],
+    language_code: str,
+    status: str,
+    last_error: Optional[str] = None,
+) -> None:
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO waba_templates (template_id, name, category, language_code,
+                                    status, last_synced_at, last_error)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(template_id) DO UPDATE SET
+            name = excluded.name,
+            category = excluded.category,
+            language_code = excluded.language_code,
+            status = excluded.status,
+            last_synced_at = excluded.last_synced_at,
+            last_error = excluded.last_error
+        """,
+        (
+            template_id, name, category, language_code, status,
+            datetime.now(timezone.utc).isoformat(), last_error,
+        ),
+    )
+
+
+def get_waba_template(
+    conn: sqlite3.Connection, template_id: str
+) -> Optional[sqlite3.Row]:
+    c = conn.cursor()
+    c.execute("SELECT * FROM waba_templates WHERE template_id = ?", (template_id,))
+    return c.fetchone()
+
+
+def list_waba_templates(
+    conn: sqlite3.Connection, only_approved: bool = False
+) -> list[sqlite3.Row]:
+    c = conn.cursor()
+    if only_approved:
+        return c.execute(
+            "SELECT * FROM waba_templates WHERE status = 'approved' "
+            "ORDER BY category, name"
+        ).fetchall()
+    return c.execute(
+        "SELECT * FROM waba_templates ORDER BY category, name"
+    ).fetchall()
+
+
+# --- Complaint events log (Phase 3.6) ---
+
+
+def log_complaint(
+    conn: sqlite3.Connection,
+    channel: str,
+    phone: Optional[str],
+    complaint_kind: str,
+    message_id: Optional[str] = None,
+) -> int:
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO complaint_events (channel, phone, complaint_kind, message_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            channel, phone, complaint_kind, message_id,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    return c.lastrowid
+
+
+def count_complaints_since(
+    conn: sqlite3.Connection, channel: str, since_iso: str
+) -> int:
+    c = conn.cursor()
+    c.execute(
+        "SELECT COUNT(*) AS n FROM complaint_events "
+        "WHERE channel = ? AND created_at >= ?",
+        (channel, since_iso),
+    )
+    row = c.fetchone()
+    return int(row["n"]) if row else 0
+
+
+def cleanup_old_complaints(conn: sqlite3.Connection, older_than_iso: str) -> int:
+    """Удаляет старые жалобы (для per-day housekeeping)."""
+    c = conn.cursor()
+    c.execute("DELETE FROM complaint_events WHERE created_at < ?", (older_than_iso,))
+    return c.rowcount

@@ -3,11 +3,11 @@
 
 Имитирует полный цикл sender.py + tracker.py:
   1. Отправляет 4 сообщения (по шаблонам всех категорий) в WhatsApp + Telegram + MAX
-     на указанный TEST_PHONE.
+     на указанный TEST_PHONE через Wazzup24.
   2. Каждое сообщение сохраняет в crm.db (contacts, messages) и шлёт в Google Sheets.
   3. Классифицирует ошибки (permanent/rate/transient/auth) при неудачах.
-  4. Ждёт указанное время и опрашивает статусы через Wappi API
-     (имитация webhook-ов, если ваш webhook-сервер ещё не поднят).
+  4. Ждёт указанное время и опрашивает статусы через Wazzup webhook
+     (или poll /v3/channels если webhook не поднят).
   5. Показывает итоговую таблицу: телефон / канал / категория / статус / message_id.
 
 Перед запуском:
@@ -36,7 +36,7 @@ if _env_path.exists():
 
 sys.path.insert(0, ".")
 
-from bulkmessage import config, db, sheets, templates, wappi
+from bulkmessage import config, db, sheets, templates, wazzup
 
 
 # ============================================================
@@ -69,7 +69,7 @@ def _print_banner() -> None:
     print("=" * 70)
     print(" TEST SEND — single number, all categories × all channels + tracking")
     print("=" * 70)
-    print(f"  Phone:     {wappi.normalize_phone(TEST_PHONE)}")
+    print(f"  Phone:     {wazzup.normalize_phone(TEST_PHONE)}")
     print(f"  Name:      {TEST_NAME}")
     print(f"  DB:        {config.DB_PATH}")
     print(f"  Sheets:    {'включены' if sheets.SHEETS.enabled else 'ОТКЛЮЧЕНЫ'}")
@@ -87,7 +87,7 @@ def _send_and_track(
     """Отправляет одно сообщение, пишет в БД, шлёт в Sheets. Возвращает dict с результатом."""
     print(f"  [{channel:8s}] {template_category:11s} -> ", end="", flush=True)
 
-    ok, message_id, detail, http_status = wappi.send_wappi(channel, phone, template_text)
+    ok, message_id, detail, http_status = wazzup.send_to_channel(channel, phone, template_text)
     record = {
         "channel": channel,
         "template": template_category,
@@ -100,7 +100,7 @@ def _send_and_track(
     }
 
     if not ok:
-        kind = wappi.classify_error(detail, http_status)
+        kind = wazzup.classify_error(detail, http_status)
         print(f"FAIL [{kind.value}]: {detail[:100]}")
         record["status"] = f"failed:{kind.value}"
         with db.db_conn() as conn:
@@ -148,95 +148,76 @@ def _send_and_track(
 
 
 def _check_status(records: list[dict]) -> None:
-    """Опрашивает Wappi по message_id, обновляет статусы (имитация webhook)."""
+    """Ждём пока webhook'и Wazzup дойдут, потом обновляем статусы из crm.db.
+
+    Wazzup — webhook-driven, нет GET API для статуса. Эта функция теперь
+    только показывает текущий статус из crm.db после ожидания.
+    """
     print()
-    print(f"Ждём {WAIT_FOR_REPLIES}с, потом опрашиваем Wappi по message_id...")
+    print(f"Ждём {WAIT_FOR_REPLIES}с, чтобы webhook'и Wazzup дошли...")
     time.sleep(WAIT_FOR_REPLIES)
 
     for r in records:
         if not r.get("message_id") or r["channel"] is None:
             continue
-        data = wappi.fetch_wappi_status(r["channel"], r["message_id"])
-        if not data:
-            continue
-        inner = data.get("message") or data
-        ds = (
-            inner.get("delivery_status")
-            or inner.get("status")
-            or (inner.get("isRead") and "read")
-        )
-        is_read = bool(inner.get("isRead"))
-        new_status = wappi.wappi_status_to_local(ds)
-        if is_read:
-            new_status = "read"
-        if new_status == r["status"]:
-            continue
-        r["status"] = new_status
-        if new_status == "delivered":
-            r["delivered"] = True
-        elif new_status == "read":
-            r["delivered"] = True
-            r["read"] = True
+        # Получаем текущий статус из БД (webhook'и обновили бы его)
         with db.db_conn() as conn:
-            kwargs: dict = {"message_pk": r["message_pk"], "status": new_status}
-            if new_status == "delivered":
-                kwargs["delivered_at"] = True
-            elif new_status == "read":
-                kwargs["delivered_at"] = True
-                kwargs["read_at"] = True
-            db.update_message_status(conn, **kwargs)
-        if sheets.SHEETS.enabled:
-            try:
-                sheets.sync_message_to_sheet(
-                    contact_id=r["contact_id"],
-                    channel=r["channel"],
-                    status=new_status,
-                    message_pk=r["message_pk"],
-                )
-            except Exception:
-                pass
+            row = db.find_message_by_message_id(conn, r["message_id"])
+            if row:
+                r["status"] = row["status"]
+                r["delivered"] = bool(row.get("delivered_at"))
+                r["read"] = bool(row.get("read_at"))
+            else:
+                r["status"] = "sent"
 
 
 def _check_replies(phone: str, since_iso: Optional[str] = None) -> list[dict]:
-    """Проверяет, пришли ли ответы (через прямой запрос к Wappi).
+    """Проверяет, пришли ли ответы через crm.db (webhook-driven).
 
-    since_iso — ISO-строка, с которой запрашивать. Если None — последние 20.
+    Wazzup не имеет GET API для истории чатов — ответы приходят только через
+    webhook → process_wazzup_payload → process_incoming_message → crm.db.
+    Эта функция теперь читает ответы напрямую из crm.db.
     """
     print()
     if since_iso:
         print("Проверяем входящие ответы (с момента %s)..." % since_iso)
     else:
-        print("Проверяем входящие ответы...")
-    phone_n = wappi.normalize_phone(phone)
+        print("Проверяем входящие ответы (из crm.db)...")
+    phone_n = wazzup.normalize_phone(phone)
     found: list[dict] = []
-    for channel in wappi.active_channels():
+    for channel in wazzup.active_channels():
         try:
-            msgs = wappi.fetch_chat_messages(channel, phone_n, since_iso=since_iso, limit=20)
+            with db.db_conn() as conn:
+                c = conn.cursor()
+                if since_iso:
+                    c.execute(
+                        "SELECT message, created_at FROM replies "
+                        "WHERE contact_id = (SELECT id FROM contacts WHERE phone = ?) "
+                        "AND channel = ? AND created_at >= ? "
+                        "ORDER BY created_at ASC",
+                        (phone_n, channel, since_iso),
+                    )
+                else:
+                    c.execute(
+                        "SELECT message, created_at FROM replies "
+                        "WHERE contact_id = (SELECT id FROM contacts WHERE phone = ?) "
+                        "AND channel = ? ORDER BY created_at DESC LIMIT 20",
+                        (phone_n, channel),
+                    )
+                msgs = [dict(r) for r in c.fetchall()]
         except Exception as e:
             print(f"  [{channel}] error: {e}")
             continue
         for m in msgs:
-            if m.get("fromMe") is True:
-                continue
-            body = (m.get("body") or "").strip()
+            body = (m.get("message") or "").strip()
             if not body:
                 continue
-            mid = m.get("id") or m.get("message_id")
+            mid = m.get("created_at")
             found.append({
                 "channel": channel,
                 "body": body[:200],
                 "message_id": mid,
             })
-            with db.db_conn() as conn:
-                contact = db.get_contact_by_phone(conn, phone_n)
-                if contact is None:
-                    continue
-                # не дублируем
-                c = conn.cursor()
-                c.execute(
-                    "SELECT 1 FROM replies WHERE wappi_message_id = ? AND contact_id = ?",
-                    (mid, contact["id"]),
-                )
                 if c.fetchone():
                     continue
                 db.add_reply(conn, contact["id"], channel, body, mid)
@@ -294,7 +275,7 @@ def main() -> int:
     log = config.get_logger("test_send")
     db.init_db()
 
-    phone = wappi.normalize_phone(TEST_PHONE)
+    phone = wazzup.normalize_phone(TEST_PHONE)
     if not phone:
         print(f"[ERR] Невалидный TEST_PHONE: {TEST_PHONE!r}")
         return 1
@@ -305,9 +286,9 @@ def main() -> int:
         return 1
     print(f"Шаблонов: {len(templates_map)} — {list(templates_map.keys())}")
 
-    channels = wappi.active_channels()
+    channels = wazzup.active_channels()
     if not channels:
-        print("[ERR] Нет активных каналов — проверьте токены")
+        print("[ERR] Нет активных каналов — проверьте WAZZUP_API_KEY + WAZZUP_*_CHANNEL_ID")
         return 1
     print(f"Активные каналы: {channels}")
     print()

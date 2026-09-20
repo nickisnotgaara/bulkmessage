@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sys
@@ -11,10 +10,15 @@ from pathlib import Path
 
 
 def _select_env_file() -> Path | None:
-    """Выбирает .env файл по приоритету:
-    1. BULK_ENV_FILE (если задан)
-    2. INSIDE_DOCKER=1 или /.dockerenv → .env.docker
-    3. иначе → .env.local
+    """DEPRECATED: возвращает ПЕРВЫЙ найденный .env* файл (для обратной совместимости).
+
+    Новый код использует _load_dotenv() который грузит ВСЕ .env* файлы
+    в порядке приоритета (от низкого к высокому):
+      .env             → базовые секреты/настройки (низший приоритет)
+      .env.local       → локальные overrides (средний приоритет)
+      .env.docker      → docker-specific (высший приоритет, грузится только в Docker)
+
+    Эта функция оставлена для совместимости (возвращает первый существующий).
     """
     root = Path(__file__).resolve().parent.parent
     explicit = os.environ.get("BULK_ENV_FILE")
@@ -25,18 +29,60 @@ def _select_env_file() -> Path | None:
         return p if p.exists() else None
 
     in_docker = os.environ.get("INSIDE_DOCKER") == "1" or Path("/.dockerenv").exists()
-    if in_docker:
-        p = root / ".env.docker"
-        if p.exists():
-            return p
+    if in_docker and (root / ".env.docker").exists():
+        return root / ".env.docker"
 
-    p = root / ".env.local"
-    return p if p.exists() else None
+    if (root / ".env.local").exists():
+        return root / ".env.local"
+    if (root / ".env").exists():
+        return root / ".env"
+    return None
+
+
+def _candidate_env_files() -> list[Path]:
+    """Возвращает список .env* файлов в порядке приоритета (от низкого к высокому).
+
+    Каждый следующий файл override'ит предыдущие (как в 12-factor app convention).
+    Docker файл — только если INSIDE_DOCKER.
+    """
+    root = Path(__file__).resolve().parent.parent
+    explicit = os.environ.get("BULK_ENV_FILE")
+    if explicit:
+        p = Path(explicit)
+        if not p.is_absolute():
+            p = root / p
+        return [p] if p.exists() else []
+
+    in_docker = os.environ.get("INSIDE_DOCKER") == "1" or Path("/.dockerenv").exists()
+    candidates: list[Path] = []
+    if (root / ".env").exists():
+        candidates.append(root / ".env")
+    if (root / ".env.local").exists():
+        candidates.append(root / ".env.local")
+    if in_docker and (root / ".env.docker").exists():
+        candidates.append(root / ".env.docker")
+    return candidates
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
+    """Парсит .env файл с поддержкой UTF-8 и Windows-1251 fallback.
+
+    Некоторые .env.local файлы сохранены в Windows-1251 (русские комментарии
+    с длинным тире и т.п.), поэтому UTF-8 даст UnicodeDecodeError.
+    Пробуем UTF-8 сначала, потом cp1251.
+    """
+    raw: str | None = None
+    for enc in ("utf-8", "cp1251", "utf-8-sig"):
+        try:
+            raw = path.read_text(encoding=enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if raw is None:
+        # Последний fallback — с errors='replace', чтоб не крашить импорт
+        raw = path.read_text(encoding="utf-8", errors="replace")
     result: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in raw.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -49,39 +95,27 @@ def _parse_env_file(path: Path) -> dict[str, str]:
 
 
 def _load_dotenv() -> None:
-    env_path = _select_env_file()
-    if env_path is None:
-        return
-    parsed = _parse_env_file(env_path)
-    for key, val in parsed.items():
-        if key not in os.environ:
-            os.environ[key] = val
+    """Грузит ВСЕ .env* файлы в порядке приоритета (от низкого к высокому).
+
+    Convention:
+      .env          → базовые секреты (например, WAZZUP_API_KEY)
+      .env.local    → локальные overrides (если есть)
+      .env.docker   → только в Docker
+
+    Каждый следующий файл override'ит предыдущие. Если переменная
+    уже в os.environ (например, задана через export в shell),
+    она НЕ перезаписывается — это позволяет override'ить
+    секреты через переменные окружения без правки файлов.
+    """
+    candidates = _candidate_env_files()
+    for env_path in candidates:
+        parsed = _parse_env_file(env_path)
+        for key, val in parsed.items():
+            if key not in os.environ:
+                os.environ[key] = val
 
 
 _load_dotenv()
-
-
-def _load_tokens() -> dict:
-    raw = os.environ.get("WAPPI_TOKENS_JSON")
-    if raw:
-        try:
-            return json.loads(raw)
-        except Exception:
-            pass
-    return {
-        "whatsapp": {
-            "token": os.environ.get("WAPPI_WHATSAPP_TOKEN", ""),
-            "profile_id": os.environ.get("WAPPI_WHATSAPP_PROFILE", ""),
-        },
-        "telegram": {
-            "token": os.environ.get("WAPPI_TELEGRAM_TOKEN", ""),
-            "profile_id": os.environ.get("WAPPI_TELEGRAM_PROFILE", ""),
-        },
-        "max": {
-            "token": os.environ.get("WAPPI_MAX_TOKEN", ""),
-            "profile_id": os.environ.get("WAPPI_MAX_PROFILE", ""),
-        },
-    }
 
 
 # --- Files / paths ---
@@ -97,27 +131,150 @@ PENDING_WEBHOOKS_PATH = os.environ.get(
 )
 TEMPLATES_PATH = os.environ.get("BULK_TEMPLATES_PATH", "Message_script.md")
 
-# --- Daily limits: 60 на КАЖДЫЙ канал (whatsapp, telegram, max) ---
-# 60 контактов × 3 канала = 180 сообщений в день максимум.
-CHANNEL_DAILY_LIMITS = {
-    "whatsapp": int(os.environ.get("BULK_LIMIT_WHATSAPP", "60")),
-    "telegram": int(os.environ.get("BULK_LIMIT_TELEGRAM", "60")),
-    "max": int(os.environ.get("BULK_LIMIT_MAX", "60")),
+# WABA tier limits per Meta (Phase 1): 250 / 1000 / 10000 / 100000 / unlimited
+WABA_TIER_LIMITS = {
+    0: 250,
+    1: 1000,
+    2: 10000,
+    3: 100000,
+    4: 1000000,  # unlimited — cap для health
 }
 
-# --- Wappi ---
-WAPPI_BASE_URL = os.environ.get("WAPPI_BASE_URL", "https://wappi.pro")
-WAPPI_TOKENS: dict = _load_tokens()
-WAPPI_SEND_PATHS = {
-    "whatsapp": "/api/sync/message/send",
-    "telegram": "/tapi/sync/message/send",
-    "max": "/maxapi/sync/message/send",
+# ЖЁСТКИЙ код-лимит для Personal-каналов. Никакой env override не может
+# превысить это значение (защита от случайного скачка cap для original account).
+MAX_PERSONAL_DAILY_HARD_CAP = 30
+
+ORIGINAL_ACCOUNT_DAILY_HARD_CAPS = {
+    "waba": 250,
+    "telegram": 40,
+    "max": 25,
 }
-WAPPI_MESSAGE_GET_PATHS = {
-    "whatsapp": "/api/sync/messages/id/get",
-    "telegram": "/tapi/sync/messages/id/get",
-    "max": "/maxapi/sync/messages/id/get",
+
+# --- Daily limits: 60 на КАЖДЫЙ канал (whatsapp, telegram, max) ---
+# 60 контактов × 3 канала = 180 сообщений в день максимум.
+# Phase 0.2 (оригинальный аккаунт): TG=40, MAX=25 (понижены для anti-bank).
+# WABA — отдельный ключ (BULK_LIMIT_WABA) или авто из tier.
+# Personal-каналы ограничены жёстким MAX_PERSONAL_DAILY_HARD_CAP=30.
+def _safe_limit(ch: str, default: int, hard_cap: int = 10**9) -> int:
+    val = int(os.environ.get(f"BULK_LIMIT_{ch.upper()}", str(default)))
+    return min(val, hard_cap)
+
+CHANNEL_DAILY_LIMITS = {
+    "whatsapp": _safe_limit("whatsapp", 60),
+    "telegram": _safe_limit("telegram", 40, hard_cap=MAX_PERSONAL_DAILY_HARD_CAP),
+    "max": _safe_limit("max", 25, hard_cap=MAX_PERSONAL_DAILY_HARD_CAP),
+    "waba": _safe_limit("waba", 250),
 }
+
+# --- Wazzup24 (единственный транспорт) ---
+WAZZUP_BASE_URL = os.environ.get("WAZZUP_BASE_URL", "https://api.wazzup24.com")
+WAZZUP_API_KEY = os.environ.get("WAZZUP_API_KEY", "").strip()
+WAZZUP_DEFAULT_CHANNEL_ID = os.environ.get("WAZZUP_DEFAULT_CHANNEL_ID", "").strip()
+# Per-channel Wazzup channel IDs — ОБЯЗАТЕЛЬНЫ для всех мессенджеров.
+WAZZUP_TG_CHANNEL_ID = os.environ.get("WAZZUP_TG_CHANNEL_ID", "").strip()
+WAZZUP_MAX_CHANNEL_ID = os.environ.get("WAZZUP_MAX_CHANNEL_ID", "").strip()
+WAZZUP_WHATSAPP_CHANNEL_ID = os.environ.get("WAZZUP_WHATSAPP_CHANNEL_ID", "").strip()
+WAZZUP_WEBHOOK_URL = os.environ.get("WAZZUP_WEBHOOK_URL", "").strip()
+WAZZUP_HMAC_SECRET = os.environ.get("WAZZUP_HMAC_SECRET", "").strip()
+# Если tier неизвестен — дефолт 0 (250/day, безопаснее)
+WAZZUP_TIER_DEFAULT = int(os.environ.get("WAZZUP_TIER_DEFAULT", "0"))
+WAZZUP_VERIFY_SIGNATURE = os.environ.get(
+    "WAZZUP_VERIFY_SIGNATURE", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_wazzup_channel_id_for(channel: str) -> str:
+    """Возвращает UUID канала Wazzup для данного bulkmessage-канала.
+
+    Канал bulkmessage ('waba'/'telegram'/'max'/'whatsapp') → UUID Wazzup.
+    Возвращает пустую строку если не задан (тогда sender пропускает канал).
+    """
+    mapping = {
+        "waba": WAZZUP_DEFAULT_CHANNEL_ID,
+        "whatsapp": WAZZUP_WHATSAPP_CHANNEL_ID,
+        "telegram": WAZZUP_TG_CHANNEL_ID,
+        "max": WAZZUP_MAX_CHANNEL_ID,
+    }
+    return mapping.get(channel, "") or ""
+
+# WABA templates per category (Phase 1.2)
+WABA_TEMPLATE_IDS = {
+    "Покупатели": os.environ.get("WABA_TEMPLATE_BUYER_ID", "").strip(),
+    "Продавцы": os.environ.get("WABA_TEMPLATE_SELLER_ID", "").strip(),
+    "Агенты": os.environ.get("WABA_TEMPLATE_AGENT_ID", "").strip(),
+    "Инвесторы": os.environ.get("WABA_TEMPLATE_INVESTOR_ID", "").strip(),
+}
+
+# Sub endpoints (Phase 1.1)
+WAZZUP_MESSAGE_SEND_PATH = "/v3/message"
+WAZZUP_CHANNELS_PATH = "/v3/channels"
+WAZZUP_WEBHOOKS_PATH = "/v3/webhooks"
+
+# Feature flag: 0 = WABA off (legacy), 1 = WABA on (cascade), 2 = shadow (compute decision only)
+USE_WABA = os.environ.get("BULK_USE_WABA", "0").strip()
+try:
+    USE_WABA = int(USE_WABA)
+except ValueError:
+    USE_WABA = 0
+
+# --- Anti-bank hardening (Phase 3) для ОРИГИНАЛЬНОГО аккаунта ---
+HEADROOM_PCT = int(os.environ.get("BULK_HEADROOM_PCT", "25"))
+
+# "Безопасные часы" внутри активного окна. Personal — сужено (11-19), WABA — шире.
+PERSONAL_SAFE_HOURS_START = int(os.environ.get("BULK_PERSONAL_SAFE_HOURS_START", "11"))
+PERSONAL_SAFE_HOURS_END = int(os.environ.get("BULK_PERSONAL_SAFE_HOURS_END", "19"))
+WABA_SAFE_HOURS_START = int(os.environ.get("BULK_WABA_SAFE_HOURS_START", "10"))
+WABA_SAFE_HOURS_END = int(os.environ.get("BULK_WABA_SAFE_HOURS_END", "20"))
+
+# Межканальный дроссель (не пер-контакт, а между отправками в любой канал).
+MIN_INTER_SEND_SEC = int(os.environ.get("BULK_MIN_INTER_SEND_SEC", "60"))
+
+# Per-phone cooldown после успешной отправки (часы).
+PER_PHONE_COOLDOWN_HOURS_WABA = int(
+    os.environ.get("BULK_PER_PHONE_COOLDOWN_HOURS_WABA", "0")
+)
+PER_PHONE_COOLDOWN_HOURS_PERSONAL = int(
+    os.environ.get("BULK_PER_PHONE_COOLDOWN_HOURS_PERSONAL", "96")
+)
+
+# Complaint halt thresholds per channel (Phase 3.6).
+COMPLAINT_HALT_THRESHOLD_TG = int(os.environ.get("BULK_COMPLAINT_HALT_TG", "3"))
+COMPLAINT_HALT_THRESHOLD_MAX = int(os.environ.get("BULK_COMPLAINT_HALT_MAX", "2"))
+COMPLAINT_HALT_THRESHOLD_WABA = int(os.environ.get("BULK_COMPLAINT_HALT_WABA", "3"))
+COMPLAINT_WINDOW_HOURS = int(os.environ.get("BULK_COMPLAINT_WINDOW_HOURS", "24"))
+COMPLAINT_HALT_DURATION_HOURS = int(
+    os.environ.get("BULK_COMPLAINT_HALT_HOURS", "24")
+)
+
+# Adaptive decay: жалоба в день → cap × decay на следующий день.
+ADAPTIVE_DECAY_ON_COMPLAINT = float(
+    os.environ.get("BULK_ADAPTIVE_DECAY_ON_COMPLAINT", "0.5")
+)
+
+# Spintax минимальное количество вариантов.
+SPINTAX_VARIANT_COUNT_MIN = int(os.environ.get("BULK_SPINTAX_VARIANT_COUNT_MIN", "3"))
+
+# Reachability cache TTL (hours).
+REACHABILITY_CACHE_TTL_HOURS = int(
+    os.environ.get("BULK_REACHABILITY_CACHE_TTL_HOURS", "24")
+)
+
+# WABA-specific: бот-режим (free text в 24ч-окне) vs template mode (cold outreach).
+WABA_FREE_TEXT_WINDOW_HOURS = 24
+
+# Bypass safe hours check (для тестов и debugging). НЕ для продакшена.
+# BULK_BYPASS_SAFE_HOURS=1 → sender шлёт в любое время суток.
+BULK_BYPASS_SAFE_HOURS = os.environ.get(
+    "BULK_BYPASS_SAFE_HOURS", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Adaptive delay: жалоба в последние 60 мин → +50% к base delay.
+COMPLAINT_ADAPTIVE_DELAY_PCT = float(
+    os.environ.get("BULK_COMPLAINT_ADAPTIVE_DELAY_PCT", "0.5")
+)
+COMPLAINT_ADAPTIVE_LOOKBACK_MIN = int(
+    os.environ.get("BULK_COMPLAINT_ADAPTIVE_LOOKBACK_MIN", "60")
+)
 
 # --- Google Sheets ---
 GOOGLE_SHEET_ID = os.environ.get("BULK_GOOGLE_SHEET_ID", "")
@@ -173,7 +330,7 @@ TRANSIENT_BACKOFF_MAX = int(os.environ.get("BULK_TRANSIENT_BACKOFF_MAX", "120"))
 TRANSIENT_RETRY = int(os.environ.get("BULK_TRANSIENT_RETRY", "1"))
 
 # --- Dry-run mode ---
-# Если = "1" / "true" — sender НЕ вызывает Wappi API, только имитирует успешные
+# Если = "1" / "true" — sender НЕ вызывает Wazzup API, только имитирует успешные
 # отправки. Полезно для прогона расписания, проверки квот и таймингов без риска
 # отправить что-то реальное. ВАЖНО: при боевом запуске должен быть 0 / пусто.
 DRY_RUN = os.environ.get("BULK_DRY_RUN", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -370,7 +527,7 @@ TG_LOG_MAX_QUEUE = int(os.environ.get("BULK_TG_LOG_MAX_QUEUE", "1000"))
 
 
 def preflight_check(test_phone: str = "") -> dict:
-    """Быстрая проверка перед боевым запуском: токены валидны, Wappi отвечает.
+    """Быстрая проверка перед боевым запуском: Wazzup24 отвечает, каналы живы.
 
     Возвращает dict:
       {
@@ -382,60 +539,69 @@ def preflight_check(test_phone: str = "") -> dict:
         },
         "errors": [str],   # список ошибок
       }
-
-    Если test_phone пустой — проверяем только /status endpoint (HEAD/GET без отправки).
     """
     # Импортируем здесь, чтобы не было циклической зависимости
-    from . import wappi
+    from . import wazzup
 
     result: dict = {"ok": True, "channels": {}, "errors": []}
-    active = wappi.active_channels()
+    active = wazzup.active_channels()
 
     if not active:
         result["ok"] = False
-        result["errors"].append("Нет активных каналов (проверьте WAPPI_*_TOKEN)")
+        result["errors"].append(
+            "Нет активных каналов (проверьте WAZZUP_API_KEY и WAZZUP_*_CHANNEL_ID)"
+        )
         return result
 
+    # Один запрос к /v3/channels — Wazzup сам знает, какие каналы активны.
+    ok, detail, channels = wazzup.get_wazzup_channels()
+    if not ok:
+        result["ok"] = False
+        result["errors"].append(f"Wazzup API недоступен: {detail[:200]}")
+        for ch in active:
+            result["channels"][ch] = {
+                "ok": False, "detail": "wazzup api unreachable", "http": None
+            }
+        return result
+
+    # Нормализуем: channels может быть list[dict] или dict (Wazzup API менялся).
+    live_channel_ids: set[str] = set()
+    if isinstance(channels, list):
+        for c in channels:
+            if isinstance(c, dict):
+                cid = c.get("channelId")
+                if isinstance(cid, str) and cid:
+                    live_channel_ids.add(cid)
+    elif isinstance(channels, dict):
+        for v in channels.values():
+            if isinstance(v, dict):
+                cid = v.get("channelId")
+                if isinstance(cid, str) and cid:
+                    live_channel_ids.add(cid)
+            elif isinstance(v, list):
+                for c in v:
+                    if isinstance(c, dict):
+                        cid = c.get("channelId")
+                        if isinstance(cid, str) and cid:
+                            live_channel_ids.add(cid)
+
     for ch in active:
-        # Простой GET на /status endpoint, чтобы убедиться что токен валиден
-        creds = WAPPI_TOKENS.get(ch, {})
-        token = creds.get("token", "")
-        profile_id = creds.get("profile_id", "")
-        if not token or not profile_id:
+        expected_cid = wazzup.channel_id_for(ch)
+        if not expected_cid:
             result["channels"][ch] = {
-                "ok": False, "detail": "empty token or profile_id", "http": None
+                "ok": False, "detail": "no WAZZUP_*_CHANNEL_ID configured", "http": None
             }
             result["ok"] = False
-            result["errors"].append(f"{ch}: пустой токен или profile_id")
-            continue
-        # Пробуем GET /messages/id/get с фейковым message_id — если токен битый,
-        # вернёт 401/403. Если ок — 404 (message not found) или 200.
-        try:
-            import requests
-            url = WAPPI_BASE_URL + WAPPI_MESSAGE_GET_PATHS[ch]
-            resp = requests.get(
-                url,
-                headers={"Authorization": token},
-                params={"profile_id": profile_id, "message_id": "preflight_check"},
-                timeout=10,
-            )
-            http = resp.status_code
-            if http in (401, 403):
-                result["channels"][ch] = {
-                    "ok": False, "detail": f"auth fail: HTTP {http}", "http": http
-                }
-                result["ok"] = False
-                result["errors"].append(f"{ch}: токен невалиден (HTTP {http})")
-            else:
-                # 200 / 404 / 400 — все ОК (токен принят, message_id не существует)
-                result["channels"][ch] = {
-                    "ok": True, "detail": f"HTTP {http}", "http": http
-                }
-        except requests.RequestException as e:
+            result["errors"].append(f"{ch}: WAZZUP_*_CHANNEL_ID пустой")
+        elif live_channel_ids and expected_cid not in live_channel_ids:
             result["channels"][ch] = {
-                "ok": False, "detail": f"network: {e}", "http": None
+                "ok": False, "detail": f"channel {expected_cid[:8]}… не в /v3/channels", "http": None
             }
             result["ok"] = False
-            result["errors"].append(f"{ch}: сеть недоступна — {e}")
+            result["errors"].append(f"{ch}: канал {expected_cid[:8]}… не найден в Wazzup")
+        else:
+            result["channels"][ch] = {
+                "ok": True, "detail": f"channelId={expected_cid[:8]}…", "http": 200
+            }
 
     return result

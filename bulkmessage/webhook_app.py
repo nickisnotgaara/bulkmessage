@@ -1,42 +1,42 @@
-"""FastAPI app for receiving Wappi webhooks."""
+"""FastAPI app for receiving Wazzup24 webhooks."""
 
 import json
 import traceback
 from typing import Optional
 
 try:
-    from fastapi import Body, FastAPI, Request
+    from fastapi import Body, FastAPI, Header, HTTPException, Request
 except ImportError:
-    Body = FastAPI = Request = None  # type: ignore
+    Body = FastAPI = Request = Header = HTTPException = None  # type: ignore
 
-from . import config, db, reconcile, wappi
+from . import config, db, reconcile, wazzup
 
 
 def _handle_payload(payload: dict) -> dict:
-    """Общая логика обработки webhook — используется и для GET, и для POST."""
+    """Общая логика обработки webhook — единый обработчик Wazzup24.
+
+    Тонкая обёртка над process_wazzup_payload для вызовов через /webhook.
+    """
+    return _handle_wazzup_payload(None, payload)
+
+
+def _handle_wazzup_payload(channel_hint: Optional[str], payload: dict) -> dict:
+    """Обработка webhook payload от Wazzup24 (единственный транспорт).
+
+    enqueue + process.
+    """
     if not isinstance(payload, dict):
         return {"status": "bad request"}
 
-    reconcile.log.info(f"Webhook received: {str(payload)[:200]}")
+    reconcile.log.info(f"Wazzup webhook received: {str(payload)[:200]}")
 
-    channel_hint: Optional[str] = None
-    try:
-        data = payload.get("messages") if "messages" in payload else payload
-        if isinstance(data, dict):
-            channel_hint = wappi.channel_from_profile_id(data.get("profile_id"))
-        elif isinstance(data, list) and data:
-            channel_hint = wappi.channel_from_profile_id(data[0].get("profile_id"))
-    except Exception:
-        channel_hint = None
-
-    # Enqueue first
     try:
         db.enqueue_pending_webhook(channel_hint, payload)
     except Exception as e:
-        reconcile.log.error(f"enqueue_pending_webhook error: {e}")
+        reconcile.log.error(f"enqueue_pending_webhook (wazzup) error: {e}")
 
     try:
-        reconcile.process_webhook_payload(channel_hint, payload)
+        reconcile.process_wazzup_payload(channel_hint, payload)
         with db.db_conn() as conn:
             c = conn.cursor()
             c.execute(
@@ -46,7 +46,9 @@ def _handle_payload(payload: dict) -> dict:
                 (json.dumps(payload, ensure_ascii=False, default=str),),
             )
     except Exception as e:
-        reconcile.log.error(f"webhook processing error: {e}\n{traceback.format_exc()}")
+        reconcile.log.error(
+            f"wazzup webhook processing error: {e}\n{traceback.format_exc()}"
+        )
 
     return {"status": "ok"}
 
@@ -55,35 +57,47 @@ def build_app():
     if FastAPI is None:
         return None
 
-    app = FastAPI(title="Wappi Webhook Receiver")
+    app = FastAPI(title="Wazzup24 Webhook Receiver")
 
-    # POST /webhook: JSON body (стандартный Wappi формат)
+    # POST /webhook: основной endpoint для Wazzup24
     @app.post(config.WEBHOOK_PATH)
-    async def webhook_post(payload: dict = Body(...)):
+    async def webhook_post(request: Request, payload: dict = Body(...)):
+        # HMAC verification (если WAZZUP_VERIFY_SIGNATURE on и secret задан)
+        if config.WAZZUP_VERIFY_SIGNATURE and config.WAZZUP_HMAC_SECRET:
+            raw = await request.body()
+            sig = (
+                request.headers.get("x-wazzup-signature")
+                or request.headers.get("x-signature")
+                or request.headers.get("signature")
+            )
+            if not wazzup.verify_webhook_signature(raw, sig):
+                reconcile.log.warning(
+                    f"Webhook /webhook: invalid signature (sig={sig!r})"
+                )
+                raise HTTPException(status_code=401, detail="invalid signature")
         reconcile.log.info(f"Webhook POST received: {str(payload)[:200]}")
-        return _handle_payload(payload)
+        return _handle_wazzup_payload(None, payload)
 
-    # GET /webhook: Wappi может слать query-параметры
-    @app.get(config.WEBHOOK_PATH)
-    async def webhook_get(request: Request):
-        params = dict(request.query_params)
-        reconcile.log.info(f"Webhook GET received: query={params}")
-        if not params:
-            return {"status": "empty"}
-        # Собираем query-параметры в структуру
-        msg = {}
-        for k, v in params.items():
-            if k in ("is_me", "isReply", "is_forwarded", "is_edited", "is_deleted", "is_bot"):
-                msg[k] = v.lower() in ("true", "1")
-            elif k in ("time",):
-                try:
-                    msg[k] = int(v)
-                except Exception:
-                    msg[k] = v
-            else:
-                msg[k] = v
-        payload = {"messages": [msg]}
-        return _handle_payload(payload)
+    # POST /webhook/wazzup: явный Wazzup endpoint
+    @app.post("/webhook/wazzup")
+    async def webhook_wazzup_post(
+        request: Request,
+        payload: dict = Body(...),
+    ):
+        if config.WAZZUP_VERIFY_SIGNATURE and config.WAZZUP_HMAC_SECRET:
+            raw = await request.body()
+            sig = (
+                request.headers.get("x-wazzup-signature")
+                or request.headers.get("x-signature")
+                or request.headers.get("signature")
+            )
+            if not wazzup.verify_webhook_signature(raw, sig):
+                reconcile.log.warning(
+                    f"Webhook /webhook/wazzup: invalid signature (sig={sig!r})"
+                )
+                raise HTTPException(status_code=401, detail="invalid signature")
+        reconcile.log.info(f"Webhook /webhook/wazzup POST: {str(payload)[:200]}")
+        return _handle_wazzup_payload("waba", payload)
 
     # HEAD /webhook: некоторые сервисы проверяют URL HEAD-запросом
     @app.head(config.WEBHOOK_PATH)

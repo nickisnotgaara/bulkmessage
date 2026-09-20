@@ -9,7 +9,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Optional
 
-from . import config, db, sheets, wappi
+from . import config, db, sheets, wazzup
 from .sheets import sync_message_to_sheet
 
 
@@ -21,14 +21,30 @@ log = config.get_logger("reconcile")
 # ============================================================
 
 
+def _extract_phone(value) -> str:
+    """Извлечь и нормализовать телефон из поля (chatId / from / sender и т.п.).
+
+    Wazzup24 присылает chatId как нормализованный цифровой phone.
+    Если встречается JID-хвост (@s.whatsapp.net и т.п.) — отрезаем.
+    """
+    if not value:
+        return ""
+    s = str(value)
+    # отрезаем JID-хвост если был
+    for sep in ("@", ":"):
+        if sep in s:
+            s = s.split(sep, 1)[0]
+    return wazzup.normalize_phone(s) or ""
+
+
 def process_incoming_message(channel: str, msg: dict) -> None:
     raw_text = (msg.get("body") or "").strip()
     msg_type = (msg.get("type") or "chat").lower()
-    wappi_message_id = msg.get("id") or msg.get("message_id")
+    message_id = msg.get("id") or msg.get("message_id")
     if msg_type != "chat" and not raw_text:
         raw_text = f"[{msg_type}]"
 
-    phone = wappi.extract_phone_from_from(msg.get("from")) or wappi.extract_phone_from_chat(
+    phone = _extract_phone(msg.get("from")) or _extract_phone(
         msg.get("chatId") or msg.get("chat_id")
     )
     if not phone:
@@ -50,7 +66,7 @@ def process_incoming_message(channel: str, msg: dict) -> None:
             )
             contact = db.get_contact_by_phone(conn, phone)
         contact_id = contact["id"]
-        db.add_reply(conn, contact_id, channel, raw_text, wappi_message_id)
+        db.add_reply(conn, contact_id, channel, raw_text, message_id)
         # Помечаем ВСЕ сообщения этого контакта в этом канале как answered
         # (т.к. контакт ответил в чате — не важно на какое именно сообщение)
         with db.db_conn() as conn2:
@@ -88,19 +104,39 @@ def process_incoming_message(channel: str, msg: dict) -> None:
     log.info(f"Reply stored and Google updated for {phone}/{channel}")
 
 
+def _wazzup_status_to_local(status: Optional[str]) -> str:
+    """Wazzup status → наш локальный status.
+
+    Wazzup statuses (см. WAZZUP24_KNOWLEDGE_BASE.md):
+      - sent / delivered / read / error
+    """
+    if not status:
+        return "sent"
+    s = str(status).lower()
+    if s == "read":
+        return "read"
+    if s == "delivered":
+        return "delivered"
+    if s in ("sent", "outgoing", "queued"):
+        return "sent"
+    if s in ("error", "failed", "undelivered"):
+        return "failed"
+    return s
+
+
 def process_delivery_status(channel: str, msg: dict) -> None:
-    wappi_message_id = msg.get("id") or msg.get("message_id")
-    status = wappi.wappi_status_to_local(msg.get("status"))
-    if not wappi_message_id:
+    message_id = msg.get("id") or msg.get("message_id")
+    status = _wazzup_status_to_local(msg.get("status"))
+    if not message_id:
         log.warning("delivery_status: нет message_id")
         return
     log.info(
-        f"📬 DELIVERY status: msg_id={wappi_message_id} channel={channel} -> {status}"
+        f"📬 DELIVERY status: msg_id={message_id} channel={channel} -> {status}"
     )
     with db.db_conn() as conn:
-        row = db.find_message_by_wappi_id(conn, wappi_message_id)
+        row = db.find_message_by_message_id(conn, message_id)
         if row is None:
-            phone = wappi.extract_phone_from_chat(msg.get("chat_id") or msg.get("to"))
+            phone = _extract_phone(msg.get("chat_id") or msg.get("to"))
             if phone:
                 contact = db.get_contact_by_phone(conn, phone)
                 if contact is not None:
@@ -109,12 +145,12 @@ def process_delivery_status(channel: str, msg: dict) -> None:
                         db.update_message_status(
                             conn,
                             message_pk=target["id"],
-                            wappi_message_id=wappi_message_id,
+                            message_id=message_id,
                         )
-                        row = db.find_message_by_wappi_id(conn, wappi_message_id)
+                        row = db.find_message_by_message_id(conn, message_id)
         if row is None:
             log.warning(
-                f"delivery_status: сообщение {wappi_message_id} не найдено в БД"
+                f"delivery_status: сообщение {message_id} не найдено в БД"
             )
             return
         kwargs: dict = {"message_pk": row["id"]}
@@ -134,63 +170,261 @@ def process_delivery_status(channel: str, msg: dict) -> None:
         contact_id=contact_id, channel=channel, status=status, message_pk=message_pk
     )
 
+    # Phase 3.6: complaint halt — если error сигналит о жалобе (spam/report).
+    error_blob = msg.get("error") or {}
+    if isinstance(error_blob, dict):
+        err_code = (error_blob.get("error") or error_blob.get("code") or "").lower()
+        err_kind = (error_blob.get("description") or "").lower()
+    else:
+        err_code = str(error_blob).lower()
+        err_kind = ""
+    spam_markers = (
+        "spam", "spam_report", "report_spam", "user_complaint",
+        "block", "blocked", "quality_red", "low_quality",
+    )
+    if any(m in err_code for m in spam_markers) or any(m in err_kind for m in spam_markers):
+        try:
+            _record_complaint_and_maybe_halt(channel, kind=err_code or "spam_report")
+        except Exception as e:
+            log.warning(f"complaint halt handler error: {e}")
+
+
+def _record_complaint_and_maybe_halt(channel: str, kind: str = "spam") -> None:
+    """Phase 3.6: записывает жалобу и halt'ит канал если порог превышен."""
+    # Lazy import чтобы не было цикла
+    from . import state, tglog
+    cur = state.load_state()
+    cur = state.reset_daily_if_new_day(cur)
+    state.record_complaint(cur, channel, kind=kind)
+    # Запись в db для аудита (long-term)
+    try:
+        with db.db_conn() as conn:
+            db.log_complaint(conn, channel, phone=None, complaint_kind=kind)
+    except Exception as e:
+        log.warning(f"db.log_complaint failed: {e}")
+    if state.should_halt_after_complaint(cur, channel):
+        state.halt_channel(cur, channel)
+        tglog.send(
+            f"🚨 CHANNEL HALT: {channel} достиг {state.get_complaint_count(cur, channel)} "
+            f"жалоб за {config.COMPLAINT_WINDOW_HOURS}ч. Канал остановлен до "
+            f"{cur['halted_channels'].get(channel, '?')}",
+            "ERROR",
+        )
+        log.error(
+            f"🚨 HALTED {channel} after {state.get_complaint_count(cur, channel)} complaints"
+        )
+    state.save_state(cur)
+
 
 def process_outgoing_message(channel: str, msg: dict) -> None:
-    wappi_message_id = msg.get("id") or msg.get("message_id")
-    if not wappi_message_id:
+    message_id = msg.get("id") or msg.get("message_id")
+    if not message_id:
         return
-    log.info(f"📤 OUTGOING event: msg_id={wappi_message_id} channel={channel}")
+    log.info(f"📤 OUTGOING event: msg_id={message_id} channel={channel}")
     with db.db_conn() as conn:
-        row = db.find_message_by_wappi_id(conn, wappi_message_id)
+        row = db.find_message_by_message_id(conn, message_id)
         if row is None:
             return
         if row["status"] in ("queued", "sent"):
             db.update_message_status(conn, message_pk=row["id"], status="sent")
 
 
-def process_webhook_payload(channel_hint: Optional[str], payload: dict) -> None:
+# ============================================================
+# Wazzup24 webhook handling (Phase 1.3)
+# ============================================================
+
+
+def _wazzup_chat_type_to_channel(chat_type: str, channel_id: str = "") -> str:
+    """Маппинг Wazzup chatType (+ channelId) → bulkmessage channel name.
+
+    Wazzup chatType: 'whatsapp' | 'telegram' | 'max' | 'viber' | 'instagram' |
+    'whatsgroup' | ''.
+    chatType "whatsapp" НЕ различает Personal WA от WABA — для этого нужен
+    channelId → transport (см. wazzup.channel_name_for()).
+
+    Приоритет:
+      1. Если задан channelId и он есть в кэше Wazzup → берём из кэша.
+      2. Иначе маппим по chatType (Telegram/MAX уникальны).
+      3. Для chatType='whatsapp' без channelId → fallback 'whatsapp' (старый код).
+    """
+    # 1. По channelId (точнее, учитывает WABA vs Personal)
+    if channel_id:
+        from . import wazzup as _wz
+        name = _wz.channel_name_for(channel_id)
+        if name:
+            return name
+
+    # 2. По chatType (для TG/MAX, где он однозначен)
+    ct = (chat_type or "").lower().strip()
+    if ct in ("telegram", "tg", "tgapi"):
+        return "telegram"
+    if ct in ("max", "vk", "maxapi"):
+        return "max"
+
+    # 3. Fallback
+    if ct in ("whatsapp", "waba", "whatsgroup"):
+        return "whatsapp"
+    return "whatsapp"  # неизвестное → как раньше (default)
+
+
+def _wazzup_extract_message(msg: dict) -> dict:
+    """Нормализует message payload от Wazzup к плоскому виду для process_incoming_message.
+
+    Wazzup fields:
+      - messageId (uuid)
+      - chatType (whatsapp/telegram/...)
+      - chatId   (phone or username)
+      - text
+      - timestamp
+      - type: 'incoming' | 'outgoing' | 'status'
+      - status: 'sent' | 'delivered' | 'read' | 'error'
+      - error: {code, description}
+      - channelId
+    """
+    return {
+        "id": msg.get("messageId"),
+        "message_id": msg.get("messageId"),
+        "body": msg.get("text") or "",
+        "type": msg.get("type"),
+        "chatId": msg.get("chatId"),
+        "chat_id": msg.get("chatId"),
+        "from": msg.get("chatId"),  # входящее = от chatId
+        "status": msg.get("status"),
+        "error": msg.get("error"),
+        "timestamp": msg.get("timestamp"),
+        "channelId": msg.get("channelId"),
+    }
+
+
+def process_wazzup_payload(channel_hint: Optional[str], payload: dict) -> None:
+    """Обрабатывает webhook payload от Wazzup24.
+
+    Поддерживаемые события (см. WAZZUP24_KNOWLEDGE_BASE.md):
+      - message.add (входящее сообщение)
+      - message.status_update (sent → delivered → read → error)
+      - channel.waba_tier_update (Meta повысил/понизил tier)
+      - waba_template.status_update (Meta одобрила/отклонила шаблон)
+      - channel.qr_update (обновился QR — для админа)
+    """
     if not isinstance(payload, dict):
         return
-    if "messages" in payload:
-        data = payload["messages"]
+    # Wazzup может слать как list, так и dict-with-list. Нормализуем.
+    items: list = []
+    if "messages" in payload and isinstance(payload["messages"], list):
+        items = payload["messages"]
+    elif "events" in payload and isinstance(payload["events"], list):
+        items = payload["events"]
     else:
-        data = payload
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        items = [data]
-    else:
-        return
+        # Один объект — оборачиваем в list
+        items = [payload]
 
-    for msg in items:
-        if not isinstance(msg, dict):
+    for evt in items:
+        if not isinstance(evt, dict):
             continue
-        wh_type = (msg.get("wh_type") or "").lower()
-        ch = channel_hint or wappi.channel_from_profile_id(msg.get("profile_id"))
-        if ch not in config.WAPPI_TOKENS:
-            ch = wappi.channel_from_profile_id(msg.get("profile_id"))
-        if not ch:
-            log.debug(
-                f"webhook: не удалось определить канал (profile_id={msg.get('profile_id')})"
-            )
-            continue
+        evt_type = (
+            evt.get("type")
+            or evt.get("event")
+            or evt.get("wh_type")
+            or ""
+        ).lower()
+
         try:
-            if wh_type == "incoming_message":
+            # Канал определяем из payload'а (chatType + channelId), а не из channel_hint.
+            # hint переопределяет только если он задан (для обратной совместимости).
+            # chatType от Wazzup: whatsapp | telegram | max | viber | instagram | …
+            # channelId нужен для различения WABA vs Personal WA (chatType='whatsapp'
+            # для обоих).
+            chat_type = (evt.get("chatType") or "").strip().lower()
+            evt_channel_id = (evt.get("channelId") or "").strip()
+            ch = channel_hint or _wazzup_chat_type_to_channel(chat_type, evt_channel_id)
+
+            if evt_type in ("incoming_message", "message", "incoming"):
+                msg = _wazzup_extract_message(evt)
+                msg["chat_type"] = chat_type or "whatsapp"
                 process_incoming_message(ch, msg)
-            elif wh_type == "delivery_status":
+            elif evt_type in ("delivery_status", "status_update", "outgoing_message_api",
+                              "outgoing_message_phone", "message_status"):
+                msg = _wazzup_extract_message(evt)
                 process_delivery_status(ch, msg)
-            elif wh_type in ("outgoing_message_api", "outgoing_message_phone"):
+            elif evt_type in ("outgoing", "outgoing_message"):
+                msg = _wazzup_extract_message(evt)
                 process_outgoing_message(ch, msg)
-            elif wh_type in ("authorization_status", "application_status", "incoming_call"):
-                log.info(f"Ignored wh_type={wh_type}")
+            elif evt_type == "channel.waba_tier_update":
+                _handle_wazzup_tier_update(evt)
+            elif evt_type == "waba_template.status_update":
+                _handle_wazzup_template_status(evt)
+            elif evt_type in ("channel.qr_update", "channel.status_update",
+                              "channel.create", "channel.delete"):
+                _handle_wazzup_channel_event(evt)
             else:
-                # Fallback detection
-                if "status" in msg and "id" in msg and "chat_id" in msg:
-                    process_delivery_status(ch, msg)
-                elif "from" in msg or "chatId" in msg or "chat_id" in msg:
-                    process_incoming_message(ch, msg)
+                log.debug(f"process_wazzup_payload: ignored event type={evt_type!r}")
         except Exception as e:
-            log.error(f"webhook handler error ({wh_type}): {e}\n{traceback.format_exc()}")
+            log.error(
+                f"process_wazzup_payload handler error ({evt_type}): {e}\n"
+                f"{traceback.format_exc()}"
+            )
+
+
+def _handle_wazzup_tier_update(evt: dict) -> None:
+    """Канал WABA получил новый tier (Meta сама повышает/понижает)."""
+    tier = evt.get("tier")
+    if tier is None:
+        log.debug("waba_tier_update: no tier field")
+        return
+    try:
+        tier = int(tier)
+    except (TypeError, ValueError):
+        log.warning(f"waba_tier_update: invalid tier value {tier!r}")
+        return
+    # Сохраняем в state.json (lazy import чтобы не было цикла)
+    from . import state as _state
+    _state.set_waba_tier(tier)
+    log.info(f"📈 WABA tier updated → {tier} (cap = {config.WABA_TIER_LIMITS.get(tier, '?')})")
+
+
+def _handle_wazzup_template_status(evt: dict) -> None:
+    """Meta одобрила/отклонила template."""
+    template_id = evt.get("templateId") or evt.get("id")
+    status = (evt.get("status") or "").lower()
+    name = evt.get("name") or ""
+    category = evt.get("category") or ""
+    language = evt.get("language") or "ru"
+    error = evt.get("error")
+    if not template_id or not status:
+        log.debug(f"waba_template.status_update: missing templateId/status")
+        return
+    try:
+        with db.db_conn() as conn:
+            db.upsert_waba_template(
+                conn,
+                template_id=template_id,
+                name=name or f"template-{template_id[:8]}",
+                category=category or None,
+                language_code=language,
+                status=status,
+                last_error=str(error) if error else None,
+            )
+        log.info(f"📋 WABA template status: {template_id} → {status}")
+    except Exception as e:
+        log.error(f"_handle_wazzup_template_status error: {e}")
+
+
+def _handle_wazzup_channel_event(evt: dict) -> None:
+    """QR-обновление, статус канала, etc — просто логируем для админа."""
+    evt_type = evt.get("type") or evt.get("event")
+    channel_id = evt.get("channelId")
+    log.info(
+        f"🔔 Wazzup channel event: type={evt_type!r} channelId={channel_id!r}"
+    )
+
+
+def process_webhook_payload(channel_hint: Optional[str], payload: dict) -> None:
+    """Прокси для webhook payload — единый обработчик Wazzup24.
+
+    Эта функция — тонкая обёртка над process_wazzup_payload для вызовов из
+    webhook_app._handle_payload.
+    """
+    process_wazzup_payload(channel_hint, payload)
 
 
 # ============================================================
@@ -230,6 +464,18 @@ def reconcile_pending_webhooks() -> None:
 
 
 def reconcile_message_statuses() -> None:
+    """Reconcile статусов сообщений.
+
+    После миграции на Wazzup24 у нас нет GET-API для статуса конкретного
+    сообщения (Wazzup — webhook-driven). Статусы приходят в
+    `message.status_update` webhook → process_wazzup_payload.
+
+    Эта функция теперь только ищет зависшие 'queued' / 'sent' сообщения,
+    которые старше N часов и должны были получить delivered/read, но не
+    получили (например, webhook'и потерялись). В таком случае помечаем их
+    как 'sent' с предупреждением, чтобы не висели вечно.
+    """
+    horizon = datetime.now(timezone.utc).timestamp() - 4 * 3600  # 4 hours
     with db.db_conn() as conn:
         c = conn.cursor()
         c.execute(
@@ -237,8 +483,9 @@ def reconcile_message_statuses() -> None:
             SELECT m.id, m.channel, m.message_id, m.sent_at, m.status
             FROM messages m
             WHERE m.message_id IS NOT NULL AND m.message_id != ''
-              AND (m.status IN ('queued', 'sent', 'delivered')
-                   OR m.read_at IS NULL)
+              AND m.status IN ('queued', 'sent', 'delivered')
+              AND m.read_at IS NULL
+              AND m.sent_at IS NOT NULL
             ORDER BY m.id DESC
             LIMIT ?
             """,
@@ -254,41 +501,13 @@ def reconcile_message_statuses() -> None:
                     sent_dt = datetime.fromisoformat(sent_at.replace("Z", "+00:00"))
                 except Exception:
                     sent_dt = now
-                if (now - sent_dt).total_seconds() < config.STATUS_POLL_AGE_SEC:
+                if sent_dt.timestamp() > horizon:
                     continue
-            data = wappi.fetch_wappi_status(row["channel"], row["message_id"])
-            if not data:
-                continue
-            inner = data.get("message") or data
-            delivery_status = (
-                inner.get("delivery_status")
-                or inner.get("status")
-                or (inner.get("isRead") and "read")
-            )
-            is_read = bool(inner.get("isRead"))
-            status = wappi.wappi_status_to_local(delivery_status)
-            if is_read:
-                status = "read"
-            if status == row["status"]:
-                continue
-            log.info(
-                f"Reconcile: msg_id={row['message_id']} {row['status']} -> {status}"
-            )
-            with db.db_conn() as conn:
-                kwargs: dict = {"message_pk": row["id"], "status": status}
-                if status == "delivered":
-                    kwargs["delivered_at"] = True
-                elif status == "read":
-                    kwargs["delivered_at"] = True
-                    kwargs["read_at"] = True
-                elif status == "failed":
-                    kwargs["last_error"] = "reconcile: failed"
-                db.update_message_status(conn, **kwargs)
-            sync_message_to_sheet(
-                contact_id=None,
-                channel=row["channel"],
-                status=status,
-                message_pk=row["id"],
+            # Wazzup webhook не доставил финального статуса. Оставляем sent,
+            # помечаем last_error, чтобы оператор видел "что-то не так".
+            log.warning(
+                f"Reconcile: msg_id={row['message_id']} висит в '{row['status']}' "
+                f"без финального статуса >4ч — webhook'и от Wazzup могли потеряться"
             )
         except Exception as e:
             log.warning(
@@ -341,119 +560,15 @@ def reconcile_sheets_queue() -> None:
 
 
 def reconcile_incoming_replies(limit_contacts: int = 100) -> None:
-    """Подтягивает пропущенные входящие ответы через GET /api/sync/messages/get.
+    """Подтягивает пропущенные входящие ответы.
 
-    Используется, когда webhook'и от Wappi не дошли (наш сервер был недоступен).
-    Для каждого контакта с отправленными сообщениями опрашивает Wappi с момента
-    last_activity и добавляет входящие сообщения как reply.
+    После миграции на Wazzup24 эта функция стала no-op: Wazzup не имеет
+    GET API для истории чатов — все входящие приходят через webhook
+    `message.add` (см. process_wazzup_payload → process_incoming_message).
+    Функция оставлена как stub для обратной совместимости вызовов из
+    reconcile_loop, чтобы ничего не падало.
     """
-    with db.db_conn() as conn:
-        c = conn.cursor()
-        c.execute(
-            """
-            SELECT ct.id AS contact_id, ct.phone, ct.name,
-                   m.channel,
-                   MAX(COALESCE(m.updated_at, m.sent_at, m.created_at)) AS last_activity,
-                   MAX(COALESCE(m.read_at, m.answered_at, m.delivered_at, m.sent_at)) AS last_event
-            FROM contacts ct
-            JOIN messages m ON m.contact_id = ct.id
-            WHERE m.status IN ('sent', 'delivered', 'read', 'answered')
-            GROUP BY ct.id, m.channel
-            ORDER BY last_activity DESC
-            LIMIT ?
-            """,
-            (limit_contacts,),
-        )
-        rows = c.fetchall()
-
-    for row in rows:
-        contact_id = row["contact_id"]
-        phone = row["phone"]
-        channel = row["channel"]
-        last_activity = row["last_activity"]
-        try:
-            since_iso = None
-            if last_activity:
-                # Wappi принимает date в формате YYYY-mm-ddTHH:MM:ss
-                try:
-                    dt = datetime.fromisoformat(last_activity.replace("Z", "+00:00"))
-                    since_iso = dt.strftime("%Y-%m-%dT%H:%M:%S")
-                except Exception:
-                    since_iso = None
-
-            messages = wappi.fetch_chat_messages(
-                channel, phone, since_iso=since_iso, limit=50
-            )
-            if not messages:
-                continue
-
-            # Уже сохранённые wappi_message_id (чтобы не дублировать)
-            with db.db_conn() as conn:
-                c = conn.cursor()
-                c.execute(
-                    "SELECT wappi_message_id FROM replies "
-                    "WHERE contact_id = ? AND channel = ? AND wappi_message_id IS NOT NULL",
-                    (contact_id, channel),
-                )
-                already = {r["wappi_message_id"] for r in c.fetchall()}
-
-            new_count = 0
-            for msg in messages:
-                # Входящее = fromMe == False (или from не наш профиль)
-                if msg.get("fromMe") is True:
-                    continue
-                wappi_mid = msg.get("id") or msg.get("message_id")
-                if wappi_mid and wappi_mid in already:
-                    continue
-                body = (msg.get("body") or "").strip()
-                msg_type = (msg.get("type") or "chat").lower()
-                if not body and msg_type:
-                    body = f"[{msg_type}]"
-                if not body:
-                    continue
-                with db.db_conn() as conn:
-                    db.add_reply(conn, contact_id, channel, body, wappi_mid)
-                    target = db.get_latest_inbound_target(conn, contact_id, channel)
-                    if target is not None and target["status"] != "answered":
-                        db.update_message_status(
-                            conn,
-                            message_pk=target["id"],
-                            status="answered",
-                            answered_at=True,
-                        )
-                        message_pk = target["id"]
-                    else:
-                        message_pk = None
-                new_count += 1
-                # Sync ALL outbound messages for this contact+channel,
-                # не только тот, на который пришёл ответ
-                with db.db_conn() as conn:
-                    c = conn.cursor()
-                    c.execute(
-                        "SELECT id FROM messages WHERE contact_id = ? AND channel = ? AND message_id IS NOT NULL AND message_id != ''",
-                        (contact_id, channel),
-                    )
-                    all_message_pks = [r["id"] for r in c.fetchall()]
-                for mpk in all_message_pks:
-                    try:
-                        sync_message_to_sheet(
-                            contact_id=contact_id,
-                            channel=channel,
-                            status="answered",
-                            message_pk=mpk,
-                        )
-                    except Exception as ex:
-                        log.warning(f"resync to sheet failed: {ex}")
-
-            if new_count:
-                log.info(
-                    f"Reconcile replies: {phone}/{channel} -> "
-                    f"+{new_count} missed reply(ies)"
-                )
-        except Exception as e:
-            log.warning(
-                f"reconcile_incoming_replies error for {phone}/{channel}: {e}"
-            )
+    return
 
 
 def reconcile_loop(stop_event: threading.Event) -> None:

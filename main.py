@@ -25,7 +25,12 @@ from bulkmessage.state import (
     reset_daily_if_new_day,
 )
 from bulkmessage.templates import build_message, load_templates
-from bulkmessage.wappi import active_channels, classify_error, send_wappi, normalize_phone
+from bulkmessage.wazzup import (
+    active_channels,
+    classify_error,
+    send_to_channel,
+    normalize_phone,
+)
 from bulkmessage import config
 
 
@@ -41,7 +46,7 @@ __all__ = [
     "channel_has_quota",
     "reset_daily_if_new_day",
     "active_channels",
-    "send_wappi",
+    "send_to_channel",
     "classify_error",
     "normalize_phone",
     "config",
@@ -61,6 +66,15 @@ if __name__ == "__main__":
     elif mode == "tracker":
         from bulkmessage.tracker import run as run_tracker
         run_tracker()
+    elif mode == "preflight":
+        from bulkmessage.preflight import run_preflight
+        sys.exit(run_preflight())
+    elif mode == "reset-state":
+        from bulkmessage.preflight import reset_state
+        sys.exit(reset_state())
     else:
-        print(f"Unknown mode: {mode}. Use 'sender' or 'tracker'.", file=sys.stderr)
+        print(
+            f"Unknown mode: {mode}. Use 'sender'|'tracker'|'preflight'|'reset-state'.",
+            file=sys.stderr,
+        )
         sys.exit(1)

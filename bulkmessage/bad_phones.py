@@ -21,7 +21,9 @@ from . import config
 
 
 _LOCK = threading.RLock()
-_DATA: Dict[str, Dict[str, bool]] = {}
+# Структура:
+#   phone -> channel -> {"bad": bool, "cooldown_until": iso_ts | None, "reason": str}
+_DATA: Dict[str, Dict[str, dict]] = {}
 
 
 def _path() -> Path:
@@ -33,18 +35,45 @@ def _path() -> Path:
 
 
 def load() -> int:
-    """Загрузить кэш с диска. Возвращает сколько контактов загружено."""
+    """Загрузить кэш с диска. Возвращает сколько контактов загружено.
+
+    Поддерживает обратную совместимость со старым форматом
+    {phone: {channel: bool}}. Если встречает bool — конвертирует в
+    {"bad": bool, "cooldown_until": None, "reason": "legacy"}.
+    """
     global _DATA
     p = _path()
     if not p.exists():
         _DATA = {}
         return 0
     try:
-        _DATA = json.loads(p.read_text(encoding="utf-8"))
-        # Sanity check
-        if not isinstance(_DATA, dict):
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
             _DATA = {}
             return 0
+        # Migrate old {channel: bool} → {channel: dict}
+        migrated: Dict[str, Dict[str, dict]] = {}
+        for phone, channels in raw.items():
+            if not isinstance(channels, dict):
+                continue
+            migrated[phone] = {}
+            for channel, val in channels.items():
+                if isinstance(val, bool):
+                    migrated[phone][channel] = {
+                        "bad": val,
+                        "cooldown_until": None,
+                        "reason": "legacy",
+                    }
+                elif isinstance(val, dict):
+                    # New format — keep as-is
+                    migrated[phone][channel] = val
+                else:
+                    migrated[phone][channel] = {
+                        "bad": bool(val),
+                        "cooldown_until": None,
+                        "reason": "legacy",
+                    }
+        _DATA = migrated
         return len(_DATA)
     except (json.JSONDecodeError, OSError) as e:
         # Битый файл — лучше начать с пустого, чем крашить
@@ -73,45 +102,94 @@ def is_bad(phone: str, channel: str) -> bool:
     """True если phone+channel ранее получал PERMANENT (404)."""
     if not phone:
         return False
-    return _DATA.get(phone, {}).get(channel, False)
+    entry = _DATA.get(phone, {}).get(channel)
+    if isinstance(entry, dict):
+        return bool(entry.get("bad"))
+    return False
 
 
-def mark_bad(phone: str, channel: str) -> bool:
+def is_in_cooldown(phone: str, channel: str, now_iso: str) -> bool:
+    """True если phone+channel в cooldown (cooldown_until > now)."""
+    if not phone or not channel:
+        return False
+    entry = _DATA.get(phone, {}).get(channel)
+    if not isinstance(entry, dict):
+        return False
+    until = entry.get("cooldown_until")
+    if not until:
+        return False
+    return str(until) > str(now_iso)
+
+
+def mark_bad(
+    phone: str,
+    channel: str,
+    reason: str = "permanent",
+    cooldown_until_iso: Optional[str] = None,
+) -> bool:
     """Пометить phone+channel как мёртвый. Возвращает True если реально изменилось.
 
     Записывает на диск атомарно. Можно вызывать часто — запись короткая.
     """
     if not phone or not channel:
         return False
+    new_entry = {
+        "bad": True,
+        "cooldown_until": cooldown_until_iso,
+        "reason": reason,
+    }
     with _LOCK:
         if phone not in _DATA:
             _DATA[phone] = {}
-        if _DATA[phone].get(channel):
+        existing = _DATA[phone].get(channel)
+        if existing == new_entry:
             return False  # уже было
-        _DATA[phone][channel] = True
+        _DATA[phone][channel] = new_entry
     # save() вне lock (он сам лочится)
     save()
     return True
+
+
+def mark_complaint_cooldown(
+    phone: str, channel: str, cooldown_until_iso: str, reason: str = "complaint"
+) -> bool:
+    """Пометить phone+channel как в cooldown после жалобы (Phase 3.6)."""
+    return mark_bad(phone, channel, reason=reason, cooldown_until_iso=cooldown_until_iso)
 
 
 def is_fully_bad(phone: str, active_channels: Set[str]) -> bool:
     """True если для phone ВСЕ переданные каналы мёртвые.
 
     Если active_channels пустое — возвращает True (нет смысла пытаться).
+    Учитывает ТОЛЬКО `bad=True`, не учитывает временный cooldown.
     """
     if not phone:
         return False
     if not active_channels:
         return True
     phone_data = _DATA.get(phone, {})
-    return all(phone_data.get(ch, False) for ch in active_channels)
+    for ch in active_channels:
+        entry = phone_data.get(ch)
+        if isinstance(entry, dict):
+            if not entry.get("bad"):
+                return False
+        else:
+            return False
+    return True
 
 
 def get_known_channels(phone: str) -> Set[str]:
     """Множество каналов, для которых phone уже помечен как мёртвый."""
     if not phone:
         return set()
-    return {ch for ch, bad in _DATA.get(phone, {}).items() if bad}
+    out: Set[str] = set()
+    for ch, entry in _DATA.get(phone, {}).items():
+        if isinstance(entry, dict):
+            if entry.get("bad"):
+                out.add(ch)
+        elif entry:  # legacy bool
+            out.add(ch)
+    return out
 
 
 def clear() -> None:

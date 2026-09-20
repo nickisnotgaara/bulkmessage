@@ -1,4 +1,7 @@
-"""Sender service: long-running daemon that broadcasts Wappi messages.
+"""Sender service: long-running daemon that broadcasts messages via Wazzup24.
+
+Все мессенджеры (WABA, Telegram, MAX, WhatsApp Personal) идут через
+Wazzup24 API — это единственная точка отправки.
 
 Per-channel backoffs and per-channel error classification: an error in one
 channel (especially MAX) does not block the others.
@@ -15,9 +18,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from . import config, contacts, db, bad_phones, failed_contacts, sheets, state, templates, wappi
+from . import (
+    config,
+    contacts,
+    db,
+    bad_phones,
+    failed_contacts,
+    sheets,
+    state,
+    templates,
+    wazzup,
+)
 from .sheets import sync_message_to_sheet
-from .wappi import ErrorKind
+from .wazzup import ErrorKind
 
 
 log = config.get_logger("sender")
@@ -241,7 +254,7 @@ def _next_backoff(kind: ErrorKind, current: int) -> int:
     """Вычисляет длительность backoff для данного типа ошибки.
 
     RATE_LIMIT — экспоненциальный рост: current*2 (с потолком MAX), старт от BASE.
-    TRANSIENT — случайный в [MIN, MAX] (Wappi моргнул, можно пробовать).
+    TRANSIENT — случайный в [MIN, MAX] (Wazzup моргнул, можно пробовать).
     AUTH — сразу MAX (токен надо чинить руками, частые попытки бессмысленны).
     PERMANENT/UNKNOWN — 0 (не повторится, нет смысла ждать).
     """
@@ -297,7 +310,7 @@ def _persist_success(phone: str, name: str, category: str, channel: str,
         return message_pk
     except Exception as e:
         # DB write упал, но state уже сохранён — квота списана, дубля не будет.
-        # Получатель УЖЕ получил сообщение (мы выше вызвали wappi), но в DB
+        # Получатель УЖЕ получил сообщение (мы выше вызвали Wazzup), но в DB
         # записи нет. Это критическая ситуация — логируем как ERROR.
         log.error(
             f"      💥 DB WRITE FAILED после успешной отправки в {channel}! "
@@ -331,6 +344,44 @@ def _persist_failure(phone: str, name: str, category: str, channel: str,
         log.warning(f"      ⚠️ Не удалось записать failed в БД: {e}")
 
 
+def _cascade_order() -> list[str]:
+    """Возвращает порядок каскада в зависимости от USE_WABA флага.
+
+    USE_WABA=0 (default, legacy): whatsapp → telegram → max.
+    USE_WABA=1: waba → telegram → max (основной режим).
+    """
+    if getattr(config, "USE_WABA", 0) and config.USE_WABA >= 1:
+        return ["waba", "telegram", "max"]
+    # legacy
+    return ["whatsapp", "telegram", "max"]
+
+
+def _within_safe_hours(channel: str = "all") -> bool:
+    """Phase 3.3: проверка активного и safe-окна.
+
+    Active window: ACTIVE_HOURS_START..ACTIVE_HOURS_END (например, 10-22).
+    Safe window (узкий): внутри active — для WABA 10-20, для Personal 11-19.
+
+    Возвращает True если сейчас можно отправлять в указанный канал.
+    BULK_BYPASS_SAFE_HOURS=1 → всегда True (только для тестов!).
+    """
+    if getattr(config, "BULK_BYPASS_SAFE_HOURS", False):
+        return True
+    now = config.now_tz()
+    h = now.hour
+    active_start = getattr(config, "ACTIVE_HOURS_START", 10)
+    active_end = getattr(config, "ACTIVE_HOURS_END", 22)
+    if h < active_start or h >= active_end:
+        return False
+    if channel == "waba":
+        safe_start = getattr(config, "WABA_SAFE_HOURS_START", active_start)
+        safe_end = getattr(config, "WABA_SAFE_HOURS_END", 20)
+    else:
+        safe_start = getattr(config, "PERSONAL_SAFE_HOURS_START", 11)
+        safe_end = getattr(config, "PERSONAL_SAFE_HOURS_END", 19)
+    return safe_start <= h < safe_end
+
+
 def _run_one_contact(
     contact: dict,
     channels: list[str],
@@ -338,85 +389,262 @@ def _run_one_contact(
     permanent_skipped: dict[str, set[str]],
     current_state: dict,
 ) -> bool:
-    """Отправляет сообщение во все активные каналы для одного контакта.
+    """Отправляет сообщение в ОДИН канал (cascade с break), не во все подряд.
 
-    Возвращает True, если хотя бы один канал доставил.
+    Возвращает True, если доставили хотя бы в один канал.
+
+    Cascade order (Phase 2.2):
+      USE_WABA=1: waba → telegram → max
+      USE_WABA=0: whatsapp → telegram → max (legacy)
+
+    На каждом канале:
+      - если PERMANENT → mark_unreachable, пробуем следующий
+      - если RATE/TRANSIENT → backoff, но НЕ пробуем следующий сразу (для sender это означает
+        «сегодня не судьба», но контакт не помечается мёртвым)
+      - если AUTH → halt канал, пробуем следующий
+      - если успех → break
 
     Side effects:
-    - backoffs[ch] обновляется для RATE_LIMIT/TRANSIENT/AUTH (нужно главному циклу).
-    - permanent_skipped[phone] обновляется для PERMANENT ошибок.
-    - current_state обновляется и сохраняется в файл при успехе.
+      - backoffs[ch] обновляется для RATE/TRANSIENT/AUTH
+      - permanent_skipped[phone] для PERMANENT
+      - current_state обновляется при успехе
+      - last_send_per_phone записывается при успехе
     """
+    from . import waba_templates  # lazy import
+
+    # Phase 3.3: dayparting проверяется per-channel внутри cascade loop,
+    # чтобы WABA мог отправлять в свои часы (10-20), а Personal в свои (11-19),
+    # даже если они не совпадают.
+
     phone = contact["phone"]
     name = contact.get("name", "") or "—"
     category = contact.get("category", "") or "—"
+
+    # Выбираем категорию и шаблон (Phase 1.2)
+    norm_category = templates.normalize_category(category)
+    template_id = waba_templates.ensure_waba_template_for_category(norm_category)
+
     text = templates.build_message(contact, templates.load_templates())
 
-    # Если ВСЕ активные каналы уже в bad_phones — skip'аем сразу (0 API calls)
-    not_fully_bad = [ch for ch in channels if not bad_phones.is_fully_bad(phone, {ch}) and ch not in permanent_skipped.get(phone, set())]
-    if not not_fully_bad and channels:
+    # Cascade: только каналы которые активны в текущей сессии
+    cascade = [ch for ch in _cascade_order() if ch in channels]
+
+    # Если ВСЕ активные каналы в bad_phones — skip без API calls
+    if cascade and bad_phones.is_fully_bad(phone, set(cascade)):
         log.info(
-            f"⏭️  SKIP {phone} ({name}, {category}) — все каналы в bad_phones cache. "
-            f"Без попыток."
+            f"⏭️  SKIP {phone} ({name}, {category}) — все каналы в bad_phones cache"
         )
         return False
 
-    available = [
-        ch for ch in channels
-        if state.channel_has_quota(current_state, ch)
-        and ch not in permanent_skipped.get(phone, set())
+    # Phase 3.x: smart WABA gating — если для этой категории НЕТ WABA template,
+    # не пытаемся WABA вообще (cold text без template = PERMANENT fail, и cascade
+    # упал бы в TG/MAX, что даёт СЛИШКОМ МНОГО TG/MAX отправок → риск бана).
+    # Вместо этого пробуем только Personal-каналы (если они есть).
+    if "waba" in cascade and not template_id:
+        cascade = [ch for ch in cascade if ch != "waba"]
+        log.debug(
+            f"      🔀 WABA skip: нет template для категории {category!r}, "
+            f"cascade → {cascade}"
+        )
+
+    # Pre-filter: bad_phones + per-phone cooldown + halted
+    cascade = [
+        ch for ch in cascade
+        if ch not in permanent_skipped.get(phone, set())
         and not bad_phones.is_bad(phone, ch)
+        and not state.is_phone_in_cooldown(current_state, phone, ch)
+        and not state.is_channel_halted(current_state, ch)
     ]
-    if not available:
+    if not cascade:
         log.info(
-            f"⏭️  SKIP {phone} ({name}, {category}) — нет доступных каналов "
-            f"(квоты/бэкофф/permanent/bad_phones). backoffs={backoffs}"
+            f"⏭️  SKIP {phone} ({name}, {category}) — все каналы в bad_phones/cooldown/halted"
         )
         return False
 
     log.info("─" * 70)
     log.info(
         f"📤 [{phone}] {name} | категория: {category} | "
-        f"каналы: {available} | длина текста: {len(text)}"
+        f"cascade: {cascade}"
     )
-    log.info(
-        f"   💬 ТЕКСТ:\n{text}"
-    )
+    # Текст покажем только когда реально отправляем (anti-pattern detection)
     log.info("─" * 70)
 
     sent_any = False
-    # Маркер: уже инкрементировали successful_today для этого контакта (чтоб при 2+ успешных каналах не считать дважды)
     counted_successful = False
 
-    for channel in available:
+    for channel in cascade:
+        # Per-channel safe hours check (WABA: 10-20, Personal: 11-19)
+        if not _within_safe_hours(channel=channel):
+            log.info(
+                f"   💤 {channel.upper()} вне safe hours, пропускаем"
+            )
+            continue
+        # Проверяем квоту (с headroom) ПЕРЕД каждой отправкой
+        if not state.channel_has_quota_with_headroom(current_state, channel):
+            log.info(
+                f"   ⏭️  {channel.upper()} quota exhausted (headroom), skip"
+            )
+            continue
+
         ch_count_sent = state.channel_sent_today(current_state, channel)
         ch_attempt = ch_count_sent + 1
+
+        # === WABA branch (Phase 1.4) ===
+        if channel == "waba":
+            started_at = config.now_tz()
+            ch_count_sent = state.channel_sent_today(current_state, "waba")
+            limit = state.effective_waba_cap(current_state)
+            log.info(
+                f"   🚀 WABA [{ch_count_sent + 1}/{limit}] отправляем {phone} ({name})…"
+            )
+            # Решаем: template или free text (24ч-окно)
+            in_24h_window = state.is_waba_in_24h_window(current_state, phone)
+            use_template = bool(template_id) and not in_24h_window
+            log.info(
+                f"      🧩 WABA decision: template_id={'set' if template_id else 'NONE'}, "
+                f"in_24h_window={in_24h_window}, mode="
+                f"{'template' if use_template else 'free-text'}"
+            )
+            if config.DRY_RUN:
+                ok = True
+                message_id = f"dryrun_{int(started_at.timestamp())}_waba"
+                detail = "[DRY-RUN] имитация WABA отправки"
+                http_status = 200
+                log.info("      🧪 WABA DRY-RUN")
+            else:
+                waba_chat_id = wazzup.normalize_phone(phone)
+                if not waba_chat_id:
+                    ok, message_id, detail, http_status = (
+                        False, None, "phone normalization failed", None,
+                    )
+                else:
+                    if use_template:
+                        # WABA template требует значение для каждой
+                        # переменной. У нас 1 переменная — имя. Пустая строка
+                        # допустима (Meta API принимает var="" без ошибок).
+                        template_values = [name if name else ""]
+                        ok, message_id, detail, http_status = wazzup.send_wazzup(
+                            channel_id=config.WAZZUP_DEFAULT_CHANNEL_ID,
+                            chat_id=waba_chat_id,
+                            template_id=template_id,
+                            template_values=template_values,
+                            chat_type="whatsapp",
+                        )
+                    else:
+                        ok, message_id, detail, http_status = wazzup.send_wazzup(
+                            channel_id=config.WAZZUP_DEFAULT_CHANNEL_ID,
+                            chat_id=waba_chat_id,
+                            text=text,
+                            chat_type="whatsapp",
+                        )
+            _append_log(phone, "waba", "success" if ok else "fail", detail)
+            elapsed = (config.now_tz() - started_at).total_seconds()
+
+            if ok:
+                log.info(
+                    f"   ✅ WABA OK за {elapsed:.1f}с | message_id={message_id} | "
+                    f"{'template' if use_template else 'free-text'} | {detail[:120]}"
+                )
+                _persist_success(
+                    phone, name, category, "waba", text, message_id, current_state,
+                )
+                from datetime import datetime, timezone
+                state.set_waba_sent_meta(current_state, phone, datetime.now(timezone.utc).isoformat())
+                current_state["_waba_consecutive_permanent"] = 0  # reset circuit breaker
+                state.set_last_send_per_phone(
+                    current_state, phone, datetime.now(timezone.utc).isoformat(),
+                )
+                state.save_state(current_state)
+                sent_any = True
+                if not counted_successful:
+                    state.increment_successful(current_state)
+                    state.save_state(current_state)
+                    counted_successful = True
+                break  # cascade: НЕ continue — broadcast был старым поведением
+            else:
+                kind = wazzup.classify_error(detail, http_status)
+                log.warning(
+                    f"   ❌ WABA FAIL [{kind.value}] http={http_status} за {elapsed:.1f}с | "
+                    f"{phone} ({name}) | {detail[:200]}"
+                )
+                if kind == ErrorKind.PERMANENT:
+                    state.mark_unreachable(current_state, phone, "waba")
+                    permanent_skipped.setdefault(phone, set()).add("waba")
+                    _persist_failure(phone, name, category, "waba", text, detail, "permanent")
+                    backoffs["waba"] = 0
+                    log.info("      🚫 WABA PERMANENT → unreachable, пробуем следующий канал")
+                    # Phase 5.5 circuit breaker: если WABA PERMANENT 5 раз подряд,
+                    # halt канал на сессию (template сломан → не валить всё в TG/MAX,
+                    # это риск бана оригинальных аккаунтов).
+                    consecutive_perm = int(current_state.get("_waba_consecutive_permanent", 0)) + 1
+                    current_state["_waba_consecutive_permanent"] = consecutive_perm
+                    if consecutive_perm >= 5:
+                        log.error(
+                            "      🔌 WABA circuit breaker: %d PERMANENT fail подряд — "
+                            "halt WABA на сессию, не уходим в TG/MAX",
+                            consecutive_perm,
+                        )
+                        state.halt_channel(current_state, "waba")
+                        state.save_state(current_state)
+                    continue  # следующий канал в cascade
+                elif kind == ErrorKind.AUTH:
+                    log.error(f"      🔐 WABA AUTH — token невалиден! Backoff MAX")
+                    backoffs["waba"] = _next_backoff(kind, backoffs["waba"])
+                    state.halt_channel(current_state, "waba")
+                    _persist_failure(phone, name, category, "waba", text, "auth: " + detail, "auth")
+                    continue
+                else:
+                    # TRANSIENT / RATE_LIMIT / UNKNOWN — сбрасываем circuit breaker
+                    current_state["_waba_consecutive_permanent"] = 0
+                    backoffs["waba"] = _next_backoff(kind, backoffs["waba"])
+                    _persist_failure(phone, name, category, "waba", text, detail, kind.value)
+                    log.info(f"      ⏭️  WABA [{kind.value}] — backoff={backoffs['waba']}с")
+                    continue
+
+        # === Wazzup-only branch (TG/MAX/WA Personal) ===
+        wazzup_channel_id = wazzup.channel_id_for(channel)
+        if not wazzup_channel_id or not wazzup.is_configured():
+            log.error(
+                f"      ⛔ {channel.upper()} не сконфигурирован: WAZZUP_*_CHANNEL_ID "
+                f"для {channel!r} пустой или WAZZUP_API_KEY не задан. "
+                f"Канал пропущен для этого контакта (cascade продолжится)."
+            )
+            _append_log(phone, channel, "fail", "wazzup channel not configured")
+            continue
+
+        transport_label = "Wazzup"
+
+        # === Wazzup branch (TG/MAX/WA Personal) ===
         limit = config.CHANNEL_DAILY_LIMITS[channel]
         started_at = config.now_tz()
         log.info(
             f"   🚀 {channel.upper()} [{ch_attempt}/{limit}] "
-            f"отправляем {phone} ({name})…"
+            f"отправляем {phone} ({name}) через {transport_label}…"
         )
 
-        # DRY-RUN: пропускаем реальный вызов Wappi целиком, только имитируем успех
+        # DRY-RUN: пропускаем реальный вызов, только имитируем успех
         if config.DRY_RUN:
             ok = True
             message_id = f"dryrun_{int(started_at.timestamp())}_{channel}"
-            detail = "[DRY-RUN] имитация успешной отправки, Wappi API НЕ вызывался"
+            detail = f"[DRY-RUN] имитация успешной отправки, {transport_label} API НЕ вызывался"
             http_status = 200
             log.info(
-                f"      🧪 {channel.upper()} DRY-RUN — реальная отправка пропущена, "
-                f"только имитация успеха"
+                f"      🧪 {channel.upper()} DRY-RUN через {transport_label} — "
+                f"реальная отправка пропущена, только имитация успеха"
             )
         else:
-            ok, message_id, detail, http_status = wappi.send_wappi(channel, phone, text)
+            ok, message_id, detail, http_status = wazzup.send_to_channel(
+                channel=channel,
+                phone=phone,
+                text=text,
+            )
         _append_log(phone, channel, "success" if ok else "fail", detail)
         elapsed = (config.now_tz() - started_at).total_seconds()
 
         if ok:
             log.info(
                 f"   ✅ {channel.upper()} OK за {elapsed:.1f}с | "
-                f"message_id={message_id} | ответ Wappi: {detail[:120]}"
+                f"message_id={message_id} | ответ Wazzup: {detail[:120]}"
             )
             _persist_success(phone, name, category, channel, text, message_id, current_state)
             sent_any = True
@@ -425,9 +653,14 @@ def _run_one_contact(
                 state.increment_successful(current_state)
                 state.save_state(current_state)
                 counted_successful = True
-            continue
+            from datetime import datetime, timezone
+            state.set_last_send_per_phone(
+                current_state, phone, datetime.now(timezone.utc).isoformat(),
+            )
+            state.save_state(current_state)
+            break  # Phase 2.2 cascade: НЕ continue — broadcast был старым поведением
 
-        kind = wappi.classify_error(detail, http_status)
+        kind = wazzup.classify_error(detail, http_status)
         log.warning(
             f"   ❌ {channel.upper()} FAIL [{kind.value}] http={http_status} "
             f"за {elapsed:.1f}с | {phone} ({name}) | {detail[:200]}"
@@ -445,8 +678,9 @@ def _run_one_contact(
 
         if kind == ErrorKind.AUTH:
             log.error(
-                f"      🔐 AUTH — токен {channel} невалиден! "
-                f"Проверьте WAPPI_{channel.upper()}_TOKEN. Backoff = {config.RATE_LIMIT_BACKOFF_MAX}с"
+                f"      🔐 AUTH — Wazzup API key/channel невалиден для {channel}! "
+                f"Проверьте WAZZUP_API_KEY и WAZZUP_{channel.upper()}_CHANNEL_ID. "
+                f"Backoff = {config.RATE_LIMIT_BACKOFF_MAX}с"
             )
             backoffs[channel] = _next_backoff(kind, backoffs[channel])
             _persist_failure(phone, name, category, channel, text,
@@ -463,8 +697,8 @@ def _run_one_contact(
 
     # Если контакт НИГДЕ не доставлен (sent_any=False), помечаем как полностью мёртвый
     # для экспорта (data/failed_today.json)
-    if not sent_any and available:
-        failed_channels = [ch for ch in available]
+    if not sent_any and cascade:
+        failed_channels = [ch for ch in cascade]
         failed_contacts.mark_fully_failed(
             phone=phone, name=name, category=category, channels_failed=failed_channels
         )
@@ -511,21 +745,62 @@ def run() -> None:
 
     # Загружаем кэш мёртвых номеров (если файл есть) + миграция из crm.db
     bad_phones.load()
-    migrated = bad_phones.migrate_from_db(set(wappi.active_channels()))
+    channels = wazzup.active_channels()
+    migrated = bad_phones.migrate_from_db(set(channels))
     log.info(
         f"Bad phones cache: {bad_phones.count()} контактов в кэше"
         + (f" (мигрировано {migrated} из crm.db)" if migrated else "")
     )
 
     templates_map = templates.load_templates()
-    channels = wappi.active_channels()
+    # WABA всегда добавляем явно (USE_WABA>=1): это канал Wazzup, не отдельный токен.
+    if getattr(config, "USE_WABA", 0) and config.USE_WABA >= 1:
+        if "waba" not in channels:
+            channels = list(channels) + ["waba"]
+
+    # Pre-flight: проверяем что для ВСЕХ категорий есть валидный WABA template UUID.
+    # Если хоть один шаблон невалидный — WABA будет фейлиться с BUILD_TEMPLATE_ERROR
+    # на КАЖДОМ контакте (теряем API quota и время). Поэтому отключаем WABA
+    # динамически на этот запуск и продолжаем через TG/MAX.
+    from . import waba_templates as wabat
+    waba_template_status = {}
+    for cat in templates_map.keys():
+        tid = wabat.pick_waba_template(cat)
+        waba_template_status[cat] = {
+            "tid": tid,
+            "valid": wabat.is_valid_template_id(tid),
+        }
+    valid_count = sum(1 for s in waba_template_status.values() if s["valid"])
+    total_count = len(waba_template_status)
+    if getattr(config, "USE_WABA", 0) and config.USE_WABA >= 1 and valid_count < total_count:
+        bad_cats = [cat for cat, s in waba_template_status.items() if not s["valid"]]
+        log.warning(
+            f"⚠️  WABA TEMPLATES: {valid_count}/{total_count} категорий имеют "
+            f"валидный UUID. Плохие: {bad_cats}. "
+            f"WABA будет SKIPPED для всех контактов этой сессии (cascade пойдёт "
+            f"через TG/MAX). Это защищает от BUILD_TEMPLATE_ERROR на каждом контакте."
+        )
+        log.warning(
+            "💡 Чтобы включить WABA: получи UUID одобренных шаблонов из Meta "
+            "Business Manager (WhatsApp → Message Templates → 'API ID') и "
+            "пропиши в .env.local как WABA_TEMPLATE_*_ID"
+        )
+        if "waba" in channels:
+            channels = [c for c in channels if c != "waba"]
+
     log.info(f"Шаблонов: {list(templates_map.keys())}")
-    log.info(f"Активные каналы: {channels}")
+    log.info(f"Активные каналы (через Wazzup): {channels}")
     log.info(f"Google Sheets: {'включены' if sheets.SHEETS.enabled else 'ОТКЛЮЧЕНЫ'}")
 
     if not channels:
-        log.error("Нет активных каналов. Проверьте токены и лимиты.")
-        tglog.send("⛔ Sender не запущен: нет активных каналов (проверь WAPPI_*_TOKEN)", "ERROR")
+        log.error(
+            "Нет активных каналов. Проверьте WAZZUP_API_KEY и "
+            "WAZZUP_*_CHANNEL_ID для telegram/max/whatsapp/waba в .env.local."
+        )
+        tglog.send(
+            "⛔ Sender не запущен: нет активных каналов (проверь WAZZUP_*_CHANNEL_ID)",
+            "ERROR",
+        )
         return
 
     log.info("=" * 70)
@@ -607,7 +882,7 @@ def run() -> None:
         )
 
     # H4: предупреждаем если последние 10 сообщений в БД — все failed
-    # (значит токен протух или Wappi в бане — лучше не запускать)
+    # (значит WAZZUP_API_KEY/channel невалиден или аккаунт в бане — лучше не запускать)
     if not config.DRY_RUN:
         try:
             with db.db_conn() as conn:
@@ -625,7 +900,7 @@ def run() -> None:
                 if total_recent >= 5 and failed_recent == total_recent:
                     log.warning(
                         f"⚠️  ВНИМАНИЕ: последние {total_recent} отправок в БД — "
-                        f"ВСЕ failed. Возможно, Wappi токен протух или аккаунт в бане. "
+                        f"ВСЕ failed. Возможно, WAZZUP_API_KEY протух или аккаунт в бане. "
                         f"Рекомендую сначала прогнать config.preflight_check() перед боем."
                     )
         except Exception as e:
@@ -692,8 +967,9 @@ def run() -> None:
             "только имитация. Для боевого запуска установи BULK_DRY_RUN=0."
         )
     else:
+        transport_label = "Wazzup (WABA → TG → MAX)"
         log.warning(
-            "🚀 БОЕВОЙ РЕЖИМ — сейчас будут ОТПРАВЛЕНЫ реальные сообщения через Wappi. "
+            f"🚀 БОЕВОЙ РЕЖИМ — сейчас будут ОТПРАВЛЕНЫ реальные сообщения через {transport_label}. "
             "Чтобы остановиться: Ctrl+C (текущий контакт доработает, остальные отменятся)."
         )
 

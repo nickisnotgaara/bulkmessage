@@ -1,5 +1,5 @@
 """
-COMPREHENSIVE TEST SUITE для broadcast системы.
+COMPREHENSIVE TEST SUITE для broadcast системы (Wazzup24-only).
 
 Что проверяем (по убыванию критичности):
   A. CONFIG — конфиг вообще грузится, лимиты/тайминги валидны
@@ -10,14 +10,14 @@ COMPREHENSIVE TEST SUITE для broadcast системы.
   F. CATEGORY NORMALIZATION — алиасы, регистр, неизвестные
   G. MESSAGE BUILDING — с именем, без имени, спец-категории (агент → "коллега")
   H. ERROR CLASSIFICATION — 401/403/429/5xx/timeout/permanent → правильный ErrorKind
-  I. DRY_RUN SAFETY — проверка стоит ДО wappi.send_wappi, ни одного реального вызова
-  J. WAPPI PATHS — все 3 канала имеют send/get пути
-  K. ACTIVE CHANNELS — каналы без токена отфильтрованы, с токеном активны
+  I. DRY_RUN SAFETY — проверка стоит ДО wazzup.send_to_channel, ни одного реального вызова
+  J. WAZZUP24 PATHS — /v3/message, /v3/channels, /v3/webhooks
+  K. ACTIVE CHANNELS — каналы без channel_id отфильтрованы, с заполненным активны
   L. SCHEDULE — симуляция 60 контактов вмещается в 10ч окно
   M. EDGE CASES — пустой Excel, битые контакты, специальные символы
 
 Запуск: py test_suite.py
-Никаких реальных Wappi вызовов, никаких изменений в основном crm.db / state.
+Никаких реальных Wazzup вызовов, никаких изменений в основном crm.db / state.
 Изоляция — через mock.patch и временные файлы.
 
 Exit code: 0 если все ✅, иначе 1.
@@ -69,18 +69,18 @@ from bulkmessage import config  # noqa: E402
 
 check("config module loads", config is not None)
 check(
-    "3 channels in CHANNEL_DAILY_LIMITS (WA/TG/MAX)",
-    set(config.CHANNEL_DAILY_LIMITS.keys()) == {"whatsapp", "telegram", "max"},
+    "4 channels in CHANNEL_DAILY_LIMITS (WA/TG/MAX/WABA)",
+    set(config.CHANNEL_DAILY_LIMITS.keys()) == {"whatsapp", "telegram", "max", "waba"},
     f"got {list(config.CHANNEL_DAILY_LIMITS.keys())}",
 )
 check("WA limit > 0", config.CHANNEL_DAILY_LIMITS["whatsapp"] > 0)
 check("TG limit > 0", config.CHANNEL_DAILY_LIMITS["telegram"] > 0)
 check("MAX limit > 0", config.CHANNEL_DAILY_LIMITS["max"] > 0)
+check("WABA limit > 0", config.CHANNEL_DAILY_LIMITS["waba"] > 0)
 check(
-    "WA = TG = MAX (одна и та же квота на контакт)",
-    config.CHANNEL_DAILY_LIMITS["whatsapp"]
-    == config.CHANNEL_DAILY_LIMITS["telegram"]
-    == config.CHANNEL_DAILY_LIMITS["max"],
+    "Personal каналы ≤ MAX_PERSONAL_DAILY_HARD_CAP (защита оригинальных аккаунтов)",
+    config.CHANNEL_DAILY_LIMITS["telegram"] <= 30
+    and config.CHANNEL_DAILY_LIMITS["max"] <= 30,
     f"got {config.CHANNEL_DAILY_LIMITS}",
 )
 check("DELAY_MIN > 0", config.DELAY_MIN > 0)
@@ -249,23 +249,25 @@ try:
         )
 
         # NEW: successful_today counter
+        target_day = config.TARGET_SUCCESS_PER_DAY
+        max_attempts = config.MAX_ATTEMPTS_PER_DAY
         s6["successful_today"] = 0
         s6["attempts_today"] = 0
-        s6["target_today"] = 60
+        s6["target_today"] = target_day
         check("successful_today() = 0 на старте",
               state.successful_today(s6) == 0)
         state.increment_successful(s6)
         check("increment_successful +1",
               state.successful_today(s6) == 1)
-        check("target_reached() = False при 1/60",
+        check(f"target_reached() = False при 1/{target_day}",
               state.target_reached(s6) is False)
-        s6["successful_today"] = 60
-        check("target_reached() = True при 60/60",
+        s6["successful_today"] = target_day
+        check(f"target_reached() = True при {target_day}/{target_day}",
               state.target_reached(s6) is True)
-        check("max_attempts_reached() = False при attempts < 200",
+        check(f"max_attempts_reached() = False при attempts < {max_attempts}",
               state.max_attempts_reached(s6) is False)
-        s6["attempts_today"] = 200
-        check("max_attempts_reached() = True при attempts = 200",
+        s6["attempts_today"] = max_attempts
+        check(f"max_attempts_reached() = True при attempts = {max_attempts}",
               state.max_attempts_reached(s6) is True)
 finally:
     Path(tmp_state_path).unlink(missing_ok=True)
@@ -287,7 +289,7 @@ try:
             and s.get("last_index") == 0
             and s.get("successful_today") == 0
             and s.get("attempts_today") == 0
-            and s.get("target_today") == 60,
+            and s.get("target_today") == config.TARGET_SUCCESS_PER_DAY,
             f"got {s}",
         )
 finally:
@@ -310,7 +312,7 @@ check("sender.py проверяет BULK_SKIP_DUP_PROTECTION env",
 # E. PHONE NORMALIZATION
 # ---------------------------------------------------------------------------
 section("E. PHONE NORMALIZATION")
-from bulkmessage.wappi import normalize_phone  # noqa: E402
+from bulkmessage.wazzup import normalize_phone  # noqa: E402
 
 cases = [
     ("89261234567", "79261234567"),     # 8 → 7
@@ -416,7 +418,7 @@ check("Неизвестная категория → fallback-сообщение
 # H. ERROR CLASSIFICATION
 # ---------------------------------------------------------------------------
 section("H. ERROR CLASSIFICATION")
-from bulkmessage.wappi import classify_error, ErrorKind  # noqa: E402
+from bulkmessage.wazzup import classify_error, ErrorKind  # noqa: E402
 
 err_cases = [
     # (detail, http_status, expected, description)
@@ -453,21 +455,18 @@ section("I. DRY_RUN SAFETY")
 sender_src = Path("bulkmessage/sender.py").read_text(encoding="utf-8")
 check("config.DRY_RUN = True (защита от случайной отправки)", config.DRY_RUN is True)
 
-# Проверяем, что в sender.py проверка DRY_RUN идёт ДО вызова wappi.send_wappi
+# Проверяем, что в sender.py проверка DRY_RUN идёт ДО вызова wazzup.send_to_channel
 dry_check_idx = sender_src.find("if config.DRY_RUN:")
-send_call_idx = sender_src.find("wappi.send_wappi(channel, phone, text)")
+send_call_idx = sender_src.find("wazzup.send_to_channel(")
 check(
-    "В sender.py: проверка DRY_RUN ПЕРЕД wappi.send_wappi",
+    "В sender.py: проверка DRY_RUN ПЕРЕД wazzup.send_to_channel",
     dry_check_idx != -1 and send_call_idx != -1 and dry_check_idx < send_call_idx,
-    f"DRY_RUN at {dry_check_idx}, send_wappi at {send_call_idx}",
+    f"DRY_RUN at {dry_check_idx}, send_to_channel at {send_call_idx}",
 )
-# Убеждаемся, что wappi.send_wappi ВЫЗЫВАЕТСЯ только в else-ветке
-# (т.е. когда DRY_RUN выключен)
-# Проверим: после if config.DRY_RUN идёт блок с return, а send_wappi — после else
-# Простая эвристика: между "if config.DRY_RUN:" и "wappi.send_wappi" должно быть "else:"
-else_idx = sender_src.find("else:\n            ok, message_id", dry_check_idx)
+# Убеждаемся, что wazzup.send_to_channel ВЫЗЫВАЕТСЯ только в else-ветке
+else_idx = sender_src.find("else:\n            ok, message_id, detail, http_status = wazzup.send_to_channel", dry_check_idx)
 check(
-    "После if DRY_RUN есть ветка else с реальным send_wappi",
+    "После if DRY_RUN есть ветка else с реальным send_to_channel",
     else_idx != -1 and else_idx < send_call_idx,
     f"else at {else_idx}, send at {send_call_idx}",
 )
@@ -475,54 +474,53 @@ check(
 # Проверим, что в DRY_RUN ветке НЕТ вызова requests.post
 dry_block_end = sender_src.find("else:", dry_check_idx)
 dry_block = sender_src[dry_check_idx:dry_block_end]
-check("В DRY_RUN ветке НЕТ requests.post/wappi.send_wappi",
-      "wappi.send_wappi" not in dry_block and "requests.post" not in dry_block)
+check("В DRY_RUN ветке НЕТ requests.post/wazzup.send_to_channel",
+      "send_to_channel" not in dry_block and "requests.post" not in dry_block)
+# Дополнительно: после миграции на Wazzup НЕ должно быть wappi вызовов
+check("В sender.py НЕТ упоминаний wappi (миграция завершена)",
+      "wappi" not in sender_src)
 
 # ---------------------------------------------------------------------------
-# J. WAPPI PATHS
+# J. WAZZUP24 PATHS
 # ---------------------------------------------------------------------------
-section("J. WAPPI PATHS")
-check("WA send path = /api/sync/message/send",
-      config.WAPPI_SEND_PATHS["whatsapp"] == "/api/sync/message/send")
-check("TG send path = /tapi/sync/message/send",
-      config.WAPPI_SEND_PATHS["telegram"] == "/tapi/sync/message/send")
-check("MAX send path = /maxapi/sync/message/send",
-      config.WAPPI_SEND_PATHS["max"] == "/maxapi/sync/message/send")
-check("WA get-status path",
-      "whatsapp" in config.WAPPI_MESSAGE_GET_PATHS)
-check("TG get-status path",
-      "telegram" in config.WAPPI_MESSAGE_GET_PATHS)
-check("MAX get-status path",
-      "max" in config.WAPPI_MESSAGE_GET_PATHS)
+section("J. WAZZUP24 PATHS")
+check("WAZZUP_MESSAGE_SEND_PATH = /v3/message",
+      config.WAZZUP_MESSAGE_SEND_PATH == "/v3/message")
+check("WAZZUP_CHANNELS_PATH = /v3/channels",
+      config.WAZZUP_CHANNELS_PATH == "/v3/channels")
+check("WAZZUP_WEBHOOKS_PATH = /v3/webhooks",
+      config.WAZZUP_WEBHOOKS_PATH == "/v3/webhooks")
+check("WAZZUP_BASE_URL задан",
+      bool(config.WAZZUP_BASE_URL))
 
 # ---------------------------------------------------------------------------
 # K. ACTIVE CHANNELS
 # ---------------------------------------------------------------------------
 section("K. ACTIVE CHANNELS")
-from bulkmessage import wappi  # noqa: E402
+from bulkmessage import wazzup  # noqa: E402
 
-channels = wappi.active_channels()
+channels = wazzup.active_channels()
 check("active_channels() возвращает list", isinstance(channels, list))
-check("WA активен (токен заполнен в .env.local)",
-      "whatsapp" in channels,
-      "проверь WAPPI_WHATSAPP_TOKEN в .env.local")
-check("TG активен (токен заполнен в .env.local)",
+check("TG активен (WAZZUP_TG_CHANNEL_ID заполнен в .env.local)",
       "telegram" in channels,
-      "проверь WAPPI_TELEGRAM_TOKEN в .env.local")
+      "проверь WAZZUP_TG_CHANNEL_ID в .env.local")
+check("MAX активен (WAZZUP_MAX_CHANNEL_ID заполнен в .env.local)",
+      "max" in channels,
+      "проверь WAZZUP_MAX_CHANNEL_ID в .env.local")
 
-# MAX: если токен пустой — должен быть отфильтрован
-wa_token = config.WAPPI_TOKENS.get("max", {}).get("token", "")
-if not wa_token or wa_token.startswith("ВАШ_"):
-    check("MAX неактивен (токен пустой) — фильтруется корректно",
-          "max" not in channels)
-else:
-    check("MAX активен (токен заполнен)", "max" in channels)
-
-# Проверим, что с пустым токеном канал отфильтровывается
-with patch.dict(config.WAPPI_TOKENS, {"whatsapp": {"token": "", "profile_id": ""}}):
-    only_active = wappi.active_channels()
-    check("Пустой токен → канал отфильтрован",
-          "whatsapp" not in only_active)
+# Если WAZZUP_*_CHANNEL_ID пустой — канал должен быть отфильтрован
+import os as _os  # noqa: E402
+with patch.dict(_os.environ, {"WAZZUP_TG_CHANNEL_ID": ""}):
+    # Перечитываем конфиг
+    import importlib  # noqa: E402
+    importlib.reload(config)
+    importlib.reload(wazzup)
+    only_active = wazzup.active_channels()
+    check("Пустой WAZZUP_TG_CHANNEL_ID → telegram отфильтрован",
+          "telegram" not in only_active)
+    # Возвращаем обратно
+    importlib.reload(config)
+    importlib.reload(wazzup)
 
 # ---------------------------------------------------------------------------
 # L. SCHEDULE (smoke)
@@ -703,6 +701,34 @@ check("sender.py содержит защиту от дублей (crm.db пус�
 check("sender.py проверяет BULK_SKIP_DUP_PROTECTION env",
       "BULK_SKIP_DUP_PROTECTION" in sender_src_check)
 
+# Code review fix: webhook channel routing использует chatType + channelId
+reconcile_src_check = Path("bulkmessage/reconcile.py").read_text(encoding="utf-8")
+check("reconcile.py использует chatType из payload (не только channel_hint)",
+      "_wazzup_chat_type_to_channel" in reconcile_src_check)
+check("reconcile.py передаёт channelId в маппер каналов",
+      "_wazzup_chat_type_to_channel(chat_type, evt_channel_id)" in reconcile_src_check)
+
+# Code review fix: _post_with_retry реально проверяет status_code
+wazzup_src_check = Path("bulkmessage/wazzup.py").read_text(encoding="utf-8")
+check("_post_with_retry проверяет r.status_code перед return",
+      "if r.status_code not in _RETRY_STATUS" in wazzup_src_check)
+check("_RETRY_STATUS не мёртвый код",
+      "if r.status_code not in _RETRY_STATUS:" in wazzup_src_check and
+      "_RETRY_STATUS" in wazzup_src_check)
+
+# Unit-тест маппинга chatType → channel name (без сети)
+from bulkmessage.reconcile import _wazzup_chat_type_to_channel  # noqa: E402
+check("chatType='telegram' → 'telegram' (без channelId)",
+      _wazzup_chat_type_to_channel("telegram", "") == "telegram")
+check("chatType='max' → 'max' (без channelId)",
+      _wazzup_chat_type_to_channel("max", "") == "max")
+check("chatType='whatsapp' без channelId → fallback 'whatsapp'",
+      _wazzup_chat_type_to_channel("whatsapp", "") == "whatsapp")
+check("chatType='' без channelId → fallback 'whatsapp'",
+      _wazzup_chat_type_to_channel("", "") == "whatsapp")
+check("chatType='TG' (uppercase) → 'telegram'",
+      _wazzup_chat_type_to_channel("TG", "") == "telegram")
+
 # ---------------------------------------------------------------------------
 # O. BAD_PHONES CACHE (кэш мёртвых номеров)
 # ---------------------------------------------------------------------------
@@ -760,9 +786,9 @@ check("Файл содержит 2 контакта",
       len(file_data) == 2,
       f"got {len(file_data)}")
 check("Файл содержит данные по каналам",
-      file_data.get("+79001112233", {}).get("whatsapp") is True and
-      file_data.get("+79001112233", {}).get("telegram") is True and
-      file_data.get("+79004445566", {}).get("max") is True)
+      file_data.get("+79001112233", {}).get("whatsapp", {}).get("bad") is True and
+      file_data.get("+79001112233", {}).get("telegram", {}).get("bad") is True and
+      file_data.get("+79004445566", {}).get("max", {}).get("bad") is True)
 
 # Очищаем память и читаем с диска
 bad_phones.clear()
@@ -807,7 +833,7 @@ check("TRANSIENT_BACKOFF_MAX > TRANSIENT_BACKOFF_MIN",
       config.TRANSIENT_BACKOFF_MAX > config.TRANSIENT_BACKOFF_MIN)
 
 # C2: _next_backoff теперь вызываем без AttributeError
-from bulkmessage.wappi import ErrorKind as _EK
+from bulkmessage.wazzup import ErrorKind as _EK
 backoff_rate = sender._next_backoff(_EK.RATE_LIMIT, 0)
 check("_next_backoff(RATE_LIMIT, 0) = BASE",
       backoff_rate == config.RATE_LIMIT_BACKOFF_BASE,
@@ -883,9 +909,9 @@ except Exception as e:
 
 # M4: normalize_phone для 9-цифр остался 998, для 10-цифр с 9 — 7
 check("normalize_phone 9 digits (UZ) = 998...",
-      wappi.normalize_phone("941234567") == "998941234567")
+      wazzup.normalize_phone("941234567") == "998941234567")
 check("normalize_phone 10 digits starting with 9 (RU) = 7...",
-      wappi.normalize_phone("9261234567") == "79261234567")
+      wazzup.normalize_phone("9261234567") == "79261234567")
 
 # L1: BULAY typo исправлен
 sender_src = Path("bulkmessage/sender.py").read_text(encoding="utf-8")
