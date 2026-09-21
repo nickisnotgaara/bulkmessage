@@ -730,6 +730,44 @@ check("chatType='TG' (uppercase) → 'telegram'",
       _wazzup_chat_type_to_channel("TG", "") == "telegram")
 
 # ---------------------------------------------------------------------------
+# O. CHANNEL-AWARE DELAY (Phase 6)
+# ---------------------------------------------------------------------------
+section("O. CHANNEL-AWARE DELAY (WABA = быстро, Personal = медленно)")
+
+# config: новые переменные загружены
+check("config.WABA_DELAY_MIN/MAX заданы (10-30 сек по умолчанию)",
+      hasattr(config, "WABA_DELAY_MIN") and hasattr(config, "WABA_DELAY_MAX")
+      and config.WABA_DELAY_MIN >= 1 and config.WABA_DELAY_MAX >= config.WABA_DELAY_MIN)
+check("config.PERSONAL_DELAY_MIN/MAX заданы (5-15 мин по умолчанию)",
+      hasattr(config, "PERSONAL_DELAY_MIN") and hasattr(config, "PERSONAL_DELAY_MAX")
+      and config.PERSONAL_DELAY_MIN >= 60 and config.PERSONAL_DELAY_MAX >= config.PERSONAL_DELAY_MIN)
+check("config.FAILED_DELAY_MIN/MAX < PERSONAL_DELAY (быстрая задержка после fail)",
+      config.FAILED_DELAY_MAX < config.PERSONAL_DELAY_MIN)
+
+# state: last_success_channel сохраняется
+state_data = state.load_state()
+check("state.load_state() имеет last_success_channel key",
+      "last_success_channel" in state_data)
+check("по умолчанию last_success_channel == ''",
+      state_data.get("last_success_channel") == "")
+
+# sender.py: код выбирает задержку по last_success_channel
+check("sender.py содержит ветку 'prev_ch == \"waba\"' (WABA → быстрая пауза)",
+      'prev_ch == "waba"' in sender_src_check)
+check("sender.py содержит ветку 'prev_ch in (\"telegram\", \"max\")' (Personal → anti-bank)",
+      'prev_ch in ("telegram", "max")' in sender_src_check)
+check("sender.py использует WABA_DELAY_MIN/MAX",
+      "config.WABA_DELAY_MIN" in sender_src_check
+      and "config.WABA_DELAY_MAX" in sender_src_check)
+check("sender.py использует PERSONAL_DELAY_MIN/MAX",
+      "config.PERSONAL_DELAY_MIN" in sender_src_check
+      and "config.PERSONAL_DELAY_MAX" in sender_src_check)
+check("sender.py сохраняет last_success_channel в state.json после WABA успеха",
+      'current_state["last_success_channel"] = "waba"' in sender_src_check)
+check("sender.py сохраняет last_success_channel в state.json после TG/MAX успеха",
+      'current_state["last_success_channel"] = channel' in sender_src_check)
+
+# ---------------------------------------------------------------------------
 # O. BAD_PHONES CACHE (кэш мёртвых номеров)
 # ---------------------------------------------------------------------------
 section("O. BAD_PHONES CACHE")

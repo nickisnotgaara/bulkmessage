@@ -33,6 +33,8 @@ def load_state() -> dict:
             data.setdefault("waba_sent_meta", {})  # phone → ts (для 24ч-окна)
             # Phase 5.5: circuit breaker для повальных PERMANENT fail (сломанные templates)
             data.setdefault("_waba_consecutive_permanent", 0)
+            # Phase 6: последний успешный канал (для channel-aware delay между контактами)
+            data.setdefault("last_success_channel", "")  # "waba" | "telegram" | "max" | ""
             return data
         except Exception:
             pass
@@ -54,6 +56,7 @@ def load_state() -> dict:
         "spintax_last_used": {},
         "waba_sent_meta": {},
         "_waba_consecutive_permanent": 0,
+        "last_success_channel": "",
     }
 
 

@@ -471,6 +471,7 @@ def _run_one_contact(
 
     sent_any = False
     counted_successful = False
+    last_success_channel_local: Optional[str] = None  # for channel-aware delay
 
     for channel in cascade:
         # Per-channel safe hours check (WABA: 10-20, Personal: 11-19)
@@ -554,8 +555,10 @@ def _run_one_contact(
                 state.set_last_send_per_phone(
                     current_state, phone, datetime.now(timezone.utc).isoformat(),
                 )
+                current_state["last_success_channel"] = "waba"
                 state.save_state(current_state)
                 sent_any = True
+                last_success_channel_local = "waba"
                 if not counted_successful:
                     state.increment_successful(current_state)
                     state.save_state(current_state)
@@ -648,6 +651,7 @@ def _run_one_contact(
             )
             _persist_success(phone, name, category, channel, text, message_id, current_state)
             sent_any = True
+            last_success_channel_local = channel  # "telegram" | "max"
             # Считаем contact как "successful" ОДИН раз (при первой успешной отправке)
             if not counted_successful:
                 state.increment_successful(current_state)
@@ -657,6 +661,7 @@ def _run_one_contact(
             state.set_last_send_per_phone(
                 current_state, phone, datetime.now(timezone.utc).isoformat(),
             )
+            current_state["last_success_channel"] = channel
             state.save_state(current_state)
             break  # Phase 2.2 cascade: НЕ continue — broadcast был старым поведением
 
@@ -987,8 +992,12 @@ def run() -> None:
         else:
             log.info(f"   Сейчас в окне ({now.strftime('%H:%M')})")
 
-    # Грубая оценка общего времени на 100 сообщений (для оператора)
-    avg_delay = (config.DELAY_MIN + config.DELAY_MAX) / 2
+    # Грубая оценка общего времени на 100 сообщений (для оператора).
+    # Channel-aware: 90% контактов ожидаем через WABA (быстро), 10% через
+    # Personal (медленнее). Реальный mix зависит от WABA success rate.
+    waba_avg = (config.WABA_DELAY_MIN + config.WABA_DELAY_MAX) / 2
+    personal_avg = (config.PERSONAL_DELAY_MIN + config.PERSONAL_DELAY_MAX) / 2
+    avg_delay = 0.9 * waba_avg + 0.1 * personal_avg
     msgs_per_batch = max(1, config.BATCH_SIZE)
     n_batches = max(0, 100 // msgs_per_batch - 1)  # кол-во длинных перерывов
     avg_break = (
@@ -1116,19 +1125,38 @@ def run() -> None:
                 target = current_state.get("target_today", config.TARGET_SUCCESS_PER_DAY)
                 log.info(f"  📈 Прогресс: {successful}/{target} успешных сегодня")
 
-            # Пауза между контактами:
-            # - sent_ok=True (1+ канал доставлен) → 5-7 мин (анти-бан)
-            # - sent_ok=False (все 3 канала fail) → 5-15 сек (сразу next)
+            # Channel-aware пауза между контактами (Phase 6):
+            # - WABA успех → короткая пауза (Personal не использовался → нет anti-bank нужен)
+            # - Personal (TG/MAX) успех → длинная пауза (anti-bank для Personal)
+            # - Все 3 fail → короткая пауза (anti-bank не нужен)
+            # - Первый контакт сессии → универсальная (нет last_success)
+            prev_ch = last_success_channel_local
             if not sent_ok:
                 delay = random.uniform(config.FAILED_DELAY_MIN, config.FAILED_DELAY_MAX)
-                log.info(f"  ⏩ Пропускаем быстро ({_fmt_duration(delay)}) — контакт мёртвый")
+                log.info(
+                    f"  ⏩ Пропускаем быстро ({_fmt_duration(delay)}) — контакт мёртвый"
+                )
+            elif prev_ch == "waba":
+                delay = random.uniform(config.WABA_DELAY_MIN, config.WABA_DELAY_MAX)
+                log.info(
+                    f"  ⚡ WABA→next: {_fmt_duration(delay)} "
+                    f"(предыдущий через WABA, Personal cooldown не нужен)"
+                )
+            elif prev_ch in ("telegram", "max"):
+                delay = random.uniform(config.PERSONAL_DELAY_MIN, config.PERSONAL_DELAY_MAX)
+                ch_label = "TG" if prev_ch == "telegram" else "MAX"
+                log.info(
+                    f"  💤 {ch_label}→next: {_fmt_duration(delay)} "
+                    f"(Personal anti-bank после {ch_label})"
+                )
             else:
+                # Первый контакт сессии — нет last_success_channel.
+                # Используем универсальный fallback (5-7 мин).
                 delay = random.uniform(config.DELAY_MIN, config.DELAY_MAX)
-                if random.random() < 0.10:
-                    delay += random.uniform(30, 90)
-                    log.info(f"  💤 Удлинённая пауза {_fmt_duration(delay)} (анти-бан)")
-                else:
-                    log.info(f"  💤 Пауза между контактами: {_fmt_duration(delay)}")
+                log.info(
+                    f"  💤 Пауза между контактами: {_fmt_duration(delay)} "
+                    f"(первый контакт сессии)"
+                )
             time.sleep(delay)
 
             total_sent = sum(current_state.get("sent_today", {}).values())

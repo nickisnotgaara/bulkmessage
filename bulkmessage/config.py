@@ -319,6 +319,17 @@ DELAY_MAX = int(os.environ.get("BULK_DELAY_MAX", "18"))
 FAILED_DELAY_MIN = int(os.environ.get("BULK_FAILED_DELAY_MIN", "5"))
 FAILED_DELAY_MAX = int(os.environ.get("BULK_FAILED_DELAY_MAX", "15"))
 
+# Channel-aware inter-contact delay (Phase 6 — оптимизация скорости рассылки).
+# Зависит от того, какой канал доставил ПРЕДЫДУЩИЙ контакт:
+#  • WABA успех → Personal не использовался → короткая пауза (15 сек)
+#  • Personal (TG/MAX) успех → anti-bank → длинная пауза (5-15 мин)
+#  • Все 3 фейл → FAILED_DELAY (быстро идём дальше, anti-bank не нужен)
+# Внутри cascade (WABA → TG → MAX для одного контакта) задержек нет.
+WABA_DELAY_MIN = int(os.environ.get("BULK_WABA_DELAY_MIN", "10"))
+WABA_DELAY_MAX = int(os.environ.get("BULK_WABA_DELAY_MAX", "30"))
+PERSONAL_DELAY_MIN = int(os.environ.get("BULK_PERSONAL_DELAY_MIN", "300"))
+PERSONAL_DELAY_MAX = int(os.environ.get("BULK_PERSONAL_DELAY_MAX", "900"))
+
 # --- Backoff (для wire-up _next_backoff в sender.py) ---
 # При RATE_LIMIT (429 / flood wait) — экспоненциальный backoff от BASE до MAX.
 # При TRANSIENT (5xx, timeout) — случайный в [MIN, MAX].
