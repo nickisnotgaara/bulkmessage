@@ -471,7 +471,8 @@ def _run_one_contact(
 
     sent_any = False
     counted_successful = False
-    last_success_channel_local: Optional[str] = None  # for channel-aware delay
+    # NOTE: channel-aware delay читает `last_success_channel` из state.json
+    # (cascade обновляет его в current_state и save_state сразу после успеха).
 
     for channel in cascade:
         # Per-channel safe hours check (WABA: 10-20, Personal: 11-19)
@@ -651,7 +652,8 @@ def _run_one_contact(
             )
             _persist_success(phone, name, category, channel, text, message_id, current_state)
             sent_any = True
-            last_success_channel_local = channel  # "telegram" | "max"
+            # channel-aware delay: `last_success_channel` пишем в state.json
+            # (читается в run() после cascade через current_state.get(...)).
             # Считаем contact как "successful" ОДИН раз (при первой успешной отправке)
             if not counted_successful:
                 state.increment_successful(current_state)
@@ -1130,7 +1132,8 @@ def run() -> None:
             # - Personal (TG/MAX) успех → длинная пауза (anti-bank для Personal)
             # - Все 3 fail → короткая пауза (anti-bank не нужен)
             # - Первый контакт сессии → универсальная (нет last_success)
-            prev_ch = last_success_channel_local
+            # Берём из state.json — cascade уже сохранил туда после успеха
+            prev_ch = current_state.get("last_success_channel", "")
             if not sent_ok:
                 delay = random.uniform(config.FAILED_DELAY_MIN, config.FAILED_DELAY_MAX)
                 log.info(
