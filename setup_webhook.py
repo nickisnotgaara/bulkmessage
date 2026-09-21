@@ -83,7 +83,7 @@ def subscribe(url: str):
         print(f"   URL:              {url}")
         print(f"   messagesAndStatuses:    {subscriptions['messagesAndStatuses']}")
         print(f"   channelsUpdates:        {subscriptions['channelsUpdates']}")
-        print(f"   templateStatus:         {subscriptions['templateStatus']}")
+        print(f"   wabaTemplatesStatus:    {subscriptions['wabaTemplatesStatus']}")
         print()
         print("⚠️  Wazzup сразу пошлёт первый POST (test event). Убедись что:")
         print(f"   • webhook сервер запущен: py run_webhook.py")
