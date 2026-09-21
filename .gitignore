@@ -114,3 +114,10 @@ data/dryrun_*.json
 broadcast_state.json
 sender.lock
 *.state.json
+
+# ============================================================
+# OPS / deploy scripts (локальные, в репо не нужны)
+# ============================================================
+deploy_server.ps1
+deploy_*.ps1
+deploy_*.sh
