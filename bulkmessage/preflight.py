@@ -28,7 +28,6 @@ def _check(name: str, ok: bool, detail: str = "") -> bool:
     print(line)
     return ok
 
-
 def run_preflight() -> int:
     """Запускает preflight проверки. Возвращает 0 если всё OK, 1 если есть проблемы."""
     print("═" * 60)

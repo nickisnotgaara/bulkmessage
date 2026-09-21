@@ -292,7 +292,7 @@ def subscribe_wazzup_webhook(url: str, subscriptions: dict) -> tuple[bool, str]:
         "messagesAndStatuses":      bool,
         "contactsAndDealsCreation": bool,
         "channelsUpdates":          bool,
-        "templateStatus":           bool,
+        "wabaTemplatesStatus":      bool,
     }
     """
     if not is_configured():

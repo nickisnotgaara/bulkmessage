@@ -73,7 +73,7 @@ def subscribe(url: str):
         "messagesAndStatuses": True,        # входящие сообщения + статусы доставки
         "contactsAndDealsCreation": False,  # auto-create contacts/deals (нам не нужно)
         "channelsUpdates": True,            # смена статуса канала (для halt logic)
-        "templateStatus": True,             # результат модерации шаблона (для UUID)
+        "wabaTemplatesStatus": True,        # результат модерации шаблона (для UUID)
     }
 
     ok, detail = wazzup.subscribe_wazzup_webhook(url, subscriptions)
