@@ -356,6 +356,74 @@ def _cascade_order() -> list[str]:
     return ["whatsapp", "telegram", "max"]
 
 
+def _drain_rescue_queue(current_state: dict, max_items: int = 2) -> int:
+    """Phase 7: process pending rescues (WABA failed → cascade TG/MAX).
+
+    Вызывается:
+      - один раз перед основным циклом
+      - между основными контактами (лимит max_items)
+
+    Возвращает количество реально обработанных rescues.
+    """
+    pending = db.pending_rescues(limit=max_items, cooldown_seconds=60)
+    if not pending:
+        return 0
+
+    log.info(f"🚑 Rescue queue: {len(pending)} pending, обрабатываю до {max_items}")
+    processed = 0
+
+    for r in pending:
+        phone = r["phone"]
+        name = r.get("name") or "—"
+        category = r.get("category") or "—"
+        log.info(
+            f"🚑 Rescue [{r['id']}]: {phone} ({name}, {category}) "
+            f"reason={r.get('reason', '?')}"
+        )
+
+        # Пропускаем если все Personal каналы в cooldown (96ч после успеха)
+        rescue_cascade = ["telegram", "max"]
+        skip_rescue = False
+        for ch in rescue_cascade:
+            last_send = state.get_last_send_per_phone(current_state, phone)
+            if last_send and not bad_phones.is_in_cooldown(
+                phone, ch, config.now_tz().isoformat()
+            ):
+                # есть канал без cooldown
+                continue
+        # Если все Personal каналы в cooldown или quota exhausted —
+        # пробуем cascade через _run_one_contact, она сама решит.
+
+        contact = {"phone": phone, "name": name, "category": category}
+        try:
+            ok = _run_one_contact(
+                contact,
+                rescue_cascade,
+                {},                # backoffs
+                {},                # permanent_skipped
+                current_state,
+                cascade_override=rescue_cascade,
+            )
+        except Exception as e:
+            log.warning(f"rescue send failed for {phone}: {e}")
+            ok = False
+
+        if ok:
+            db.mark_rescue_success(
+                r["id"], channel="telegram_or_max",
+                message_id=f"rescued_from_{r['id']}",
+            )
+            log.info(f"  ✅ Rescued {phone} via Personal")
+            processed += 1
+        else:
+            db.mark_rescue_attempt(r["id"], error="all_personal_failed")
+            log.warning(f"  ❌ Rescue не удался для {phone} (attempts={r['attempts'] + 1})")
+
+    if processed > 0:
+        state.save_state(current_state)
+    return processed
+
+
 def _within_safe_hours(channel: str = "all") -> bool:
     """Phase 3.3: проверка активного и safe-окна.
 
@@ -388,6 +456,7 @@ def _run_one_contact(
     backoffs: dict[str, int],
     permanent_skipped: dict[str, set[str]],
     current_state: dict,
+    cascade_override: Optional[list[str]] = None,
 ) -> bool:
     """Отправляет сообщение в ОДИН канал (cascade с break), не во все подряд.
 
@@ -426,8 +495,13 @@ def _run_one_contact(
 
     text = templates.build_message(contact, templates.load_templates())
 
-    # Cascade: только каналы которые активны в текущей сессии
-    cascade = [ch for ch in _cascade_order() if ch in channels]
+    # Cascade: только каналы которые активны в текущей сессии.
+    # Если передан cascade_override (для rescue queue — skip WABA),
+    # используем его, но фильтруем по channels.
+    if cascade_override is not None:
+        cascade = [ch for ch in cascade_override if ch in channels]
+    else:
+        cascade = [ch for ch in _cascade_order() if ch in channels]
 
     # Если ВСЕ активные каналы в bad_phones — skip без API calls
     if cascade and bad_phones.is_fully_bad(phone, set(cascade)):
@@ -487,6 +561,24 @@ def _run_one_contact(
                 f"   ⏭️  {channel.upper()} quota exhausted (headroom), skip"
             )
             continue
+        # Phase 7: lazy retry — если WABA recently failed для этого phone,
+        # сразу пробуем Personal channels (экономим WABA slot и время).
+        if channel == "waba" and db.waba_recently_failed(phone, hours=24):
+            recent = db.waba_recent_failures(phone, hours=24)
+            log.warning(
+                f"   🔁 WABA недавно failed ({len(recent)} в 24ч) для {phone}, "
+                f"skip WABA → Personal channels"
+            )
+            continue
+        # Phase 7: pre-check через reachability cache (из webhook'ов).
+        # Если кэш говорит WABA unreachable для этого phone → skip.
+        if channel == "waba":
+            cached = state.get_cached_reachability(current_state, phone)
+            if cached and cached.get("waba") is False:
+                log.info(
+                    f"   🚫 WABA reachability cache: unreachable для {phone}, skip"
+                )
+                continue
 
         ch_count_sent = state.channel_sent_today(current_state, channel)
         ch_attempt = ch_count_sent + 1
@@ -1063,6 +1155,13 @@ def run() -> None:
     log.info("─" * 70)
 
     try:
+        # Phase 7: drain rescue queue перед основным циклом
+        # (если webhook'и уже пришли с момента прошлого запуска)
+        try:
+            _drain_rescue_queue(current_state)
+        except Exception as e:
+            log.warning(f"rescue queue drain failed (non-fatal): {e}")
+
         for idx, contact in enumerate(filtered):
             if stop_requested["v"]:
                 log.info("⛔ Остановка по сигналу")
@@ -1126,6 +1225,13 @@ def run() -> None:
                 successful = state.successful_today(current_state)
                 target = current_state.get("target_today", config.TARGET_SUCCESS_PER_DAY)
                 log.info(f"  📈 Прогресс: {successful}/{target} успешных сегодня")
+
+            # Phase 7: между основными контактами обрабатываем rescue queue
+            # (WABA failed → cascade TG/MAX). Не чаще раза в 60с (cooldown).
+            try:
+                _drain_rescue_queue(current_state, max_items=2)
+            except Exception as e:
+                log.warning(f"rescue drain between contacts failed: {e}")
 
             # Channel-aware пауза между контактами (Phase 6):
             # - WABA успех → короткая пауза (Personal не использовался → нет anti-bank нужен)

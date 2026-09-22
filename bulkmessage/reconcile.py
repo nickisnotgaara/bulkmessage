@@ -170,6 +170,60 @@ def process_delivery_status(channel: str, msg: dict) -> None:
         contact_id=contact_id, channel=channel, status=status, message_pk=message_pk
     )
 
+    # Phase 7: reachability cache update (используется cascade'ом как pre-check).
+    # Если WABA delivery status == 'delivered'/'read' → этот канал reachable.
+    # Если status == 'failed' → этот канал UNreachable для этого phone.
+    if channel in ("waba", "whatsapp", "telegram", "max"):
+        try:
+            from . import state as state_mod
+            cur_state = state_mod.load_state()
+            cur_state = state_mod.reset_daily_if_new_day(cur_state)
+            # Получаем phone через contact_id
+            with db.db_conn() as conn2:
+                row2 = conn2.execute(
+                    "SELECT phone FROM contacts WHERE id = ?", (contact_id,)
+                ).fetchone()
+                if row2:
+                    phone = row2["phone"]
+                    reachable = status in ("delivered", "read", "sent")
+                    state_mod.set_cached_reachability(
+                        cur_state, phone, {channel: reachable}
+                    )
+                    state_mod.save_state(cur_state)
+        except Exception as e:
+            log.warning(f"reachability cache update failed: {e}")
+
+    # Phase 7: rescue queue — WABA delivery failure → cascade TG/MAX.
+    # Sender reads queue between contacts и шлёт Personal автоматически.
+    if channel == "waba" and status == "failed":
+        try:
+            contact_phone = None
+            contact_name = None
+            contact_category = None
+            with db.db_conn() as conn2:
+                crow = conn2.execute(
+                    "SELECT c.phone, c.name, c.category FROM contacts c WHERE c.id = ?",
+                    (contact_id,),
+                ).fetchone()
+                if crow:
+                    contact_phone = crow["phone"]
+                    contact_name = crow["name"]
+                    contact_category = crow["category"]
+            if contact_phone:
+                reason = (msg.get("status") or "delivery_failed")[:200]
+                rid = db.enqueue_rescue(
+                    phone=contact_phone,
+                    name=contact_name,
+                    category=contact_category,
+                    original_channel="waba",
+                    reason=reason,
+                )
+                log.info(
+                    f"🚑 WABA failed → enqueued for rescue (id={rid}, phone={contact_phone})"
+                )
+        except Exception as e:
+            log.warning(f"rescue enqueue failed: {e}")
+
     # Phase 3.6: complaint halt — если error сигналит о жалобе (spam/report).
     error_blob = msg.get("error") or {}
     if isinstance(error_blob, dict):

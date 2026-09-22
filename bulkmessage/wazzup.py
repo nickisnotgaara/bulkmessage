@@ -273,16 +273,27 @@ def resolve_wazzup_chat(chat_id: str, channel_id: str) -> Optional[bool]:
 
     Возвращает True/False если ответ определён, None если сеть/timeout
     (тогда sender должен fallthrough на try/send).
+
+    Реализация: GET /v3/channels/{channelId}/contacts/{chatId}
+    Если контакт есть в списке Wazzup → True (Wazzup знает про него).
+    Если 404 → False.
     """
-    if not is_configured():
+    if not is_configured() or not channel_id or not chat_id:
         return None
-    # Wazzup не имеет отдельного endpoint для проверки chat.
-    # Лучший pre-check — попробовать отправить пустое сообщение НЕЛЬЗЯ
-    # (потратит Meta деньги + статус изменится).
-    # Fallback: вернуть None (кэш остаётся) → sender идёт по try/send.
-    # Реальная реализация pre-check для WABA — через webhook channel.qr_update
-    # + history imports (Phase 5).
-    return None
+    url = (
+        f"{config.WAZZUP_BASE_URL}{config.WAZZUP_CHANNELS_PATH}"
+        f"/{channel_id}/contacts/{chat_id}"
+    )
+    try:
+        r = requests.get(url, headers=_headers(), timeout=10)
+        if r.status_code == 200:
+            return True
+        if r.status_code in (404, 400):
+            return False
+        # 5xx / timeout / network → None (fallback на try/send)
+        return None
+    except requests.exceptions.RequestException:
+        return None
 
 
 def subscribe_wazzup_webhook(url: str, subscriptions: dict) -> tuple[bool, str]:

@@ -1141,6 +1141,98 @@ check("send_test() существует (сетевая проверка — в 
       callable(tglog.send_test))
 
 # ---------------------------------------------------------------------------
+# Q. WABA RESCUE MECHANISMS (Phase 7: lazy retry + rescue queue + reachability)
+# ---------------------------------------------------------------------------
+section("Q. WABA RESCUE MECHANISMS (Phase 7)")
+
+from bulkmessage import db
+import time as _time
+
+# Reset rescue queue (idempotent)
+db.init_db()
+
+# === Q1: waba_recently_failed() ===
+# Чистим старые failed messages для теста
+with db.db_conn() as conn:
+    conn.execute("DELETE FROM messages WHERE channel='waba' AND status='failed'")
+    conn.execute("DELETE FROM contacts WHERE phone='+79999999999'")
+    conn.commit()
+
+# Создаём contact + failed message
+with db.db_conn() as conn:
+    cid = db.upsert_contact(conn, "+79999999999", "Test", "Buyers")
+    db.insert_message(
+        conn, contact_id=cid, channel="waba", message_text="x",
+        message_id="test_failed_1", status="failed",
+    )
+    conn.commit()
+
+check("waba_recently_failed для недавно failed = True",
+      db.waba_recently_failed("+79999999999", hours=24) is True)
+check("waba_recently_failed для другого phone = False",
+      db.waba_recently_failed("+78888888888", hours=24) is False)
+
+# === Q2: enqueue_rescue идемпотентно ===
+rid1 = db.enqueue_rescue("+79999999999", "Test", "Buyers", reason="waba_failed")
+rid2 = db.enqueue_rescue("+79999999999", "Test", "Buyers", reason="waba_failed_2")
+check("enqueue_rescue идемпотентно (same id)", rid1 == rid2,
+      f"got {rid1} vs {rid2}")
+
+# Новый phone → новый rescue
+rid3 = db.enqueue_rescue("+77777777777", "Test2", "Sellers", reason="wba_fail")
+check("enqueue_rescue для нового phone → новый id", rid3 != rid2,
+      f"got {rid3} vs {rid2}")
+
+# === Q3: pending_rescues возвращает pending ===
+pending = db.pending_rescues(limit=10, cooldown_seconds=0)
+check("pending_rescues возвращает ≥2 записей",
+      len(pending) >= 2, f"got {len(pending)}")
+
+# === Q4: mark_rescue_success ===
+db.mark_rescue_success(rid1, channel="telegram", message_id="msg_xyz")
+got = db.get_rescue_by_id(rid1)
+check("mark_rescue_success → status=rescued",
+      got and got["status"] == "rescued", f"got {got['status'] if got else None}")
+check("mark_rescue_success → rescued_channel=telegram",
+      got and got["rescued_channel"] == "telegram",
+      f"got {got['rescued_channel'] if got else None}")
+
+# === Q5: mark_rescue_attempt инкрементирует ===
+db.mark_rescue_attempt(rid3, error="fail1")
+db.mark_rescue_attempt(rid3, error="fail2")
+db.mark_rescue_attempt(rid3, error="fail3")  # 3rd attempt → failed
+got = db.get_rescue_by_id(rid3)
+check("mark_rescue_attempt x3 → status=failed",
+      got and got["status"] == "failed",
+      f"got {got['status'] if got else None}, attempts={got['attempts'] if got else None}")
+
+# Cleanup
+with db.db_conn() as conn:
+    conn.execute("DELETE FROM messages WHERE channel='waba' AND status='failed'")
+    conn.execute("DELETE FROM contacts WHERE phone IN ('+79999999999', '+77777777777')")
+    conn.execute("DELETE FROM rescue_queue")
+    conn.commit()
+
+# === Q6: _drain_rescue_queue существует ===
+from bulkmessage import sender
+check("_drain_rescue_queue() callable",
+      callable(getattr(sender, "_drain_rescue_queue", None)))
+
+# === Q7: reachability cache ===
+cur = state.load_state()
+state.set_cached_reachability(cur, "+79991111111", {"waba": False})
+state.save_state(cur)
+cur2 = state.load_state()
+cached = state.get_cached_reachability(cur2, "+79991111111")
+check("reachability cache waba=False сохраняется",
+      cached is not None and cached.get("waba") is False,
+      f"got {cached}")
+
+# Cleanup
+state.set_cached_reachability(cur2, "+79991111111", {"waba": True})
+state.save_state(cur2)
+
+# ---------------------------------------------------------------------------
 # ИТОГ
 # ---------------------------------------------------------------------------
 

@@ -137,6 +137,8 @@ def init_db() -> None:
             """
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_sheets_ops_done ON sheets_ops(done)")
+        # Phase 7: rescue queue (WABA → Personal cascade retry on async WABA failure)
+        init_rescue_queue()
         # Phase 0.1: channel_reachability cache (pre-check results, TTL 24h)
         c.execute(
             """
@@ -448,6 +450,169 @@ def enqueue_sheet_op(op: str, payload: dict, message_pk: Optional[int] = None) -
         )
 
 
+# --- Rescue queue (Phase 7) ---
+# Webhook handler enqueues failed WABA sends here.
+# Sender drains this queue between main contacts → cascade TG/MAX.
+#
+
+
+def init_rescue_queue() -> None:
+    """Создаёт таблицу rescue_queue (idempotent)."""
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rescue_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                name TEXT,
+                category TEXT,
+                original_channel TEXT NOT NULL,
+                reason TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                last_attempt_at TEXT,
+                rescued_channel TEXT,
+                rescued_message_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rescue_status "
+            "ON rescue_queue(status, created_at)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rescue_phone "
+            "ON rescue_queue(phone)"
+        )
+
+
+def enqueue_rescue(
+    phone: str,
+    name: Optional[str],
+    category: Optional[str],
+    original_channel: str = "waba",
+    reason: Optional[str] = None,
+) -> Optional[int]:
+    """Ставит phone в очередь на rescue (cascade Personal).
+
+    Идемпотентно: если уже есть pending rescue для этого phone,
+    НЕ создаём дубль (просто обновляем reason/updated_at).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id FROM rescue_queue
+            WHERE phone = ? AND status = 'pending'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (phone,),
+        )
+        existing = c.fetchone()
+        if existing is not None:
+            c.execute(
+                """
+                UPDATE rescue_queue
+                SET reason = COALESCE(?, reason),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (reason, now, existing["id"]),
+            )
+            return existing["id"]
+        c.execute(
+            """
+            INSERT INTO rescue_queue
+                (phone, name, category, original_channel, reason, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (phone, name, category, original_channel, reason, now, now),
+        )
+        return c.lastrowid
+
+
+def pending_rescues(limit: int = 5, cooldown_seconds: int = 60) -> list[dict]:
+    """Возвращает список pending rescues, готовых к обработке.
+
+    Не возвращает записи, у которых last_attempt_at свежее cooldown_seconds
+    (чтобы не спамить Personal каналы).
+    """
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=cooldown_seconds)).isoformat()
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute(
+            """
+            SELECT * FROM rescue_queue
+            WHERE status = 'pending'
+              AND (last_attempt_at IS NULL OR last_attempt_at < ?)
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_pending_rescues() -> int:
+    with db_conn() as conn:
+        c = conn.cursor()
+        return (c.execute("SELECT COUNT(*) FROM rescue_queue WHERE status = 'pending'").fetchone() or [0])[0]
+
+
+def mark_rescue_attempt(rescue_id: int, error: Optional[str] = None) -> None:
+    """Инкрементирует attempts, ставит timestamp. Если attempts >= 3 → failed."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            UPDATE rescue_queue
+            SET attempts = attempts + 1,
+                last_attempt_at = ?,
+                updated_at = ?,
+                status = CASE WHEN attempts + 1 >= 3 THEN 'failed' ELSE 'pending' END
+            WHERE id = ?
+            """,
+            (now, now, rescue_id),
+        )
+
+
+def mark_rescue_success(
+    rescue_id: int, channel: str, message_id: str
+) -> None:
+    """Помечает rescue успешно завершённым (Personal доставлен)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            UPDATE rescue_queue
+            SET status = 'rescued',
+                rescued_channel = ?,
+                rescued_message_id = ?,
+                last_attempt_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (channel, message_id, now, now, rescue_id),
+        )
+
+
+def get_rescue_by_id(rescue_id: int) -> Optional[dict]:
+    with db_conn() as conn:
+        c = conn.cursor()
+        row = c.execute(
+            "SELECT * FROM rescue_queue WHERE id = ?", (rescue_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
 # --- Channel reachability cache (Phase 0.1 + 2.1) ---
 
 
@@ -496,6 +661,50 @@ def get_all_reachability_for_phone(
         "SELECT * FROM channel_reachability WHERE phone = ?", (phone,)
     ).fetchall()
     return {r["channel"]: r for r in rows}
+
+
+def waba_recently_failed(phone: str, hours: int = 24) -> bool:
+    """True если для этого phone был WABA `failed` в последние N часов.
+
+    Используется cascade'ом для skip WABA → сразу TG/MAX (lazy retry).
+    Запрос по status='failed' в messages table, не rely на webhook.
+    """
+    c_limit = hours * 3600  # seconds
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT COUNT(*) FROM messages m
+            JOIN contacts ct ON ct.id = m.contact_id
+            WHERE ct.phone = ? AND m.channel = 'waba'
+              AND m.status = 'failed'
+              AND CAST(strftime('%s','now') AS INTEGER) -
+                  CAST(strftime('%s', m.created_at) AS INTEGER) < ?
+            """,
+            (phone, c_limit),
+        )
+        return (c.fetchone() or [0])[0] > 0
+
+
+def waba_recent_failures(phone: str, hours: int = 24) -> list[dict]:
+    """Возвращает список WABA failed messages для phone (для дебага/log)."""
+    c_limit = hours * 3600
+    with db_conn() as conn:
+        c = conn.cursor()
+        rows = c.execute(
+            """
+            SELECT m.id, m.message_id, m.last_error, m.created_at
+            FROM messages m
+            JOIN contacts ct ON ct.id = m.contact_id
+            WHERE ct.phone = ? AND m.channel = 'waba'
+              AND m.status = 'failed'
+              AND CAST(strftime('%s','now') AS INTEGER) -
+                  CAST(strftime('%s', m.created_at) AS INTEGER) < ?
+            ORDER BY m.created_at DESC
+            """,
+            (phone, c_limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # --- WABA templates registry (Phase 1.2) ---
