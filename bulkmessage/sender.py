@@ -364,6 +364,10 @@ def _drain_rescue_queue(current_state: dict, max_items: int = 2) -> int:
       - между основными контактами (лимит max_items)
 
     Возвращает количество реально обработанных rescues.
+
+    IMPORTANT: сохраняет/восстанавливает last_success_channel чтобы
+    rescue-успех через TG/MAX НЕ замедлял следующий основной контакт.
+    Без этого rescue замедлил бы основной цикл в 30-90 раз.
     """
     pending = db.pending_rescues(limit=max_items, cooldown_seconds=60)
     if not pending:
@@ -371,6 +375,9 @@ def _drain_rescue_queue(current_state: dict, max_items: int = 2) -> int:
 
     log.info(f"🚑 Rescue queue: {len(pending)} pending, обрабатываю до {max_items}")
     processed = 0
+
+    # Сохраняем last_success_channel — rescue НЕ должен менять темп основного цикла
+    saved_channel = current_state.get("last_success_channel", "")
 
     for r in pending:
         phone = r["phone"]
@@ -381,18 +388,7 @@ def _drain_rescue_queue(current_state: dict, max_items: int = 2) -> int:
             f"reason={r.get('reason', '?')}"
         )
 
-        # Пропускаем если все Personal каналы в cooldown (96ч после успеха)
         rescue_cascade = ["telegram", "max"]
-        skip_rescue = False
-        for ch in rescue_cascade:
-            last_send = state.get_last_send_per_phone(current_state, phone)
-            if last_send and not bad_phones.is_in_cooldown(
-                phone, ch, config.now_tz().isoformat()
-            ):
-                # есть канал без cooldown
-                continue
-        # Если все Personal каналы в cooldown или quota exhausted —
-        # пробуем cascade через _run_one_contact, она сама решит.
 
         contact = {"phone": phone, "name": name, "category": category}
         try:
@@ -408,6 +404,9 @@ def _drain_rescue_queue(current_state: dict, max_items: int = 2) -> int:
             log.warning(f"rescue send failed for {phone}: {e}")
             ok = False
 
+        # Восстанавливаем channel ДО следующего rescue (чтобы не накапливалось)
+        current_state["last_success_channel"] = saved_channel
+
         if ok:
             db.mark_rescue_success(
                 r["id"], channel="telegram_or_max",
@@ -418,6 +417,9 @@ def _drain_rescue_queue(current_state: dict, max_items: int = 2) -> int:
         else:
             db.mark_rescue_attempt(r["id"], error="all_personal_failed")
             log.warning(f"  ❌ Rescue не удался для {phone} (attempts={r['attempts'] + 1})")
+
+    # Финальный restore (на случай если последний rescue succeeded и сбил значение)
+    current_state["last_success_channel"] = saved_channel
 
     if processed > 0:
         state.save_state(current_state)
