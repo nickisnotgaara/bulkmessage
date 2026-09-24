@@ -687,14 +687,14 @@ def _run_one_contact(
                     continue  # следующий канал в cascade
                 elif kind == ErrorKind.AUTH:
                     log.error(f"      🔐 WABA AUTH — token невалиден! Backoff MAX")
-                    backoffs["waba"] = _next_backoff(kind, backoffs["waba"])
+                    backoffs["waba"] = _next_backoff(kind, backoffs.get("waba", 0))
                     state.halt_channel(current_state, "waba")
                     _persist_failure(phone, name, category, "waba", text, "auth: " + detail, "auth")
                     continue
                 else:
                     # TRANSIENT / RATE_LIMIT / UNKNOWN — сбрасываем circuit breaker
                     current_state["_waba_consecutive_permanent"] = 0
-                    backoffs["waba"] = _next_backoff(kind, backoffs["waba"])
+                    backoffs["waba"] = _next_backoff(kind, backoffs.get("waba", 0))
                     _persist_failure(phone, name, category, "waba", text, detail, kind.value)
                     log.info(f"      ⏭️  WABA [{kind.value}] — backoff={backoffs['waba']}с")
                     continue

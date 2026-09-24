@@ -746,10 +746,18 @@ check("config.FAILED_DELAY_MIN/MAX < PERSONAL_DELAY (быстрая задерж
 
 # state: last_success_channel сохраняется
 state_data = state.load_state()
+_saved_last_ch = state_data.get("last_success_channel")
+# Временно очищаем для проверки default
+state_data["last_success_channel"] = ""
+state.save_state(state_data)
 check("state.load_state() имеет last_success_channel key",
-      "last_success_channel" in state_data)
+      "last_success_channel" in state.load_state())
 check("по умолчанию last_success_channel == ''",
-      state_data.get("last_success_channel") == "")
+      state.load_state().get("last_success_channel") == "")
+# Восстанавливаем
+state_data = state.load_state()
+state_data["last_success_channel"] = _saved_last_ch or ""
+state.save_state(state_data)
 
 # sender.py: код выбирает задержку по last_success_channel
 check("sender.py содержит ветку 'prev_ch == \"waba\"' (WABA → быстрая пауза)",
