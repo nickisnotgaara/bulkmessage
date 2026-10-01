@@ -33,7 +33,7 @@ if _env_path.exists():
 
 sys.path.insert(0, ".")
 
-from bulkmessage import config, db, sender, state, wazzup  # noqa: E402
+from bulkmessage import config, db, sender, state, wazzup, sms_ru  # noqa: E402
 
 
 def main() -> int:
@@ -44,6 +44,9 @@ def main() -> int:
     p.add_argument("--name", default="Тест", help="Имя контакта")
     p.add_argument("--category", default="Покупатели",
                    help="Категория для шаблона")
+    p.add_argument("--with-sms", action="store_true",
+                   help="Добавить SMS.RU в каскад (требует --dry-run: "
+                        "SMS стоит денег). Без флага тестируются только мессенджеры.")
     args = p.parse_args()
 
     if args.dry_run:
@@ -89,8 +92,20 @@ def main() -> int:
     # Контакт
     contact = {"phone": phone, "name": args.name, "category": args.category}
 
-    # Cascade channels (тестируем все 3)
+    # Cascade channels. По умолчанию — только мессенджеры (wazzup.active_channels),
+    # потому что SMS РЕАЛЬНО стоит денег и не должна попадать в каскад «наугад».
+    # SMS добавляется лишь явным флагом --with-sms И --dry-run (иначе можно
+    # случайно отправить платное SMS на тестовый номер).
     channels = wazzup.active_channels()
+    if args.with_sms and config.SMSRU_ENABLED and sms_ru.is_configured():
+        if "sms" not in channels:
+            channels = list(channels) + ["sms"]
+        if not config.DRY_RUN:
+            print(
+                "⛔ --with-sms без --dry-run: SMS отправляет РЕАЛЬНЫЕ SMS "
+                "и тратит баланс. Повторите с --dry-run."
+            )
+            return 1
 
     print()
     print(f"🔄 Запускаю cascade: {channels}")
@@ -99,7 +114,7 @@ def main() -> int:
     sent_ok = sender._run_one_contact(
         contact,
         channels,
-        {},                # backoffs
+        {ch: 0 for ch in channels},   # backoffs
         {},                # permanent_skipped
         current_state,
     )

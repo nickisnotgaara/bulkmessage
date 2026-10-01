@@ -260,6 +260,10 @@ def is_phone_in_cooldown(state: dict, phone: str, channel: str) -> bool:
         ts = ts.replace(tzinfo=timezone.utc)
     if channel == "waba":
         cooldown_h = getattr(config, "PER_PHONE_COOLDOWN_HOURS_WABA", 0)
+    elif channel == "sms":
+        # SMS — отдельный транспорт (SMS.RU), но поведение как у Personal:
+        # контакт, до которого дошла SMS, не трогаем SMS-каналом ещё 96ч.
+        cooldown_h = getattr(config, "SMSRU_COOLDOWN_HOURS", 96)
     else:
         cooldown_h = getattr(config, "PER_PHONE_COOLDOWN_HOURS_PERSONAL", 96)
     if cooldown_h <= 0:
@@ -336,6 +340,10 @@ def get_halt_threshold(channel: str) -> int:
         return getattr(config, "COMPLAINT_HALT_THRESHOLD_WABA", 3)
     if channel == "max":
         return getattr(config, "COMPLAINT_HALT_THRESHOLD_MAX", 2)
+    if channel == "sms":
+        # Жалоба на спам в SMS.RU блокирует зарегистрированное имя отправителя
+        # у ВСЕХ операторов сразу — поэтому порог строже, чем у TG/WABA.
+        return getattr(config, "COMPLAINT_HALT_THRESHOLD_SMS", 2)
     return getattr(config, "COMPLAINT_HALT_THRESHOLD_TG", 3)
 
 

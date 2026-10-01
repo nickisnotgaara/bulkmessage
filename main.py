@@ -25,6 +25,8 @@ from bulkmessage.state import (
     reset_daily_if_new_day,
 )
 from bulkmessage.templates import build_message, load_templates
+from bulkmessage import sms_ru
+from bulkmessage.templates import build_sms_message, load_sms_templates
 from bulkmessage.wazzup import (
     active_channels,
     classify_error,
@@ -37,6 +39,9 @@ from bulkmessage import config
 __all__ = [
     "load_templates",
     "build_message",
+    "load_sms_templates",
+    "build_sms_message",
+    "sms_ru",
     "load_contacts",
     "init_db",
     "load_state",

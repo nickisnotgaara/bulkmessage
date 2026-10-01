@@ -29,7 +29,7 @@ import json
 import logging
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -69,8 +69,8 @@ from bulkmessage import config  # noqa: E402
 
 check("config module loads", config is not None)
 check(
-    "4 channels in CHANNEL_DAILY_LIMITS (WA/TG/MAX/WABA)",
-    set(config.CHANNEL_DAILY_LIMITS.keys()) == {"whatsapp", "telegram", "max", "waba"},
+    "5 channels in CHANNEL_DAILY_LIMITS (WA/TG/MAX/WABA/SMS)",
+    set(config.CHANNEL_DAILY_LIMITS.keys()) == {"whatsapp", "telegram", "max", "waba", "sms"},
     f"got {list(config.CHANNEL_DAILY_LIMITS.keys())}",
 )
 check("WA limit > 0", config.CHANNEL_DAILY_LIMITS["whatsapp"] > 0)
@@ -1241,8 +1241,289 @@ state.set_cached_reachability(cur2, "+79991111111", {"waba": True})
 state.save_state(cur2)
 
 # ---------------------------------------------------------------------------
-# ИТОГ
+# R. SMS.RU FALLBACK CHANNEL (cascade waba→telegram→max→sms)
 # ---------------------------------------------------------------------------
+section("R. SMS.RU FALLBACK")
+from bulkmessage import sms_ru, templates as _tpl  # noqa: E402
+from bulkmessage.wazzup import ErrorKind as _EK_SMS  # noqa: E402
+
+# R1: normalize_phone в формате SMS.RU (11 цифр, с 7, без '+')
+check("sms_ru.normalize_phone '+7 (925) 507-06-02'",
+      sms_ru.normalize_phone("+7 (925) 507-06-02") == "79255070602",
+      f"got {sms_ru.normalize_phone('+7 (925) 507-06-02')!r}")
+check("sms_ru.normalize_phone '8 925 507 06 02' (8→7)",
+      sms_ru.normalize_phone("8 925 507 06 02") == "79255070602",
+      f"got {sms_ru.normalize_phone('8 925 507 06 02')!r}")
+check("sms_ru.normalize_phone '79255070602' (уже нормализован)",
+      sms_ru.normalize_phone("79255070602") == "79255070602")
+check("sms_ru.normalize_phone '9261234567' (10 цифр с 9)",
+      sms_ru.normalize_phone("9261234567") == "79261234567",
+      f"got {sms_ru.normalize_phone('9261234567')!r}")
+check("sms_ru.normalize_phone мусор = ''",
+      sms_ru.normalize_phone("не телефон") == "" and sms_ru.normalize_phone("") == "")
+check("sms_ru.normalize_phone +998 (Узбекистан) = '' — SMS.RU только РФ",
+      sms_ru.normalize_phone("998901234567") == "",
+      f"got {sms_ru.normalize_phone('998901234567')!r}")
+
+# R2: сегменты (70 символов = 1 сегмент)
+check("estimate_segments(70 симв) = 1", sms_ru.estimate_segments("а" * 70) == 1)
+check("estimate_segments(71 симв) = 2", sms_ru.estimate_segments("а" * 71) == 2)
+check("estimate_segments(140 симв) = 2", sms_ru.estimate_segments("а" * 140) == 2)
+check("estimate_segments(141 симв) = 3", sms_ru.estimate_segments("а" * 141) == 3)
+check("estimate_segments('') = 0", sms_ru.estimate_segments("") == 0)
+
+# R3: классификация кодов SMS.RU
+check("classify 200 (wrong api_id) = AUTH",
+      sms_ru.classify_smsru_error(200, "") == _EK_SMS.AUTH)
+check("classify 221 (нужен отправитель) = AUTH",
+      sms_ru.classify_smsru_error(221, "") == _EK_SMS.AUTH)
+check("classify 302 (аккаунт не подтверждён) = AUTH",
+      sms_ru.classify_smsru_error(302, "") == _EK_SMS.AUTH)
+check("classify 201 (нет денег) = RATE_LIMIT",
+      sms_ru.classify_smsru_error(201, "") == _EK_SMS.RATE_LIMIT)
+check("classify 206 (дневной лимит) = RATE_LIMIT",
+      sms_ru.classify_smsru_error(206, "") == _EK_SMS.RATE_LIMIT)
+check("classify 230 (лимит на номер) = RATE_LIMIT",
+      sms_ru.classify_smsru_error(230, "") == _EK_SMS.RATE_LIMIT)
+check("classify 220 (сервис недоступен) = TRANSIENT",
+      sms_ru.classify_smsru_error(220, "") == _EK_SMS.TRANSIENT)
+check("classify 502 (IP из другой страны) = TRANSIENT",
+      sms_ru.classify_smsru_error(502, "") == _EK_SMS.TRANSIENT)
+check("classify 207 (нет маршрута) = PERMANENT",
+      sms_ru.classify_smsru_error(207, "") == _EK_SMS.PERMANENT)
+check("classify 215 (стоп-лист SMS.RU, жалоба) = PERMANENT",
+      sms_ru.classify_smsru_error(215, "") == _EK_SMS.PERMANENT)
+check("classify 217 (реклама кредита без фразы) = PERMANENT",
+      sms_ru.classify_smsru_error(217, "") == _EK_SMS.PERMANENT)
+check("classify 205 (слишком длинно) = PERMANENT",
+      sms_ru.classify_smsru_error(205, "") == _EK_SMS.PERMANENT)
+check("classify 100 (принято) = UNKNOWN (не ошибка)",
+      sms_ru.classify_smsru_error(100, "") == _EK_SMS.UNKNOWN)
+check("is_auth_like_error(221) = True (halt канала)",
+      sms_ru.is_auth_like_error(221) is True)
+check("is_auth_like_error(207) = False (проблема номера, не аккаунта)",
+      sms_ru.is_auth_like_error(207) is False)
+
+# R4: парсинг ответа SMS.RU
+_ok, _mid, _det, _code = sms_ru._parse_send_response(
+    {"status": "OK", "status_code": 100,
+     "sms": {"79255070602": {"status": "OK", "status_code": 100,
+                             "sms_id": "000000-10000000"}},
+     "balance": 4122.56},
+    "79255070602",
+)
+check("parse OK-ответа: ok=True, sms_id извлечён",
+      _ok is True and _mid == "000000-10000000",
+      f"ok={_ok}, id={_mid!r}")
+_ok2, _mid2, _det2, _code2 = sms_ru._parse_send_response(
+    {"status": "OK", "status_code": 100,
+     "sms": {"79255070602": {"status": "ERROR", "status_code": 207,
+                             "status_text": "Нет маршрута"}}},
+    "79255070602",
+)
+check("parse ERROR-номера: ok=False, code=207",
+      _ok2 is False and _code2 == 207,
+      f"ok={_ok2}, code={_code2}")
+_ok3, _mid3, _det3, _code3 = sms_ru._parse_send_response(
+    {"status": "ERROR", "status_code": 221,
+     "status_text": "Требуется буквенный отправитель"},
+    "79255070602",
+)
+check("parse request-level ERROR (221): ok=False",
+      _ok3 is False and _code3 == 221,
+      f"ok={_ok3}, code={_code3}")
+_ok4, _mid4, _det4, _code4 = sms_ru._parse_send_response(None, "79255070602")
+check("parse None-ответа: ok=False без исключения", _ok4 is False)
+
+# R5: DRY-RUN не делает сетевых вызовов
+def _boom_post(*a, **kw):
+    raise AssertionError("сетевой вызов в DRY-RUN — недопустимо!")
+
+_sms_dry_orig = config.DRY_RUN
+_sms_pid_orig = config.SMSRU_API_ID
+_sms_name_orig = config.SMSRU_SENDER_NAME
+try:
+    config.DRY_RUN = True
+    config.SMSRU_API_ID = "test-key"
+    config.SMSRU_SENDER_NAME = "TESTBRAND"
+    with patch("bulkmessage.sms_ru._post_form", side_effect=_boom_post):
+        _rok, _rmid, _rdet, _rcode = sms_ru.send_sms("+7 925 507-06-02", "тест")
+    check("DRY-RUN: send_sms НЕ вызывает _post_form", _rok is True and str(_rmid).startswith("dryrun_"),
+          f"ok={_rok}, id={_rmid!r}")
+    check("DRY-RUN: detail содержит 'API НЕ вызывался'", "НЕ вызывался" in _rdet, _rdet)
+finally:
+    config.DRY_RUN = _sms_dry_orig
+    config.SMSRU_API_ID = _sms_pid_orig
+    config.SMSRU_SENDER_NAME = _sms_name_orig
+
+# R6: нормализация/длина отсекаются ДО сети
+_sms_pid_orig = config.SMSRU_API_ID
+_sms_name_orig = config.SMSRU_SENDER_NAME
+_sms_dry_orig = config.DRY_RUN
+try:
+    config.DRY_RUN = False
+    config.SMSRU_API_ID = "test-key"
+    config.SMSRU_SENDER_NAME = "TESTBRAND"
+    with patch("bulkmessage.sms_ru._post_form", side_effect=_boom_post):
+        _rok2, _rmid2, _rdet2, _rcode2 = sms_ru.send_sms("не телефон", "тест")
+    check("CRUD-номер отсекается локально (202), без сети",
+          _rok2 is False and _rcode2 == 202,
+          f"ok={_rok2}, code={_rcode2}")
+    with patch("bulkmessage.sms_ru._post_form", side_effect=_boom_post):
+        _rok3, _rmid3, _rdet3, _rcode3 = sms_ru.send_sms("79255070602", "а" * 300)
+    check("Слишком длинный текст отсекается локально (205), без сети",
+          _rok3 is False and _rcode3 == 205,
+          f"ok={_rok3}, code={_rcode3}")
+finally:
+    config.DRY_RUN = _sms_dry_orig
+    config.SMSRU_API_ID = _sms_pid_orig
+    config.SMSRU_SENDER_NAME = _sms_name_orig
+
+# R7: test=1 реально уходит в запрос
+_sms_test_orig = config.SMSRU_TEST_MODE
+_captured = {}
+def _fake_post(path, params, timeout=30):
+    _captured.update(params)
+    return ({"status": "OK", "status_code": 100,
+             "sms": {params.get("to"): {"status": "OK", "status_code": 100,
+                                       "sms_id": "test-1"}}}, "{}", 200)
+try:
+    config.DRY_RUN = False
+    config.SMSRU_API_ID = "test-key"
+    config.SMSRU_SENDER_NAME = "TESTBRAND"
+    config.SMSRU_TEST_MODE = True
+    with patch("bulkmessage.sms_ru._post_form", side_effect=_fake_post):
+        _rok4, _rmid4, _rdet4, _rcode4 = sms_ru.send_sms("79255070602", "короткий текст")
+    check("SMSRU_TEST_MODE=1 → test=1 в params", _captured.get("test") == 1,
+          f"captured={_captured}")
+    check("test=1 запрос: to нормализован, from=SENDER_NAME",
+          _captured.get("to") == "79255070602" and _captured.get("from") == "TESTBRAND",
+          f"captured={_captured}")
+    check("api_id передаётся в params", _captured.get("api_id") == "test-key")
+    check("json=1 запрошен", _captured.get("json") == 1)
+finally:
+    config.SMSRU_TEST_MODE = _sms_test_orig
+
+# R8: SMS-шаблоны — длина и кредитная фраза
+_sms_tpls = _tpl.load_sms_templates()
+check("load_sms_templates() нашёл категории", len(_sms_tpls) == 4,
+      f"got {list(_sms_tpls)}")
+_sms_budget = min(config.SMSRU_MAX_SEGMENTS, sms_ru.SMSRU_HARD_MAX_SEGMENTS)
+for _cat in _sms_tpls:
+    _msg = _tpl.build_sms_message({"name": "Иван", "category": _cat}, _sms_tpls)
+    _segs = sms_ru.estimate_segments(_msg)
+    check(f"SMS «{_cat}» в бюджете {_sms_budget} сегм.",
+          _segs <= _sms_budget,
+          f"{len(_msg)} симв = {_segs} сегм")
+    check(f"SMS «{_cat}» содержит кредитную фразу (ошибка 217)",
+          sms_ru.has_credit_disclaimer(_msg))
+    check(f"SMS «{_cat}» без имени корректно чистится",
+          not any(bad in _tpl.build_sms_message({"name": "", "category": _cat}, _sms_tpls)
+                  for bad in (", !", ",!", ",  ,")))
+
+check("build_sms_message подставляет {имя}",
+      "Иван" in _tpl.build_sms_message({"name": "Иван", "category": "Покупатели"}, _sms_tpls))
+check("build_sms_message раскрывает spin-tax (нет { } |)",
+      not any(ch in _tpl.build_sms_message({"name": "Иван", "category": "Агенты"}, _sms_tpls)
+              for ch in "{}|"))
+check("has_credit_disclaimer() чувствителен к регистру",
+      sms_ru.has_credit_disclaimer("оцените свои ФИНАНСОВЫЕ возможности и риски") is True)
+check("has_credit_disclaimer() = False без фразы",
+      sms_ru.has_credit_disclaimer("обычный текст") is False)
+
+# R9: config/state — лимиты, halt, cooldown
+check("CHANNEL_DAILY_LIMITS['sms'] = 50", config.CHANNEL_DAILY_LIMITS["sms"] == 50,
+      f"got {config.CHANNEL_DAILY_LIMITS['sms']}")
+check("SMS НЕ ограничен MAX_PERSONAL_DAILY_HARD_CAP",
+      config.CHANNEL_DAILY_LIMITS["sms"] > config.MAX_PERSONAL_DAILY_HARD_CAP)
+_sms_st = state.load_state()
+_sms_eff = state.channel_effective_cap(_sms_st, "sms")
+check("channel_effective_cap('sms') = 37 (50 при headroom 25%)",
+      _sms_eff == 37, f"got {_sms_eff}")
+check("get_halt_threshold('sms') = 2", state.get_halt_threshold("sms") == 2,
+      f"got {state.get_halt_threshold('sms')}")
+check("SMSRU_COOLDOWN_HOURS = 96", config.SMSRU_COOLDOWN_HOURS == 96)
+check("SMS safe hours по умолчанию 11-19",
+      config.SMSRU_SAFE_HOURS_START == 11 and config.SMSRU_SAFE_HOURS_END == 19)
+
+# cooldown применяется именно к SMS
+_sms_cd = state.load_state()
+_sms_cd.pop("last_send_per_phone", None)
+state.set_last_send_per_phone(_sms_cd, "+79990000001",
+                               datetime.now(timezone.utc).isoformat())
+check("is_phone_in_cooldown('sms') = True сразу после SMS",
+      state.is_phone_in_cooldown(_sms_cd, "+79990000001", "sms") is True)
+state.set_last_send_per_phone(_sms_cd, "+79990000002",
+                               (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat())
+check("is_phone_in_cooldown('sms') = False после 100ч (cooldown 96ч)",
+      state.is_phone_in_cooldown(_sms_cd, "+79990000002", "sms") is False)
+state.save_state(_sms_cd)
+
+# R10: SMS НЕ проходит через Wazzup (это отдельный транспорт)
+check("wazzup.channel_id_for('sms') = '' (нет Wazzup-канала)",
+      sender.wazzup.channel_id_for("sms") == "")
+check("'sms' НЕ в wazzup.active_channels() (добавляется явно в run())",
+      "sms" not in sender.wazzup.active_channels(),
+      f"got {sender.wazzup.active_channels()}")
+
+# R11: порядок каскада — SMS строго последний
+_sms_casc = sender._cascade_order()
+check("cascade USE_WABA=1 = waba→telegram→max→sms",
+      _sms_casc == ["waba", "telegram", "max", "sms"], f"got {_sms_casc}")
+check("SMS — последний в каскаде", _sms_casc[-1] == "sms")
+_sms_uca = _os.environ.get("BULK_USE_WABA")
+try:
+    _os.environ["BULK_USE_WABA"] = "0"
+    import importlib
+    _cfg_mod = importlib.reload(config)
+    _snd_mod = importlib.reload(sender)
+    check("cascade USE_WABA=0 = whatsapp→telegram→max→sms",
+          _snd_mod._cascade_order() == ["whatsapp", "telegram", "max", "sms"],
+          f"got {_snd_mod._cascade_order()}")
+finally:
+    if _sms_uca is None:
+        _os.environ.pop("BULK_USE_WABA", None)
+    else:
+        _os.environ["BULK_USE_WABA"] = _sms_uca
+    importlib.reload(config)
+    importlib.reload(sender)
+
+# R12: rescue-очередь НЕ трогает SMS (не тратит деньги)
+_rescue_src = Path("bulkmessage/sender.py").read_text(encoding="utf-8")
+check("rescue_cascade = [telegram, max] — SMS исключён",
+      'rescue_cascade = ["telegram", "max"]' in _rescue_src)
+
+# R13: SMS-ветка в sender стоит ДО Wazzup-guard (иначе cascade пропустит SMS)
+_sms_sender_src = Path("bulkmessage/sender.py").read_text(encoding="utf-8")
+_sms_branch_i = _sms_sender_src.find('if channel == "sms":')
+_wazzup_guard_i = _sms_sender_src.find("wazzup_channel_id = wazzup.channel_id_for(channel)")
+check("SMS-ветка в sender.py идёт ПЕРЕД Wazzup-guard",
+      _sms_branch_i != -1 and _wazzup_guard_i != -1 and _sms_branch_i < _wazzup_guard_i,
+      f"sms={_sms_branch_i}, guard={_wazzup_guard_i}")
+
+# R14: секрет не должен попадать в .env.example
+_env_ex = Path(".env.example").read_text(encoding="utf-8")
+check(".env.example: BULK_SMSRU_API_ID пустой (без секрета)",
+      any(line.strip() == "BULK_SMSRU_API_ID=" for line in _env_ex.splitlines()),
+      "найдена непустая BULK_SMSRU_API_ID в .env.example")
+_env_loc = Path(".env.local").read_text(encoding="utf-8") if Path(".env.local").exists() else ""
+check(".env.local содержит BULK_SMSRU_API_ID (секрет локально)",
+      "BULK_SMSRU_API_ID=" in _env_loc and
+      not any(line.strip() == "BULK_SMSRU_API_ID=" for line in _env_loc.splitlines()))
+
+# R15: preflight импортируется без сетевых вызовов
+from bulkmessage import preflight  # noqa: E402
+check("preflight.run_preflight() callable", callable(preflight.run_preflight))
+
+# R16: файлы SMS существуют и содержат критические предупреждения
+check("bulkmessage/sms_ru.py существует", Path("bulkmessage/sms_ru.py").exists())
+check("Message_script_sms.md существует", Path("Message_script_sms.md").exists())
+_sms_md = Path("Message_script_sms.md").read_text(encoding="utf-8")
+check("Message_script_sms.md документирует ошибку 217",
+      "217" in _sms_md and sms_ru.CREDIT_DISCLAIMER in _sms_md)
+check("sms_ru.py определяет CREDIT_DISCLAIMER",
+      sms_ru.CREDIT_DISCLAIMER == "Оцените свои финансовые возможности и риски",
+      f"got {sms_ru.CREDIT_DISCLAIMER!r}")
 
 # ---------------------------------------------------------------------------
 # ИТОГ

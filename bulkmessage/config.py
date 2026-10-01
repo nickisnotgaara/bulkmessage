@@ -164,9 +164,54 @@ CHANNEL_DAILY_LIMITS = {
     "telegram": _safe_limit("telegram", 40, hard_cap=MAX_PERSONAL_DAILY_HARD_CAP),
     "max": _safe_limit("max", 25, hard_cap=MAX_PERSONAL_DAILY_HARD_CAP),
     "waba": _safe_limit("waba", 250),
+    # SMS — fallback последней надежды. НЕ ограничен MAX_PERSONAL_DAILY_HARD_CAP:
+    # SMS идёт через агрегатор с зарегистрированным именем отправителя, а не через
+    # оригинальный личный аккаунт мессенджера. Но каждая SMS реально стоит денег
+    # (~8.4-8.5 ₽ за сегмент), поэтому кап всё равно жёсткий: 50/день = 37 effective
+    # при headroom 25% (~314 ₽/день максимум).
+    "sms": _safe_limit("sms", 50),
 }
 
-# --- Wazzup24 (единственный транспорт) ---
+# --- SMS.RU (fallback-канал, отдельный транспорт НЕ через Wazzup24) ---
+SMSRU_BASE_URL = os.environ.get("BULK_SMSRU_BASE_URL", "https://sms.ru").strip().rstrip("/")
+# СЕКРЕТ. Только в .env.local, никогда не коммитить и не логировать.
+SMSRU_API_ID = os.environ.get("BULK_SMSRU_API_ID", "").strip()
+# Буквенный отправитель (alphanumeric sender), согласованный с SMS.RU.
+# Без него SMS.RU отвечает ошибкой 221.
+SMSRU_SENDER_NAME = os.environ.get("BULK_SMSRU_SENDER_NAME", "").strip()
+# 0 = полностью выключить SMS-канал (каскад работает как раньше, 3 мессенджера).
+SMSRU_ENABLED = int(os.environ.get("BULK_SMSRU_ENABLED", "1") or "1")
+# 1 = добавлять test=1 ко всем вызовам SMS.RU (сервис ничего не отправляет,
+# баланс не тратится). Дополнительный предохранитель к BULK_DRY_RUN.
+SMSRU_TEST_MODE = os.environ.get(
+    "BULK_SMSRU_TEST_MODE", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+# Номер для preflight smoke-теста (test=1 — SMS.RU ничего не отправляет).
+# По умолчанию 79000000000: заведомо несуществующий, но валидный формат,
+# поэтому 202/207 не сработают и мы увидим именно ошибку конфигурации.
+SMSRU_TEST_PHONE = os.environ.get("BULK_SMSRU_TEST_PHONE", "79000000000").strip()
+# Жёсткий лимит сегментов (SMS.RU отвергает >8 сегментов ошибкой 205).
+# По умолчанию 2 сегмента = 140 символов = ~17 ₽ максимум за сообщение.
+SMSRU_MAX_SEGMENTS = int(os.environ.get("BULK_SMSRU_MAX_SEGMENTS", "2"))
+# Свой файл с короткими SMS-шаблонами (длинные мессенджерные не подходят).
+SMSRU_TEMPLATES_PATH = os.environ.get(
+    "BULK_SMSRU_TEMPLATES_PATH", "Message_script_sms.md"
+).strip()
+# Safe hours для SMS. По умолчанию как у Personal (11-19): ночные SMS
+# жалуются чаще, а SMS.RU тратит на них деньги.
+SMSRU_SAFE_HOURS_START = int(os.environ.get("BULK_SMS_SAFE_HOURS_START", "11"))
+SMSRU_SAFE_HOURS_END = int(os.environ.get("BULK_SMS_SAFE_HOURS_END", "19"))
+# Per-phone cooldown после успешной SMS (контакт не трогаем SMS-каналом 4 дня).
+SMSRU_COOLDOWN_HOURS = int(os.environ.get("BULK_SMS_COOLDOWN_HOURS", "96"))
+# Жалоба на спам в SMS.RU может заблокировать имя отправителя у ВСЕХ операторов,
+# поэтому порог строже, чем у TG/WABA (и такой же, как у MAX).
+COMPLAINT_HALT_THRESHOLD_SMS = int(os.environ.get("BULK_COMPLAINT_HALT_SMS", "2"))
+# Пауза между контактами, когда предыдущий доставлен через SMS. SMS — терминальный
+# канал с низким объёмом, поэтому пауза заметно короче PERSONAL_DELAY (300-900с).
+SMS_DELAY_MIN = int(os.environ.get("BULK_SMS_DELAY_MIN", "30"))
+SMS_DELAY_MAX = int(os.environ.get("BULK_SMS_DELAY_MAX", "90"))
+
+# --- Wazzup24 (единственный транспорт для мессенджеров) ---
 WAZZUP_BASE_URL = os.environ.get("WAZZUP_BASE_URL", "https://api.wazzup24.com")
 WAZZUP_API_KEY = os.environ.get("WAZZUP_API_KEY", "").strip()
 WAZZUP_DEFAULT_CHANNEL_ID = os.environ.get("WAZZUP_DEFAULT_CHANNEL_ID", "").strip()

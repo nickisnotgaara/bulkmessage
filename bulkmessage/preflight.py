@@ -17,7 +17,7 @@ import json
 import sys
 from typing import Any
 
-from . import config, db, wazzup, waba_templates, state
+from . import config, db, wazzup, waba_templates, state, sms_ru, templates
 
 
 def _check(name: str, ok: bool, detail: str = "") -> bool:
@@ -79,6 +79,67 @@ def run_preflight() -> int:
             bool(cid),
             f"channel_id={cid[:8]+'…' if cid else 'EMPTY!'}",
         )
+
+    # 3.5 SMS.RU fallback (отдельный транспорт, НЕ Wazzup)
+    if config.SMSRU_ENABLED:
+        print("\n── 3.5 SMS.RU FALLBACK (sms.ru) ──")
+        all_ok &= _check(
+            "BULK_SMSRU_API_ID",
+            bool(config.SMSRU_API_ID),
+            f"set ({len(config.SMSRU_API_ID)} chars, значение скрыто)"
+            if config.SMSRU_API_ID
+            else "EMPTY! (SMS.RU ответит ошибкой 200)",
+        )
+        sender_name = config.SMSRU_SENDER_NAME
+        name_ok = bool(sender_name) and sender_name.isalpha() and 3 <= len(sender_name) <= 11
+        all_ok &= _check(
+            "BULK_SMSRU_SENDER_NAME",
+            name_ok,
+            f"{sender_name!r} (лат. буквы, 3-11 символов)"
+            if sender_name
+            else "EMPTY! (SMS.RU ответит 221 — нужен зарегистрированный отправитель)",
+        )
+        sms_tpls = templates.load_sms_templates()
+        all_ok &= _check(
+            "SMS шаблоны",
+            bool(sms_tpls),
+            f"{len(sms_tpls)} категорий из {config.SMSRU_TEMPLATES_PATH}",
+        )
+        # Аудит длины: SMS тарифицируется по сегментам (70 символов = сегмент).
+        budget = min(config.SMSRU_MAX_SEGMENTS, sms_ru.SMSRU_HARD_MAX_SEGMENTS)
+        if sms_tpls:
+            for cat in sms_tpls:
+                msg = templates.build_sms_message(
+                    {"name": "Тест", "category": cat}, sms_tpls
+                )
+                segs = sms_ru.estimate_segments(msg)
+                all_ok &= _check(
+                    f"  SMS «{cat}»",
+                    segs <= budget,
+                    f"{len(msg)} симв. = {segs} сегм. (~{segs * 8.5:.1f} ₽), "
+                    f"бюджет {budget} сегм.",
+                )
+        if config.SMSRU_TEST_MODE:
+            print("  ℹ️  BULK_SMSRU_TEST_MODE=1 — ко всем вызовам добавляется test=1")
+        else:
+            print("  ℹ️  BULK_SMSRU_TEST_MODE=0 — SMS.RU будет слать РЕАЛЬНЫЕ SMS")
+        if not config.DRY_RUN and config.SMSRU_API_ID and name_ok:
+            # test=1: SMS.RU ничего не отправляет и не списывает баланс.
+            print("  … проверка связи с SMS.RU (test=1, без трат)…")
+            try:
+                _ok, _mid, _detail, _code = sms_ru.send_sms(
+                    config.SMSRU_TEST_PHONE, "preflight", test=True
+                )
+                all_ok &= _check(
+                    "SMS.RU test=1 smoke",
+                    _ok,
+                    f"{_code}: {_detail[:70]}",
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                all_ok &= _check("SMS.RU test=1 smoke", False, f"exception: {e}")
+    else:
+        print("\n── 3.5 SMS.RU FALLBACK (sms.ru) ──")
+        print("  ⏭️  выключен (BULK_SMSRU_ENABLED=0) — каскад без SMS")
 
     # 4. Wazzup API key + webhook (если USE_WABA=1)
     if use_waba:

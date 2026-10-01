@@ -32,6 +32,10 @@ from . import (
 from .sheets import sync_message_to_sheet
 from .wazzup import ErrorKind
 
+# SMS.RU — отдельный транспорт (НЕ Wazzup24). Импорт на уровне модуля безопасен:
+# модуль не делает сетевых вызовов при импорте, всё только внутри send_sms().
+from . import sms_ru
+
 
 log = config.get_logger("sender")
 
@@ -347,13 +351,17 @@ def _persist_failure(phone: str, name: str, category: str, channel: str,
 def _cascade_order() -> list[str]:
     """Возвращает порядок каскада в зависимости от USE_WABA флага.
 
-    USE_WABA=0 (default, legacy): whatsapp → telegram → max.
-    USE_WABA=1: waba → telegram → max (основной режим).
+    USE_WABA=0 (default, legacy): whatsapp → telegram → max → sms.
+    USE_WABA=1: waba → telegram → max → sms (основной режим).
+
+    SMS всегда ПОСЛЕДНИЙ: это fallback-канал последней надежды, каждая SMS
+    реально стоит денег (~8.5 ₽ за сегмент), поэтому до неё дело доходит
+    только когда все мессенджеры провалились.
     """
     if getattr(config, "USE_WABA", 0) and config.USE_WABA >= 1:
-        return ["waba", "telegram", "max"]
+        return ["waba", "telegram", "max", "sms"]
     # legacy
-    return ["whatsapp", "telegram", "max"]
+    return ["whatsapp", "telegram", "max", "sms"]
 
 
 def _drain_rescue_queue(current_state: dict, max_items: int = 2) -> int:
@@ -446,6 +454,11 @@ def _within_safe_hours(channel: str = "all") -> bool:
     if channel == "waba":
         safe_start = getattr(config, "WABA_SAFE_HOURS_START", active_start)
         safe_end = getattr(config, "WABA_SAFE_HOURS_END", 20)
+    elif channel == "sms":
+        # SMS — свой канал (SMS.RU). По умолчанию 11-19 как у Personal:
+        # ночные SMS жалуются чаще, а деньги SMS.RU списывает в любом случае.
+        safe_start = getattr(config, "SMSRU_SAFE_HOURS_START", 11)
+        safe_end = getattr(config, "SMSRU_SAFE_HOURS_END", 19)
     else:
         safe_start = getattr(config, "PERSONAL_SAFE_HOURS_START", 11)
         safe_end = getattr(config, "PERSONAL_SAFE_HOURS_END", 19)
@@ -496,6 +509,19 @@ def _run_one_contact(
     template_id = waba_templates.ensure_waba_template_for_category(norm_category)
 
     text = templates.build_message(contact, templates.load_templates())
+
+    # SMS-текст строим ЛЕНИВО: отдельный короткий источник Message_script_sms.md.
+    # Мессенджерный `text` (330-380 символов) в SMS стоил бы 5-6 сегментов
+    # (42-51 ₽ против 8.5 ₽), поэтому SMS использует собственный шаблон.
+    # Вычисляется один раз и переиспользуется, если контакт дошёл до SMS.
+    _sms_text_cache: list[str] = []
+
+    def _sms_text() -> str:
+        if not _sms_text_cache:
+            _sms_text_cache.append(
+                templates.build_sms_message(contact, templates.load_sms_templates())
+            )
+        return _sms_text_cache[0]
 
     # Cascade: только каналы которые активны в текущей сессии.
     # Если передан cascade_override (для rescue queue — skip WABA),
@@ -699,6 +725,115 @@ def _run_one_contact(
                     log.info(f"      ⏭️  WABA [{kind.value}] — backoff={backoffs['waba']}с")
                     continue
 
+        # === SMS.RU branch (fallback последней надежды) ===
+        # ВАЖНО: этот блок стоит ДО Wazzup-guard, потому что у SMS нет
+        # WAZZUP_*_CHANNEL_ID — это отдельный транспорт. Если бы блок стоял
+        # после guard, cascade молча пропускал бы SMS на каждом контакте.
+        if channel == "sms":
+            sms_body = _sms_text()
+            sms_limit = state.channel_effective_cap(current_state, "sms")
+            started_at = config.now_tz()
+            log.info(
+                f"   🚀 SMS [{ch_attempt}/{sms_limit}] отправляем {phone} ({name}) "
+                f"через SMS.RU…"
+            )
+
+            # Локальная проверка бюджета сегментов ДО сетевого вызова.
+            # Экономит деньги: SMS.RU всё равно не спишет за отвергнутое
+            # сообщение, но мы сразу увидим проблему шаблона в логах.
+            if sms_ru.exceeds_segment_budget(sms_body):
+                detail = (
+                    f"SMS text too long: {sms_ru.estimate_segments(sms_body)} segments "
+                    f"({len(sms_body)} chars), budget "
+                    f"{min(config.SMSRU_MAX_SEGMENTS, sms_ru.SMSRU_HARD_MAX_SEGMENTS)} "
+                    f"— fix Message_script_sms.md"
+                )
+                _append_log(phone, "sms", "fail", detail)
+                _persist_failure(phone, name, category, "sms", sms_body, detail, "permanent")
+                permanent_skipped.setdefault(phone, set()).add("sms")
+                state.mark_unreachable(current_state, phone, "sms")
+                log.error(f"      ❌ {detail}")
+                continue
+
+            ok, sms_id, detail, sms_code = sms_ru.send_sms(phone, sms_body)
+            _append_log(phone, "sms", "success" if ok else "fail", detail)
+            elapsed = (config.now_tz() - started_at).total_seconds()
+
+            if ok:
+                log.info(
+                    f"   ✅ SMS OK за {elapsed:.1f}с | sms_id={sms_id} | {detail[:120]}"
+                )
+                # SMS-текст сохраняем в БД (не мессенджерный!) — по нему потом
+                # считается фактическая стоимость рассылки.
+                _persist_success(
+                    phone, name, category, "sms", sms_body, sms_id, current_state,
+                )
+                sent_any = True
+                if not counted_successful:
+                    state.increment_successful(current_state)
+                    state.save_state(current_state)
+                    counted_successful = True
+                from datetime import datetime, timezone
+                state.set_last_send_per_phone(
+                    current_state, phone, datetime.now(timezone.utc).isoformat(),
+                )
+                current_state["last_success_channel"] = "sms"
+                state.save_state(current_state)
+                break  # один контакт = одно сообщение в ОДИН канал
+
+            kind = sms_ru.classify_smsru_error(sms_code, detail)
+            log.warning(
+                f"   ❌ SMS FAIL [{kind.value}] code={sms_code} за {elapsed:.1f}с | "
+                f"{phone} ({name}) | {detail[:200]}"
+            )
+            if kind == ErrorKind.PERMANENT:
+                # 207/150 (нет маршрута), 215 (стоп-лист SMS.RU), 205/216/217
+                # (наш баг в тексте) — номер больше НЕ пробуем ни в SMS.
+                permanent_skipped.setdefault(phone, set()).add("sms")
+                state.mark_unreachable(current_state, phone, "sms")
+                _persist_failure(
+                    phone, name, category, "sms", sms_body, detail, "permanent",
+                )
+                backoffs["sms"] = 0
+                log.info(
+                    "      🚫 SMS PERMANENT — номер помечен как недоступный для SMS"
+                )
+                continue
+            if kind == ErrorKind.AUTH:
+                # 200/204/221/302 — проблема АККАУНТА, не контакта. Повтор только
+                # выжигает дневную квоту, поэтомуhalt канала целиком.
+                log.error(
+                    "      🔐 SMS AUTH — %s. Проверьте BULK_SMSRU_API_ID, "
+                    "BULK_SMSRU_SENDER_NAME и подтверждение аккаунта SMS.RU. "
+                    "Канал SMS останавливается на 24ч.",
+                    detail[:200],
+                )
+                state.halt_channel(current_state, "sms")
+                state.save_state(current_state)
+                backoffs["sms"] = _next_backoff(kind, backoffs.get("sms", 0))
+                _persist_failure(
+                    phone, name, category, "sms", sms_body, "auth: " + detail, "auth",
+                )
+                try:
+                    from . import tglog
+                    tglog.send(
+                        f"🔐 SMS AUTH fail: {detail[:300]} — SMS-канал halted на 24ч",
+                        level="ERROR",
+                    )
+                except Exception:
+                    pass
+                continue
+            # RATE_LIMIT / TRANSIENT — SMS терминальный, падать дальше некуда.
+            backoffs["sms"] = _next_backoff(kind, backoffs.get("sms", 0))
+            _persist_failure(
+                phone, name, category, "sms", sms_body, detail, kind.value,
+            )
+            log.info(
+                f"      ⏭️  SMS [{kind.value}] — backoff={backoffs['sms']}с. "
+                f"Канал последний, следующих нет."
+            )
+            continue
+
         # === Wazzup-only branch (TG/MAX/WA Personal) ===
         wazzup_channel_id = wazzup.channel_id_for(channel)
         if not wazzup_channel_id or not wazzup.is_configured():
@@ -783,13 +918,16 @@ def _run_one_contact(
                 f"Проверьте WAZZUP_API_KEY и WAZZUP_{channel.upper()}_CHANNEL_ID. "
                 f"Backoff = {config.RATE_LIMIT_BACKOFF_MAX}с"
             )
-            backoffs[channel] = _next_backoff(kind, backoffs[channel])
+            backoffs[channel] = _next_backoff(kind, backoffs.get(channel, 0))
             _persist_failure(phone, name, category, channel, text,
                              "auth: " + detail, "auth")
             continue
 
-        # RATE_LIMIT или TRANSIENT — накапливаем backoff, идём дальше
-        backoffs[channel] = _next_backoff(kind, backoffs[channel])
+        # RATE_LIMIT или TRANSIENT — накапливаем backoff, идём дальше.
+        # .get(), а не [channel]: rescue-очередь передаёт backoffs={} (см.
+        # _drain_rescue_queue), и прямое индексирование роняло весь rescue
+        # с KeyError — исключение глушилось, контакт молча терялся.
+        backoffs[channel] = _next_backoff(kind, backoffs.get(channel, 0))
         _persist_failure(phone, name, category, channel, text, detail, kind.value)
         log.info(
             f"      ⏭️  {channel.upper()} [{kind.value}] — backoff={backoffs[channel]}с. "
@@ -859,6 +997,40 @@ def run() -> None:
         if "waba" not in channels:
             channels = list(channels) + ["waba"]
 
+    # SMS.RU добавляем ТОЖЕ явно: это отдельный транспорт, у него нет
+    # WAZZUP_*_CHANNEL_ID, поэтому wazzup.active_channels() его никогда не
+    # вернёт. Без этой строки каскад молча работал бы только на 3 мессенджера.
+    sms_templates_map = templates.load_sms_templates()
+    if "sms" not in channels:
+        if not getattr(config, "SMSRU_ENABLED", 1):
+            log.info("📱 SMS.RU выключен (BULK_SMSRU_ENABLED=0) — канал SMS не используется")
+        elif not config.SMSRU_API_ID:
+            log.info(
+                "📱 SMS.RU пропущен: не задан BULK_SMSRU_API_ID в .env.local. "
+                "Без api_id SMS.RU отвечает ошибкой 200."
+            )
+        elif not config.SMSRU_SENDER_NAME:
+            log.info(
+                "📱 SMS.RU пропущен: не задан BULK_SMSRU_SENDER_NAME. Без "
+                "зарегистрированного имени отправителя SMS.RU отвечает 221."
+            )
+        elif not sms_templates_map:
+            log.warning(
+                "📱 SMS.RU пропущен: не найден файл %s с SMS-шаблонами "
+                "(SMS без коротких шаблонов стоил бы 5-6 сегментов = 42-51 ₽)",
+                config.SMSRU_TEMPLATES_PATH,
+            )
+        else:
+            channels = list(channels) + ["sms"]
+            log.info(
+                "📱 SMS.RU подключён как fallback (отправитель %r, "
+                "дневной лимит %d, сегментов максимум %d, шаблонов: %d)",
+                config.SMSRU_SENDER_NAME,
+                config.CHANNEL_DAILY_LIMITS.get("sms", 0),
+                config.SMSRU_MAX_SEGMENTS,
+                len(sms_templates_map),
+            )
+
     # Pre-flight: проверяем что для ВСЕХ категорий есть валидный WABA template UUID.
     # Если хоть один шаблон невалидный — WABA будет фейлиться с BUILD_TEMPLATE_ERROR
     # на КАЖДОМ контакте (теряем API quota и время). Поэтому отключаем WABA
@@ -896,7 +1068,10 @@ def run() -> None:
     if not channels:
         log.error(
             "Нет активных каналов. Проверьте WAZZUP_API_KEY и "
-            "WAZZUP_*_CHANNEL_ID для telegram/max/whatsapp/waba в .env.local."
+            "WAZZUP_*_CHANNEL_ID для telegram/max/whatsapp/waba в .env.local. "
+            "Для SMS: BULK_SMSRU_ENABLED=1, BULK_SMSRU_API_ID, "
+            "BULK_SMSRU_SENDER_NAME и файл %s."
+            % config.SMSRU_TEMPLATES_PATH
         )
         tglog.send(
             "⛔ Sender не запущен: нет активных каналов (проверь WAZZUP_*_CHANNEL_ID)",
@@ -1259,6 +1434,14 @@ def run() -> None:
                 log.info(
                     f"  💤 {ch_label}→next: {_fmt_duration(delay)} "
                     f"(Personal anti-bank после {ch_label})"
+                )
+            elif prev_ch == "sms":
+                # SMS — терминальный канал с низким объёмом, но он стоит денег,
+                # поэтому пауза короче Personal (не нужно ждать 5-15 минут).
+                delay = random.uniform(config.SMS_DELAY_MIN, config.SMS_DELAY_MAX)
+                log.info(
+                    f"  📱 SMS→next: {_fmt_duration(delay)} "
+                    f"(после SMS, пауза короче Personal — SMS стоит денег)"
                 )
             else:
                 # Первый контакт сессии — нет last_success_channel.
