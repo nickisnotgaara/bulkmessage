@@ -1895,7 +1895,17 @@ def run() -> None:
     log.info(f"   • Контактов в файле: {len(all_contacts)}")
     log.info(f"   • Уже отправлено ранее: {len(sent_phones)}")
     log.info(f"   • Каналов активно: {channels}")
-    log.info(f"   • Дневные лимиты: {config.CHANNEL_DAILY_LIMITS}")
+    # Лимиты печатаем ТОЛЬКО для активных каналов. Раньше тут был весь
+    # config.CHANNEL_DAILY_LIMITS, где есть и whatsapp (legacy Personal WA,
+    # канал не подключён — WAZZUP_WHATSAPP_CHANNEL_ID пуст), и sms (отключён).
+    # В логе это читалось как «WhatsApp и WABA — два канала, оба работают»,
+    # хотя активны ровно три: waba, telegram, max.
+    _lim = {ch: cap for ch, cap in config.CHANNEL_DAILY_LIMITS.items()
+            if ch in channels}
+    _skipped = sorted(set(config.CHANNEL_DAILY_LIMITS) - set(channels))
+    log.info(f"   • Дневные лимиты (по активным): {_lim}")
+    if _skipped:
+        log.info(f"   • Не используются (нет канала/выключены): {_skipped}")
     log.info(f"   • Google Sheets: {'включены' if sheets.SHEETS.enabled else 'ОТКЛЮЧЕНЫ'}")
     log.info(f"   • Анти-блок: батч={config.BATCH_SIZE}, "
              f"задержка={config.DELAY_MIN}-{config.DELAY_MAX}с")

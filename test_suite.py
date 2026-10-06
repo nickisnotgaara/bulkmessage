@@ -3115,6 +3115,15 @@ check("sweep_unconfirmed_deliveries по умолчанию = CONFIRM_TIMEOUT_MI
 check("RESCUE_SETTLE_MINUTES настроен",
       int(getattr(config, "RESCUE_SETTLE_MINUTES", 0)) > 0)
 
+# W3. Лог старта не должен показывать неподключённые каналы как рабочие.
+# В конфиге есть legacy whatsapp (канал не подключён) и выключенный sms —
+# в стартовой сводке они выглядели как «WhatsApp и WABA — два канала».
+_w3_src = inspect.getsource(sender.run)
+check("лимиты печатаются только для активных каналов",
+      "по активным" in _w3_src and "if ch in channels" in _w3_src)
+check("неиспользуемые каналы печатаются отдельной строкой",
+      "Не используются" in _w3_src)
+
 # W2. Запуск, который стартует СРАЗУ с отката (BULK_PHASE_ORDER=telegram,max).
 # Живой случай 2026-10-06: Telegram пропущен как «пусто», потому что сторож
 # отрабатывал только ПОСЛЕ первой фазы, и откат ушёл в MAX — рискованный
