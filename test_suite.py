@@ -3022,6 +3022,99 @@ finally:
     os.environ.pop("BULK_WABA_RUN_LIMIT", None)
     os.environ.pop("BULK_RUN_HOURS", None)
 
+# ---------------------------------------------------------------------------
+# W. РЕГРЕССИЯ: ФАЗЫ ОТКАТА БЫЛИ ПУСТЫМИ (это и есть «не доставилось,
+# но другим каналом не отправили»).
+#
+# Замер боевого прогона 2026-10-06 (31 сообщение WABA):
+#   delivered по вебхуку — 15, БЕЗ единого события — 16;
+#   статус `failed` от Wazzup — 0 событий за всю историю (1321 событие).
+# Wazzap шлёт delivered/read/sent/error(BAD_CONTACT) и НИКОГДА failed.
+# Отказ Meta по маркетинговому шаблону выглядит как ТИШИНА.
+#
+# Код ждал явный `failed`, поэтому rescue_queue оставалась пустой, и фазы
+# Telegram/MAX не отправляли НИЧЕГО. Ниже — сквозной тест: WABA приняты без
+# подтверждения → пауза → сторож молчания → очередь отката непуста.
+# ---------------------------------------------------------------------------
+section("W. РЕГРЕССИЯ: ФАЗЫ ОТКАТА (тишина вебхука = провал)")
+_w_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_w_db.close()
+_w_st = _w_db.name + ".state.json"
+open(_w_st, "w", encoding="utf-8").write("{}")
+_w_rescued: list = []
+_w_swept_calls: list = []
+
+
+def _w_fake_sweep(limit=50, minutes=None):
+    """Сторож: всё, что sender отправил, но что НЕ подтверждено, — провал."""
+    _w_swept_calls.append(minutes)
+    # Сторож зовётся перед каждой фазой отката, но очередь наполняется
+    # один раз — иначе тест считал бы дубликаты, а не контакты.
+    if not _w_rescued:
+        _w_rescued.extend(_w_sent)
+    return len(_w_rescued)
+
+
+_w_sent: list = []
+try:
+    _w_sel = [{"phone": f"+7999777{i:04d}", "name": "W",
+               "category": "Покупатели"} for i in range(4)]
+    with patch.object(config, "DB_PATH", _w_db.name), \
+         patch.object(config, "STATE_PATH", _w_st), \
+         patch.object(config, "BULK_BYPASS_SAFE_HOURS", True), \
+         patch.object(config, "PHASE_GRACE_MINUTES", 12), \
+         patch.object(config, "RESCUE_SETTLE_MINUTES", 5), \
+         patch.object(config, "CHANNEL_DAILY_LIMITS",
+                      {"whatsapp": 60, "telegram": 50, "max": 15,
+                       "waba": 250, "sms": 50}), \
+         patch.object(sender, "_sleep_phase", lambda s, st: None), \
+         patch.object(sender, "_wait_until_active_window", lambda log: False), \
+         patch.object(sender, "_phase_fits", lambda ch, n: True), \
+         patch.object(state, "max_attempts_reached", lambda st: False), \
+         patch.object(reconcile, "sweep_unconfirmed_deliveries", _w_fake_sweep), \
+         patch.object(db, "pending_rescues",
+                      lambda **kw: [
+                          {"id": i + 1, "phone": ph, "name": "W",
+                           "category": "Покупатели"}
+                          for i, ph in enumerate(_w_rescued)
+                      ] if kw.get("exclude_tried") == "telegram" else []), \
+         patch.object(sender, "_run_one_contact",
+                      lambda c, chs, b, ps, st, **kw: _w_sent.append(
+                          (chs[0] if chs else "?", c["phone"])) or True):
+        db.init_db()
+        _stats = sender._run_all_phases(_w_sel, {"v": False}, {}, {}, cycle_no=1)
+
+    _w_waba = [ph for ch, ph in _w_sent if ch == "waba"]
+    _w_tg = [ph for ch, ph in _w_sent if ch == "telegram"]
+    check("WABA-фаза отправила контакты",
+          len(_w_waba) == 4, f"отправлено {len(_w_waba)}: {_w_waba}")
+    check("сторож молчания вызван ПОСЛЕ паузы WABA",
+          _w_swept_calls and _w_swept_calls[0] == 12,
+          f"таймауты сторожа: {_w_swept_calls}")
+    check("сторож молчания вызван и перед фазой MAX",
+          len(_w_swept_calls) >= 2, f"вызовов {_w_swept_calls}")
+    check("фаза отката непуста: rescue наполнен тишиной",
+          len(_w_rescued) == 4, f"в rescue {_w_rescued}")
+    check("фаза Telegram реально отправила откат (не пустая)",
+          len(_w_tg) == 4, f"TG-отправок {len(_w_tg)}: {_w_tg}")
+    check("никому не отправили дважды в одном круге",
+          len(_w_tg) == len(set(_w_tg)), f"{_w_tg}")
+finally:
+    for _f in (_w_db.name, _w_st):
+        try:
+            os.unlink(_f)
+        except OSError:
+            pass
+
+# Сторож реально уважает переопределение минут.
+check("sweep_unconfirmed_deliveries принимает minutes",
+      "minutes" in inspect.signature(reconcile.sweep_unconfirmed_deliveries).parameters)
+check("sweep_unconfirmed_deliveries по умолчанию = CONFIRM_TIMEOUT_MINUTES",
+      "CONFIRM_TIMEOUT_MINUTES" in inspect.getsource(
+          reconcile.sweep_unconfirmed_deliveries))
+check("RESCUE_SETTLE_MINUTES настроен",
+      int(getattr(config, "RESCUE_SETTLE_MINUTES", 0)) > 0)
+
 print()
 print("=" * 70)
 print(f" TOTAL: {passed} passed, {failed} failed")

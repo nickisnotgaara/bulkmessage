@@ -701,10 +701,11 @@ def reconcile_pending_webhooks() -> None:
             log.warning(f"Pending webhook {row['id']} retry failed: {e}")
 
 
-def sweep_unconfirmed_deliveries(limit: int = 50) -> int:
+def sweep_unconfirmed_deliveries(limit: int = 50,
+                                 minutes: int | None = None) -> int:
     """Сторож подтверждений: принято, но не подтверждено доставкой.
 
-    Вебхук — единственный источник, который запускает fallback. Если он
+    ВЕБХУК — единственный источник, который запускает fallback. Если он
     потерян или подписка молчит, сообщение навсегда остаётся в статусе
     `sent`: rescue-очередь его не видит, и контакт тихо исчезает из воронки.
     Именно это и приводило к «100 отправлено → 28 дошло»: недоставки были,
@@ -714,9 +715,23 @@ def sweep_unconfirmed_deliveries(limit: int = 50) -> int:
     с причиной `no_delivery_confirmation` и ставим контакт в rescue-очередь,
     откуда sender отправит его следующим каналом.
 
+    ПОЧЕМУ ЭТО КРИТИЧНО: замер боевого прогона 2026-10-06 показал, что
+    Wazzup НЕ присылает статус `failed` вообще — ни разу за 1321 событие.
+    Реальный набор статусов: delivered / read / sent / error(BAD_CONTACT).
+    То есть отказ Meta по маркетинговому шаблону выглядит как ТИШИНА:
+    сообщение принято (HTTP 2xx), и про него больше никто не пишет.
+    Поэтому запускать откат только по явному `failed` бессмысленно —
+    очередь всегда пуста, и фазы Telegram/MAX не отрабатывают никогда.
+    Молчание и есть отказ.
+
+    `minutes` — переопределение таймаута ожидания подтверждения. Фазы
+    отката ждут PHASE_GRACE_MINUTES (минуты), а не дефолтные 60: иначе
+    откат начнётся через час, когда человек уже не в окне 11–19 МСК.
+
     Возвращает количество контактов, отправленных в rescue.
     """
-    minutes = getattr(config, "CONFIRM_TIMEOUT_MINUTES", 60)
+    if minutes is None:
+        minutes = getattr(config, "CONFIRM_TIMEOUT_MINUTES", 60)
     max_age = getattr(config, "CONFIRM_MAX_AGE_HOURS", 24)
     try:
         rows = db.find_unconfirmed(

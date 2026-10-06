@@ -1555,6 +1555,35 @@ def _select_contacts_for_cycle(
     return out
 
 
+def _sweep_silence_into_rescue(minutes: int) -> int:
+    """Перед фазой отката: молчание вебхука = отказ Meta.
+
+    Wazzup не присылает `failed` (замер 2026-10-06: 0 событий `failed` на
+    1321 событий, реальные статусы — delivered/read/sent/error). Отказ по
+    маркетинговому шаблону выглядит как тишина: HTTP 2xx есть, подтверждения
+    доставки нет и не будет. Поэтому перед откатом мы сами превращаем
+    молчание в явный провал и кладём контакты в rescue-очередь.
+
+    Без этого шага фазы Telegram/MAX уходили в пустоту: очередь наполнял
+    только `error` (2 события за всю историю), а откат на 100–250 сообщений
+    не срабатывал НИ РАЗУ.
+    """
+    try:
+        from . import reconcile as _reconcile
+        n = _reconcile.sweep_unconfirmed_deliveries(
+            limit=200, minutes=max(1, int(minutes))
+        )
+    except Exception as e:
+        log.warning(f"Сторож молчания перед откатом не отработал (non-fatal): {e}")
+        return 0
+    if n:
+        log.warning(
+            f"🔇 Вебхук промолчал {n} контактов после паузы — они идут в откат "
+            f"(TG/MAX). Явных 'failed' от Wazzup не бывает."
+        )
+    return n
+
+
 def _run_all_phases(
     filtered: list,
     stop_requested: dict,
@@ -1585,15 +1614,25 @@ def _run_all_phases(
             break
 
         if phase_no > 0:
-            # Пауза ТОЛЬКО после WABA: ждём явные failed-события вебхука,
-            # которые и формируют пул для отката. Без вебхука пул будет пуст.
+            # Пауза ТОЛЬКО после WABA: ждём события вебхука. Но Wazzup не
+            # шлёт `failed`, поэтому после паузы молчание само становится
+            # провалом — прогоняем сторож и наполняем очередь отката.
             grace = int(getattr(config, "PHASE_GRACE_MINUTES", 5)) * 60
             if grace > 0 and phase_order[phase_no - 1] == "waba":
                 log.info(
-                    f"⏸️  Пауза {grace // 60} мин после WABA: ждём события "
-                    f"'failed' от вебхука (без них откат не знает, кому идти)"
+                    f"⏸️  Пауза {grace // 60} мин после WABA: ждём подтверждений "
+                    f"доставки (Wazzup не шлёт 'failed', недоказанное = провал)"
                 )
                 _sleep_phase(grace, stop_requested)
+                _sweep_silence_into_rescue(grace // 60)
+            elif phase_order[phase_no - 1] != "waba":
+                # Вторая и последующие фазы отката: короткая пауза, чтобы
+                # долетели статусы по предыдущему каналу, затем снова сторож.
+                short = int(getattr(config, "RESCUE_SETTLE_MINUTES", 5)) * 60
+                if short > 0:
+                    _sleep_phase(short, stop_requested)
+                    _sweep_silence_into_rescue(getattr(
+                        config, "RESCUE_SETTLE_MINUTES", 5))
 
         if phase_ch == "waba":
             # Ждём открытия активного окна (10:00 МСК) перед первой фазой.
