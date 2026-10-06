@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
+import sys
 import threading
 import time
 from datetime import datetime
@@ -41,6 +43,58 @@ _WORKER_STARTED = False
 _LAST_FAIL_REPORT: dict[str, float] = {}
 
 
+# ---------------------------------------------------------------------------
+# Подавление уведомлений на тестовых прогонах
+# ---------------------------------------------------------------------------
+#
+# Реальный случай 2026-10-06: юнит-тест R26 в test_suite.py подставляет
+# фикстурный ответ `HTTP 401 Not authorized in channel` (контакт +79995550044).
+# sender логирует это как ERROR → TelegramHandler форвардит в боевой
+# tglog-бот → владелец получает в личку «🔐 AUTH — Wazzup API key/channel
+# невалиден для telegram», хотя никакого запроса в Wazzup не было.
+#
+# То есть фикстура теста выглядела как настоящая авария канала. Поэтому
+# любой тестовый/стендовый прогон (test_*.py, bm_*.py) молчит в Telegram,
+# а явный вызов send_test() — работает (это ручное действие человека).
+
+_SUPPRESS_ENV_FLAG = "BULK_TG_LOG_DISABLE"
+
+_TRUE_VALUES = ("1", "true", "yes", "on")
+
+
+def _entry_script() -> str:
+    """Имя скрипта, которым запущен процесс (test_suite.py, main.py...)."""
+    try:
+        return os.path.basename(sys.argv[0] or "").lower()
+    except Exception:
+        return ""
+
+
+def _auto_suppressed() -> bool:
+    """True, если процесс — тест/стенд или явно выставлен флаг отключения."""
+    flag = (os.environ.get(_SUPPRESS_ENV_FLAG) or "").strip().lower()
+    if flag in _TRUE_VALUES:
+        return True
+    name = _entry_script()
+    if name.startswith("test_") or name.startswith("bm_"):
+        return True
+    return False
+
+
+_SUPPRESSED = _auto_suppressed()
+
+
+def is_suppressed() -> bool:
+    """True — уведомления в Telegram подавлены (тест/стенд/флаг)."""
+    return _SUPPRESSED
+
+
+def set_suppressed(value: bool) -> None:
+    """Переключить подавление во время работы процесса."""
+    global _SUPPRESSED
+    _SUPPRESSED = bool(value)
+
+
 def _format_message(text: str, level: str = "INFO") -> str:
     """Форматирует сообщение для Telegram. Лимит Telegram: 4096 символов."""
     if len(text) > 3500:
@@ -58,6 +112,8 @@ def _format_message(text: str, level: str = "INFO") -> str:
 
 def _send_to_telegram(text: str) -> bool:
     """Один HTTP POST. Возвращает True если успешно."""
+    if _SUPPRESSED:
+        return False
     if not config.TG_LOG_ENABLED:
         return False
     try:
@@ -109,6 +165,8 @@ def _start_worker() -> None:
     global _WORKER_STARTED
     if _WORKER_STARTED:
         return
+    if _SUPPRESSED:
+        return
     if not config.TG_LOG_ENABLED:
         return
     t = threading.Thread(target=_worker, name="tglog-worker", daemon=True)
@@ -124,7 +182,11 @@ def send(text: str, level: str = "INFO") -> None:
     """Отправить произвольное сообщение админу (неблокирующе).
 
     Если TG_LOG_ENABLED=False — no-op. Если очередь переполнена — drop + warn.
+    На тестовых прогонах (test_*.py / bm_*.py / BULK_TG_LOG_DISABLE=1) —
+    тоже no-op: фикстурные ошибки не должны прилетать в личку владельца.
     """
+    if _SUPPRESSED:
+        return
     if not config.TG_LOG_ENABLED:
         return
     msg = _format_message(text, level)
@@ -210,6 +272,8 @@ class TelegramHandler(logging.Handler):
         _start_worker()
 
     def emit(self, record: logging.LogRecord) -> None:
+        if _SUPPRESSED:
+            return
         try:
             text = self.format(record)
             msg = _format_message(text, record.levelname)
@@ -235,5 +299,12 @@ def install_handler() -> bool:
         if isinstance(h, TelegramHandler):
             return True
     root.addHandler(TelegramHandler())
-    log.info("TG log: TelegramHandler подключён к root logger")
+    if _SUPPRESSED:
+        # Handler подключён (идемпотентность, тесты), но emit() молчит.
+        log.info(
+            "TG log: уведомления ПОДАВЛЕНЫ (тестовый/стендовый прогон) — "
+            "в Telegram ничего не уйдёт"
+        )
+    else:
+        log.info("TG log: TelegramHandler подключён к root logger")
     return True

@@ -1225,6 +1225,41 @@ ok2 = tglog.install_handler()
 check("install_handler() идемпотентен (повторный не дублирует)",
       ok2 is True and len(_logging.getLogger().handlers) == _root_after)
 
+# Подавление уведомлений на тестовых прогонах.
+# Реальный случай 2026-10-06: фикстура R26 «HTTP 401 Not authorized in channel»
+# улетела в личку владельца как «канал telegram мёртв», хотя запрос в Wazzup
+# не уходил. Фикстура теста не должна выглядеть как авария боевого канала.
+check("На test_*.py уведомления подавлены (is_suppressed)",
+      tglog.is_suppressed() is True)
+
+_q_before = tglog._QUEUE.qsize()
+tglog.TelegramHandler().emit(
+    logging.LogRecord("sender", logging.ERROR, __file__, 1,
+                      "AUTH фикстура R26 — не должна уйти в Telegram", None, None))
+check("emit() при подавлении не кладёт запись в очередь",
+      tglog._QUEUE.qsize() == _q_before,
+      f"before={_q_before} after={tglog._QUEUE.qsize()}")
+
+check("_send_to_telegram() при подавлении возвращает False без сети",
+      tglog._send_to_telegram("ping") is False)
+
+_q_before2 = tglog._QUEUE.qsize()
+tglog.send("подавлено", "ERROR")
+check("send() при подавлении — no-op",
+      tglog._QUEUE.qsize() == _q_before2,
+      f"before={_q_before2} after={tglog._QUEUE.qsize()}")
+
+import os as _os
+_os.environ["BULK_TG_LOG_DISABLE"] = "1"
+check("_auto_suppressed() уважает BULK_TG_LOG_DISABLE=1",
+      tglog._auto_suppressed() is True)
+_os.environ.pop("BULK_TG_LOG_DISABLE", None)
+check("set_suppressed() переключает флаг вручную",
+      (tglog.set_suppressed(False), tglog.is_suppressed())[1] is False)
+tglog.set_suppressed(tglog._auto_suppressed())
+check("auto-флаг восстановлен после ручного сброса",
+      tglog.is_suppressed() is True)
+
 # getMe и send_test — реальные сетевые вызовы (НЕ запускаем в unit-suite,
 # чтоб не блокировать на сетевых таймаутах. Отдельный скрипт _check_tg.py)
 check("getMe() существует (сетевая проверка — в _check_tg.py)",
