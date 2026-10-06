@@ -26,6 +26,8 @@ from typing import Optional
 
 import requests
 
+import logging
+
 from . import config
 
 
@@ -80,6 +82,14 @@ _AUTH_KEYWORDS = (
     "auth",
     "channel not found",
 )
+
+# Числовые коды НЕЛЬЗЯ искать как подстроку: Wazzup возвращает сырой JSON,
+# где task_id/uuid — случайный hex. Реальный случай 2026-10-06:
+# «Peer flood error for 79779612336» с task_id «...4ea40107a...» — внутри
+# task_id нашлась подстрока «401», и отказ ОДНОГО контакта был классифицирован
+# как AUTH → halt канала telegram на 24 часа. Поэтому код ищем по границам
+# слова: «ea40107a» не матчится, «HTTP 401 Unauthorized» — матчится.
+_AUTH_CODE_RE = re.compile(r"(?<![\w-])(401|403)(?![\w-])")
 
 # Ошибки уровня ОДНОГО КОНТАКТА, не уровня канала. Проверяются раньше
 # _AUTH_KEYWORDS, иначе они классифицировались бы как AUTH и гасили канал.
@@ -165,7 +175,9 @@ def classify_error(detail: str, http_status: Optional[int] = None) -> ErrorKind:
         return ErrorKind.AUTH
     if any(k in s for k in _CONTACT_KILL_KEYWORDS):
         return ErrorKind.PERMANENT
-    if any(k in s for k in _AUTH_KEYWORDS):
+    if _AUTH_CODE_RE.search(s):
+        return ErrorKind.AUTH
+    if any(k in s for k in _AUTH_KEYWORDS if not k.isdigit()):
         return ErrorKind.AUTH
     if any(k in s for k in _PERMANENT_KEYWORDS):
         return ErrorKind.PERMANENT

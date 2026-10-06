@@ -3191,6 +3191,34 @@ check("CHAT_WRITE_FORBIDDEN при ответе 200 не роняет канал
       classify_error("CHAT_WRITE_FORBIDDEN", 200) == ErrorKind.PERMANENT,
       f"got {classify_error('CHAT_WRITE_FORBIDDEN', 200)}")
 
+# Реальный случай 2026-10-06 (источник «AUTH на telegram» в боевой БД):
+# отказ ОДНОГО контакта «Peer flood error» классифицировался как AUTH,
+# потому что «401» нашлось как подстрока внутри task_id-хекса, и канал
+# telegram гас на 24 часа.
+_peer_flood = (
+    'HTTP 400: {"status":"error","timestamp":1788185455,'
+    '"detail":"Peer flood error for 79779612336",'
+    '"task_id":"d12fd41739fc25b4ea40107a8f3faf98",'
+    '"uuid":"8994f8b2-4dce"}'
+)
+check("«401» внутри task_id-хекса НЕ даёт AUTH",
+      classify_error(_peer_flood, 400) == ErrorKind.RATE_LIMIT,
+      f"got {classify_error(_peer_flood, 400)}")
+check("Peer flood error = RATE_LIMIT, а не AUTH",
+      classify_error("Peer flood error for 79779612336", 400)
+      == ErrorKind.RATE_LIMIT,
+      f"got {classify_error('Peer flood error for 79779612336', 400)}")
+check("HTTP 401 в тексте ответа по-прежнему AUTH",
+      classify_error("HTTP 401 Not authorized in channel", 400)
+      == ErrorKind.AUTH,
+      f"got {classify_error('HTTP 401 Not authorized in channel', 400)}")
+check("HTTP 403 в тексте ответа по-прежнему AUTH",
+      classify_error("HTTP 403 Forbidden", 400) == ErrorKind.AUTH,
+      f"got {classify_error('HTTP 403 Forbidden', 400)}")
+check("'unauthorized' в тексте — AUTH",
+      classify_error("Not authorized in channel", 400) == ErrorKind.AUTH,
+      f"got {classify_error('Not authorized in channel', 400)}")
+
 _r_perm_src = inspect.getsource(sender._run_one_contact)
 _r_perm_at = _r_perm_src.rindex("ErrorKind.PERMANENT")
 _r_perm_branch = _r_perm_src[_r_perm_at:_r_perm_at + 900]
