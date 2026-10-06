@@ -1673,6 +1673,13 @@ def _run_all_phases(
 
 
 def run() -> None:
+    # Дедлайн и номер круга живут на уровне модуля: их читают
+    # _run_seconds_left() и _run_all_phases(). Без `global` присваивание
+    # ниже создавало ЛОКАЛЬНЫЕ имена, и первый же круг падал с
+    # `UnboundLocalError: _RUN_CYCLE`, а режим длинного прогона видел
+    # дедлайн None (никогда не останавливался по времени).
+    global _RUN_DEADLINE, _RUN_CYCLE
+
     config.configure_logging()
     db.init_db()
 
@@ -2121,6 +2128,10 @@ def run() -> None:
         run_hours = float(getattr(config, "RUN_HOURS", 0) or 0)
         loop_pause = float(getattr(config, "RUN_LOOP_PAUSE_MINUTES", 10) or 0)
 
+        # Сброс на каждый вызов run(): иначе повторный запуск в том же
+        # процессе унаследует дедлайн и номер круга предыдущего.
+        _RUN_CYCLE = 0
+        _RUN_DEADLINE = None
         if run_hours > 0:
             _RUN_DEADLINE = time.time() + run_hours * 3600
             _dl = datetime.fromtimestamp(_RUN_DEADLINE, tz=timezone.utc)

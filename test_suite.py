@@ -2784,6 +2784,160 @@ finally:
         pass
 
 
+# ---------------------------------------------------------------------------
+# U. РЕГРЕССИЯ: run() падал с UnboundLocalError на ПЕРВОМ же круге фаз.
+#
+# Причина: `_RUN_CYCLE` и `_RUN_DEADLINE` объявлялись как имена уровня
+# модуля, но присваивались внутри run() БЕЗ `global` → становились
+# локальными. Чтение `cycle_no=(_RUN_CYCLE + 1)` в первом проходе цикла
+# давало `UnboundLocalError: cannot access local variable '_RUN_CYCLE'`,
+# то есть БОЕВОЙ запуск падал в первую секунду. Тесты этого не ловили:
+# bm_runloop.py выставлял глобалы ДО вызова run() и замаскировал баг.
+#
+# Тест ниже НЕ трогает глобалы перед вызовом — ровно как в бою.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# U. РЕГРЕССИЯ: run() падал с UnboundLocalError на ПЕРВОМ же круге фаз.
+#
+# Причина: `_RUN_CYCLE` и `_RUN_DEADLINE` объявлены на уровне модуля, но
+# присваивались внутри run() БЕЗ `global` → становились ЛОКАЛЬНЫМИ именами.
+# Чтение `cycle_no=(_RUN_CYCLE + 1)` в первом проходе цикла давало
+# `UnboundLocalError: cannot access local variable '_RUN_CYCLE'`, то есть
+# БОЕВОЙ запуск падал в первую секунду (поймано сухим прогоном на сервере).
+# Второй следствие: _run_seconds_left() читал глобальный _RUN_DEADLINE,
+# который оставался None → режим --run-hours никогда не останавливался.
+#
+# Тесты этого не ловили: bm_runloop.py выставлял глобалы ДО вызова run().
+# Тесты ниже НЕ трогают глобалы перед вызовом — ровно как в бою.
+# ---------------------------------------------------------------------------
+section("U. РЕГРЕССИЯ: ПЕРВЫЙ КРУГ ФАЗ (UnboundLocalError)")
+import time as _time
+
+_u_state_f = tempfile.NamedTemporaryFile(suffix=".state.json", delete=False)
+_u_state_f.write(b"{}")
+_u_state_f.close()
+_u_db_f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_u_db_f.close()
+
+_save_run_hours = getattr(config, "RUN_HOURS", 0)
+_save_loop_pause = getattr(config, "RUN_LOOP_PAUSE_MINUTES", 10)
+_cycles_seen: list = []
+_lefts_seen: list = []
+
+
+def _u_ctx():
+    """Изоляция: пустая база контактов, локальные БД/state, без сети."""
+    return (
+        patch.object(config, "STATE_PATH", _u_state_f.name),
+        patch.object(config, "DB_PATH", _u_db_f.name),
+        patch.object(config, "LOCK_PATH", _u_db_f.name + ".lock"),
+        patch.object(config, "BULK_BYPASS_SAFE_HOURS", True),
+        patch.object(sender, "_select_contacts_for_cycle", lambda c: []),
+        patch.object(sender.contacts, "load_contacts", lambda *a, **k: []),
+        patch.object(sender.wazzup, "active_channels", lambda: ["waba"]),
+        patch.object(sender.wazzup, "channel_id_for", lambda ch: "test-cid"),
+        # None здесь означал бы «lock занят» → ранний return из run().
+        patch.object(sender, "_try_acquire_lock", lambda: _u_db_f.name),
+        patch.object(sender, "_release_lock", lambda p: None),
+        patch.object(sender, "_sleep_phase", lambda s, st: None),
+        patch.object(sender, "_drain_rescue_queue", lambda st: 0),
+        # tglog/reconcile sender импортирует ВНУТРИ функций, поэтому патчим
+        # сами модули: иначе тест реально отправил бы TG-отчёт админу.
+        patch("bulkmessage.tglog.send", lambda *a, **k: None),
+        patch("bulkmessage.reconcile.sweep_unconfirmed_deliveries",
+              lambda **k: 0),
+        patch("bulkmessage.reconcile.sync_message_to_sheet",
+              lambda **k: None),
+    )
+
+
+_u_err = None
+try:
+    # --- A. Обычный запуск (без --run-hours): ровно один круг фаз.
+    sender._RUN_CYCLE = 0
+    sender._RUN_DEADLINE = None
+    config.RUN_HOURS = 0
+    _cycles_seen.clear()
+    _lefts_seen.clear()
+
+    def _u_phases_once(filtered, stop_requested, backoffs,
+                       permanent_skipped, cycle_no=1):
+        _cycles_seen.append(cycle_no)
+        return {}
+
+    _ctxs = _u_ctx()
+    try:
+        for _c in _ctxs:
+            _c.start()
+        with patch.object(sender, "_run_all_phases", _u_phases_once):
+            sender.run()
+    except BaseException as _exc:
+        _u_err = f"{type(_exc).__name__}: {_exc}"
+    finally:
+        for _c in reversed(_ctxs):
+            _c.stop()
+
+    check("run(): первый круг фаз без UnboundLocalError",
+          _u_err is None, f"raised {_u_err}")
+    check("run(): номер круга передан как 1",
+          _cycles_seen == [1], f"got {_cycles_seen}")
+    check("run(): без --run-hours отработал ровно один круг",
+          len(_cycles_seen) == 1, f"got {len(_cycles_seen)}")
+
+    # --- B. Режим --run-hours: дедлайн обязан быть виден МОДУЛЬНОЙ функции.
+    # Второй круг сами уводим дедлайн в прошлое, чтобы цикл закрылся без
+    # реального ожидания. Если run() снова сделает имя локальным,
+    # _run_seconds_left() вернёт inf и проверка упадёт.
+    sender._RUN_CYCLE = 0
+    sender._RUN_DEADLINE = None
+    config.RUN_HOURS = 1.0
+    _cycles_seen.clear()
+    _lefts_seen.clear()
+
+    def _u_phases_loop(filtered, stop_requested, backoffs,
+                       permanent_skipped, cycle_no=1):
+        _cycles_seen.append(cycle_no)
+        _lefts_seen.append(sender._run_seconds_left())
+        if len(_cycles_seen) >= 2:
+            sender._RUN_DEADLINE = _time.time() - 1  # форсируем выход
+        return {}
+
+    _u_err = None
+    _ctxs = _u_ctx()
+    try:
+        for _c in _ctxs:
+            _c.start()
+        with patch.object(sender, "_run_all_phases", _u_phases_loop):
+            sender.run()
+    except BaseException as _exc:
+        _u_err = f"{type(_exc).__name__}: {_exc}"
+    finally:
+        for _c in reversed(_ctxs):
+            _c.stop()
+
+    check("run() с --run-hours: тоже без UnboundLocalError",
+          _u_err is None, f"raised {_u_err}")
+    check("run() с --run-hours: дедлайн виден модулю (не inf)",
+          bool(_lefts_seen) and _lefts_seen[0] != float("inf"),
+          f"first left={_lefts_seen[0] if _lefts_seen else 'n/a'}")
+    check("run() с --run-hours: остаток ≈ 1ч",
+          bool(_lefts_seen) and 3500 <= _lefts_seen[0] <= 3600,
+          f"got {_lefts_seen[0] if _lefts_seen else 'n/a'}")
+    check("run() с --run-hours: номер круга растёт (1, 2, ...)",
+          _cycles_seen[:2] == [1, 2], f"got {_cycles_seen[:4]}")
+    check("run() с --run-hours: цикл вышел по дедлайну, не зациклился",
+          len(_cycles_seen) == 2, f"cycles={len(_cycles_seen)}")
+finally:
+    config.RUN_HOURS = _save_run_hours
+    config.RUN_LOOP_PAUSE_MINUTES = _save_loop_pause
+    sender._RUN_CYCLE = 0
+    sender._RUN_DEADLINE = None
+    for _f in (_u_state_f.name, _u_db_f.name):
+        try:
+            os.unlink(_f)
+        except OSError:
+            pass
+
 print()
 print("=" * 70)
 print(f" TOTAL: {passed} passed, {failed} failed")
