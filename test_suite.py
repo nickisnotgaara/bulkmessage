@@ -3115,6 +3115,152 @@ check("sweep_unconfirmed_deliveries по умолчанию = CONFIRM_TIMEOUT_MI
 check("RESCUE_SETTLE_MINUTES настроен",
       int(getattr(config, "RESCUE_SETTLE_MINUTES", 0)) > 0)
 
+# ---------------------------------------------------------------------------
+# W. РЕГРЕССИЯ: ФАЗЫ ОТКАТА БЫЛИ ПУСТЫМИ (это и есть «не доставилось,
+# но другим каналом не отправили»).
+#
+# Замер боевого прогона 2026-10-06 (31 сообщение WABA):
+#   delivered по вебхуку — 15, БЕЗ единого события — 16;
+#   статус `failed` от Wazzup — 0 событий за всю историю (1321 событие).
+# Wazzap шлёт delivered/read/sent/error(BAD_CONTACT) и НИКОГДА failed.
+# Отказ Meta по маркетинговому шаблону выглядит как ТИШИНА.
+#
+# Код ждал явный `failed`, поэтому rescue_queue оставалась пустой, и фазы
+# Telegram/MAX не отправляли НИЧЕГО. Ниже — сквозной тест: WABA приняты без
+# подтверждения → пауза → сторож молчания → очередь отката непуста.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# X. РЕГРЕССИЯ: ПОДТВЕРЖДЕНИЯ ДОСТАВКИ НИКОГДА НЕ ПОПАДАЛИ В БД.
+#
+# Живой замер 2026-10-06: вебхук получил 1321 событие, из них 15 реально
+# доставленных WABA-сообщений, но в логе НОЛЬ строк "DELIVERY status", а
+# в таблице messages все они остались status='sent'.
+#
+# Две причины, обе в разборе payload:
+#   1) конверт `{"statuses": [...]}` не разворачивался — код знал только
+#      про "messages" и "events", поэтому events уходили в "ignored";
+#   2) внутри статуса нет ни `type`, ни `wh_type`, ни channelId/chatType —
+#      даже развернутый конверт не попал бы ни в одну ветку диспетчера,
+#      а канал резолвился бы как 'whatsapp' вместо 'waba'.
+#
+# Ниже — ТОЧНЫЕ payload'ы из data/pending_webhooks.jsonl.
+# ---------------------------------------------------------------------------
+section("X. РЕГРЕССИЯ: РАЗБОР РЕАЛЬНЫХ СТАТУСОВ WAZZUP")
+_x_calls: list = []
+
+# Реальный конверт статуса: ни type, ни wh_type, ни channelId, ни chatType.
+_X_REAL_STATUS = {
+    "statuses": [{
+        "messageId": "1a5e0449-0948-498f-a6bb-f2dd5d47b7d7",
+        "timestamp": "2026-10-06T13:15:00.000Z",
+        "status": "delivered",
+    }]
+}
+_X_REAL_ERROR = {
+    "statuses": [{
+        "messageId": "632ff404-5db7-4641-a623-2b7a4502bee4",
+        "timestamp": "2026-10-02T07:05:15.723Z",
+        "status": "error",
+        "error": {"error": "BAD_CONTACT",
+                  "description": "Number may not be on WhatsApp"},
+    }]
+}
+# Реальное входящее сообщение — не должно поехать в обработчик статусов.
+_X_REAL_INCOMING = {
+    "messages": [{
+        "messageId": "b893af6d-e66b-426c-b0f7-9b4c6e2b4e44",
+        "dateTime": "2026-10-06T13:34:05.000Z",
+        "channelId": "14058d25-0705-421e-9d78-0eb2f1c0d667",
+        "chatType": "whatsapp",
+        "chatId": "79167365456@c.us",
+        "text": "да",
+    }]
+}
+
+check("конверт 'statuses' распознан как статус-событие",
+      reconcile._is_status_event(
+          dict(_X_REAL_STATUS["statuses"][0], _envelope="statuses"), ""))
+check("статус-событие опознаётся и без тега конверта",
+      reconcile._is_status_event(_X_REAL_STATUS["statuses"][0], ""))
+check("входящее сообщение НЕ считается статус-событием",
+      not reconcile._is_status_event(_X_REAL_INCOMING["messages"][0], "message"))
+check("входящее с текстом и статусом — всё равно не статус",
+      not reconcile._is_status_event(
+          dict(_X_REAL_INCOMING["messages"][0], status="sent"), "message"))
+
+
+def _x_spy_status(ch, msg):
+    _x_calls.append(("status", ch, msg.get("id") or msg.get("message_id"),
+                     (msg.get("status") or "").lower()))
+
+
+def _x_spy_incoming(ch, msg):
+    _x_calls.append(("incoming", ch, msg.get("body")))
+
+
+try:
+    with patch.object(reconcile, "process_delivery_status", _x_spy_status), \
+         patch.object(reconcile, "process_incoming_message", _x_spy_incoming), \
+         patch.object(reconcile, "process_outgoing_message",
+                      lambda ch, msg: _x_calls.append(("outgoing", ch, None))):
+        reconcile.process_wazzup_payload(None, _X_REAL_STATUS)
+        reconcile.process_wazzup_payload(None, _X_REAL_ERROR)
+        reconcile.process_wazzup_payload(None, _X_REAL_INCOMING)
+
+    kinds = [c[0] for c in _x_calls]
+    check("реальный конверт statuses дошёл до обработчика статусов",
+          kinds[:2] == ["status", "status"], f"got {kinds}")
+    check("messageId извлечён из реального статуса",
+          _x_calls[0][2] == "1a5e0449-0948-498f-a6bb-f2dd5d47b7d7",
+          f"got {_x_calls[0][2]}")
+    check("статус delivered распознан",
+          _x_calls[0][3] == "delivered", f"got {_x_calls[0][3]}")
+    check("статус error распознан обработчиком (сырой 'error')",
+          _x_calls[1][3] == "error", f"got {_x_calls[1][3]}")
+    check("error преобразуется в локальный 'failed' (=> rescue)",
+          reconcile._wazzup_status_to_local("error") == "failed",
+          f"got {reconcile._wazzup_status_to_local('error')}")
+    check("delivered преобразуется в локальный 'delivered'",
+          reconcile._wazzup_status_to_local("delivered") == "delivered")
+    check("входящее сообщение ушло в свой обработчик, не в статус",
+          kinds[2] == "incoming", f"got {kinds[2] if len(kinds) > 2 else None}")
+    check("_envelope не попадает в исходный payload",
+          "_envelope" not in _X_REAL_STATUS["statuses"][0])
+finally:
+    pass
+
+# Канал для статуса берётся из БД: у события нет ни channelId, ни chatType.
+_x_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_x_db.close()
+try:
+    with patch.object(config, "DB_PATH", _x_db.name):
+        db.init_db()
+        _x_rows_before = []
+        with db.db_conn() as conn:
+            _cid = db.upsert_contact(conn, phone="+79990001111",
+                                     name="Канал", category="Покупатели")
+            db.insert_message(conn, contact_id=_cid, channel="waba",
+                              message_text="t", message_id="mid-waba-1",
+                              status="sent")
+        with patch.object(state, "record_delivered",
+                          lambda st, ch, *a, **k: _x_rows_before.append(ch)), \
+             patch.object(state, "record_failed_delivery",
+                          lambda st, ch, *a, **k: None), \
+             patch.object(state, "load_state", dict), \
+             patch.object(state, "reset_daily_if_new_day", lambda s: s):
+            # ch=None имитирует то, что реально приходит из резолва payload:
+            # ни channelId, ни chatType у статус-события нет.
+            reconcile.process_delivery_status(
+                None, {"id": "mid-waba-1", "status": "delivered"})
+    check("канал статуса взят из БД ('waba'), а не из payload",
+          "waba" in _x_rows_before,
+          f"записали каналы {_x_rows_before}")
+finally:
+    try:
+        os.unlink(_x_db.name)
+    except OSError:
+        pass
+
 print()
 print("=" * 70)
 print(f" TOTAL: {passed} passed, {failed} failed")

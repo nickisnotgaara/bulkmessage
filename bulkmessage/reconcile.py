@@ -192,6 +192,12 @@ def process_delivery_status(channel: str, msg: dict) -> None:
                 f"delivery_status: сообщение {message_id} не найдено в БД"
             )
             return
+        # Канал берём из БД, а не из payload. У status-событий Wazzup нет ни
+        # channelId, ни chatType (0 из 1321 событий), поэтому резолв по payload
+        # давал 'whatsapp' вместо 'waba' — счётчики, halt и откат писались
+        # в несуществующий канал. Строка в БД — единственный достоверный
+        # источник: её туда положил sender в момент реальной отправки.
+        channel = row["channel"] or channel
         kwargs: dict = {"message_pk": row["id"]}
         if status == "delivered":
             kwargs.update({"status": "delivered", "delivered_at": True})
@@ -537,12 +543,17 @@ def process_wazzup_payload(channel_hint: Optional[str], payload: dict) -> None:
     # помечались обработанными. Отсюда были пустыми rescue_queue, complaint_events
     # и channel_reachability.
     items: list = []
-    for key in ("messages", "events"):
+    # Тег конверта: событие статуса приходит в {"statuses": [...]}, а у самого
+    # объекта НЕТ поля type/wh_type — только messageId/timestamp/status. Без
+    # тега такое событие уходило в "ignored event type=''", и НИ ОДНОГО
+    # подтверждения доставки не попадало в БД (замер 2026-10-06: 0 строк
+    # "DELIVERY status" при 15 реально доставленных сообщениях).
+    for key in ("messages", "events", "statuses", "statusesUpdate"):
         node = payload.get(key)
         if isinstance(node, list):
-            items.extend(node)
+            items.extend(_tag(item, key) for item in node)
         elif isinstance(node, dict):
-            items.append(node)
+            items.append(_tag(node, key))
     if not items:
         # Один объект без конверта — оборачиваем
         items = [payload]
@@ -576,14 +587,22 @@ def process_wazzup_payload(channel_hint: Optional[str], payload: dict) -> None:
                  evt.get("chatId"), evt.get("chat_id_full")],
             )
 
+            _envelope = evt.get("_envelope")
             if evt_type in ("incoming_message", "message", "incoming"):
                 msg = _wazzup_extract_message(evt)
                 msg["chat_type"] = chat_type or "whatsapp"
                 process_incoming_message(ch, msg)
-            elif evt_type in ("delivery_status", "status_update", "outgoing_message_api",
-                              "outgoing_message_phone", "message_status"):
+            elif _is_status_event(evt, evt_type):
                 msg = _wazzup_extract_message(evt)
                 process_delivery_status(ch, msg)
+            elif _envelope == "messages":
+                # Конверт `{"messages": [...]}` у Wazzup — это ВХОДЯЩИЕ
+                # сообщения, и у объекта внутри часто нет поля type. Раньше
+                # такие события уходили в "ignored event type=''", то есть
+                # ответы клиентов терялись целиком.
+                msg = _wazzup_extract_message(evt)
+                msg["chat_type"] = chat_type or "whatsapp"
+                process_incoming_message(ch, msg)
             elif evt_type in ("outgoing", "outgoing_message"):
                 msg = _wazzup_extract_message(evt)
                 process_outgoing_message(ch, msg)
@@ -654,6 +673,40 @@ def _handle_wazzup_channel_event(evt: dict) -> None:
     log.info(
         f"🔔 Wazzup channel event: type={evt_type!r} channelId={channel_id!r}"
     )
+
+
+def _is_status_event(evt: dict, evt_type: str) -> bool:
+    """Это событие смены статуса исходящего сообщения?
+
+    Два источника истины:
+      1) конверт `{"statuses": [...]}` — так Wazzup реально шлёт статусы;
+         у объекта внутри нет ни `type`, ни `wh_type`;
+      2) явный тип из прежней документации.
+
+    Плюс запасной признак: есть messageId И есть status И нет текста —
+    такой объект статусом является, даже если конверт неизвестен.
+    """
+    if evt.get("_envelope") in ("statuses", "statusesUpdate"):
+        return True
+    if evt_type in ("delivery_status", "status_update", "outgoing_message_api",
+                    "outgoing_message_phone", "message_status"):
+        return True
+    has_id = bool(evt.get("messageId") or evt.get("id")
+                  or evt.get("message_id") or evt.get("task_id"))
+    has_status = bool(evt.get("status"))
+    no_text = not (evt.get("text") or evt.get("body"))
+    return has_id and has_status and no_text
+
+
+def _tag(evt: dict, source: str) -> dict:
+    """Помечает событие конвертом, из которого оно пришло.
+
+    Копия, а не мутация: сырой payload лежит в data/pending_webhooks.jsonl и
+    используется как документация реального формата Wazzup.
+    """
+    out = dict(evt)
+    out["_envelope"] = source
+    return out
 
 
 def process_webhook_payload(channel_hint: Optional[str], payload: dict) -> None:
