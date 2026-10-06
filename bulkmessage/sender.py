@@ -335,9 +335,9 @@ def _persist_failure(phone: str, name: str, category: str, channel: str,
     молчания такую строку уже не подбирали, и контакт просто исчезал из
     воронки без всякого отката.
 
-    Фазы 2 и 3 (TG/MAX) читают очередь по `original_channel=<канал>`, поэтому
-    `original_channel` обязан быть именем канала, которым ОТПРАВЛЯЛИ — иначе
-    фильтр `original_channel="waba"` её не увидит.
+    Фазы отката (TG/MAX) берут из очереди ЛЮБЫЕ неподтверждённые контакты,
+    поэтому `original_channel` обязан быть именем канала, которым ОТПРАВЛЯЛИ —
+    это же имя потом видно в отчёте и в разборе воронки.
     """
     try:
         with db.db_conn() as conn:
@@ -1427,6 +1427,13 @@ def _sleep_phase(seconds: float, stop_requested: dict) -> None:
         slept += 30
 
 
+def _phase_order_channels() -> list[str]:
+    """Каналы фазовой схемы в порядке запуска (waba, telegram, max, ...)."""
+    return [c.strip() for c in
+            (getattr(config, "PHASE_ORDER", []) or [])
+            if c.strip()]
+
+
 def channel_delivery_health(channel: str, min_sample: int = 5,
                              window_hours: int = 6) -> dict:
     """Здоровье канала по недавней истории: доставилось хоть что-нибудь или нет.
@@ -1546,10 +1553,34 @@ def _run_phase(
                 log.info(f"  ✅ Rescue {rid} → {item.get('phone')} через {phase_ch}")
             else:
                 db.mark_rescue_attempt(rid, error=f"{phase_ch}_failed")
-                log.info(
-                    f"  ❌ Rescue {rid} не удался через {phase_ch} "
-                    f"(остаётся в очереди)"
-                )
+                # Все каналы отката для этого контакта уже отработали?
+                # Тогда НЕ оставляем его болтаться в начале очереди: уводим
+                # в конец с retry_after — на следующий день попробуем заново.
+                # Раньше такая запись навсегда оставалась 'pending' и просто
+                # занимала место, без единого шанса на повтор.
+                try:
+                    _tried = set(db.rescue_tried_channels(rid))
+                except Exception as _te:
+                    # Старая БД без колонки tried_channels: не роняем фазу
+                    # из-за служебной проверки — просто не откладываем.
+                    log.debug(f"rescue_tried_channels недоступна: {_te}")
+                    _tried = set()
+                _fallbacks = [c for c in _phase_order_channels() if c != "waba"]
+                if _fallbacks and set(_fallbacks).issubset(_tried):
+                    _tomorrow = (
+                        datetime.now(timezone.utc) + timedelta(days=1)
+                    ).isoformat()
+                    db.mark_rescue_deferred(rid, _tomorrow)
+                    log.info(
+                        f"  ⏭️ Rescue {rid} ({item.get('phone')}) провалился во "
+                        f"всех каналах ({', '.join(_tried)}) — в конец очереди, "
+                        f"повтор после {_tomorrow[:10]}"
+                    )
+                else:
+                    log.info(
+                        f"  ❌ Rescue {rid} не удался через {phase_ch} "
+                        f"(остаётся в очереди)"
+                    )
 
         if done % 10 == 0 or done == total:
             log.info(
@@ -1759,14 +1790,23 @@ def _run_all_phases(
             # exclude_tried: контакт, которому фаза TG уже не смогла
             # доставить, НЕ должен снова попасть в фазу MAX — иначе
             # он получит второе-третье сообщение за один прогон.
+            #
+            # original_channel ФИЛЬТРОМ НЕ ЗАДАЁМ. Раньше фаза отката читала
+            # только провалы WABA (хардкод на этот канал), и это ломало ровно
+            # ту цепочку, ради которой всё затевалось: если WABA не доставил,
+            # а Telegram принял и тоже не доставил (тишина вебхука), сторож
+            # кладёт такой контакт в очередь с original_channel='telegram' —
+            # и фаза MAX его уже не видела. Контакт зависал навсегда: ни
+            # Telegram, ни MAX. Теперь фаза берёт любые провалы из очереди;
+            # exclude_tried не даёт одному контакту получить
+            # второе сообщение в одном канале за прогон.
             pending = db.pending_rescues(
-                limit=limit, cooldown_seconds=0, original_channel="waba",
-                exclude_tried=phase_ch,
+                limit=limit, cooldown_seconds=0, exclude_tried=phase_ch,
             )
             if not pending:
                 log.info(
-                    f"▶️  Фаза {phase_ch.upper()}: пусто (нет провалов WABA "
-                    f"в очереди для этого канала)"
+                    f"▶️  Фаза {phase_ch.upper()}: пусто (нет неподтверждённых "
+                    f"контактов в очереди для этого канала)"
                 )
                 continue
             items = [

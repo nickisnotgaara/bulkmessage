@@ -610,6 +610,14 @@ def init_rescue_queue() -> None:
                 "ALTER TABLE rescue_queue ADD COLUMN tried_channels "
                 "TEXT NOT NULL DEFAULT ''"
             )
+        # Контакт, провалившийся во ВСЕХ каналах отката, не должен зависать
+        # в очереди навсегда и не должен блокировать её начало. Он уходит
+        # в status='deferred' с retry_after и возвращается в конец очереди
+        # на следующий день — ровно то «переводим в последние назад».
+        if not _has_column(conn, "rescue_queue", "retry_after"):
+            c.execute(
+                "ALTER TABLE rescue_queue ADD COLUMN retry_after TEXT"
+            )
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_rescue_status "
             "ON rescue_queue(status, created_at)"
@@ -688,12 +696,18 @@ def pending_rescues(
     from datetime import datetime, timezone, timedelta
 
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=cooldown_seconds)).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # pending — обычная очередь; deferred — вернётся, когда подойдёт retry_after.
+    # Порядок: сначала свежие pending, потом «отложенные» — то есть отложенные
+    # ВСЕГДА уходят в конец, ровно как требовалось.
     sql = (
         "SELECT * FROM rescue_queue "
-        "WHERE status = 'pending' "
+        "WHERE (status = 'pending'"
+        "   OR (status = 'deferred' AND retry_after IS NOT NULL "
+        "       AND retry_after <= ?)) "
         "AND (last_attempt_at IS NULL OR last_attempt_at < ?)"
     )
-    args: list = [cutoff]
+    args: list = [now_iso, cutoff]
     if original_channel:
         sql += " AND original_channel = ?"
         args.append(original_channel)
@@ -705,13 +719,56 @@ def pending_rescues(
             " OR (',' || tried_channels || ',') NOT LIKE ?)"
         )
         args.append(f"%,{exclude_tried},%")
-    sql += " ORDER BY created_at ASC LIMIT ?"
+    sql += " ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END, " \
+           "created_at ASC LIMIT ?"
     args.append(limit)
 
     with db_conn() as conn:
         c = conn.cursor()
         rows = c.execute(sql, args).fetchall()
-    return [dict(r) for r in rows]
+    # Запись, которую мы подобрали как отложенную, снова в работе: снимаем
+    # отметку отсрочки и чистим tried_channels, иначе exclude_tried
+    # продолжал бы считать канал «уже пробованным» и контакт не получал бы
+    # ни одной новой попытки.
+    picked = [dict(r) for r in rows]
+    revived = [r["id"] for r in picked if r.get("status") == "deferred"]
+    if revived:
+        with db_conn() as conn:
+            conn.execute(
+                "UPDATE rescue_queue SET status='pending', retry_after=NULL, "
+                "tried_channels='' WHERE id IN "
+                f"({','.join('?' * len(revived))})",
+                revived,
+            )
+        for r in picked:
+            if r["id"] in revived:
+                r["tried_channels"] = ""
+    return picked
+
+
+def mark_rescue_deferred(rescue_id: int, retry_after_iso: str) -> None:
+    """Уводит контакт в конец очереди до retry_after_iso.
+
+    Все каналы отката уже отработали и не сработали — контакт не теряется,
+    а просто ждёт следующего дня. tried_channels чистится, чтобы новая
+    попытка прошла по всем каналам заново.
+    """
+    if not rescue_id:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE rescue_queue SET status='deferred', retry_after=?, "
+            "tried_channels='', updated_at=? WHERE id = ?",
+            (retry_after_iso, now, rescue_id),
+        )
+
+
+def count_deferred_rescues() -> int:
+    with db_conn() as conn:
+        return (conn.execute(
+            "SELECT COUNT(*) FROM rescue_queue WHERE status = 'deferred'"
+        ).fetchone() or [0])[0]
 
 
 def count_pending_rescues() -> int:

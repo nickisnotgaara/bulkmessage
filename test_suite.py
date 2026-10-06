@@ -2435,8 +2435,10 @@ check("цель дня НЕ прерывает фазы (вызова state.targ
       "state.target_reached(" not in _src_run
       and "state.target_reached(" not in _src_phases
       and "state.target_reached(" not in _src_phase_fn)
-check("фаза TG берёт только провалы WABA",
-      'original_channel="waba"' in _src_phases)
+check("фаза отката берёт ЛЮБЫЕ неподтверждённые, а не только провалы WABA",
+      'original_channel="waba"' not in _src_phases)
+check("фаза отката не берёт уже опробованный канал (exclude_tried)",
+      "exclude_tried=phase_ch" in _src_phases)
 check("после TG rescue получает терминальный статус",
       "mark_rescue_success" in _src_phase_fn
       and "mark_rescue_attempt" in _src_phase_fn)
@@ -3213,6 +3215,96 @@ finally:
             os.unlink(_f)
         except OSError:
             pass
+
+# W6. ЦЕПОЧКА ПО ЦЕЛИ: провал в Telegram обязан дойти до MAX, а контакт,
+# исчерпавший ВСЕ каналы, — уйти в конец очереди, а не зависнуть.
+#
+# Оба бага найдены по живому прогону 2026-10-06:
+#  1) фаза отката читала ТОЛЬКО провалы WABA (original_channel="waba"),
+#     поэтому провал Telegram в MAX не доходил — цепочка обрывалась;
+#  2) запись, провалившаяся везде, навсегда оставалась status='pending':
+#     занимала начало очереди и не получала ни одной новой попытки.
+_d_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_d_db.close()
+try:
+    with patch.object(config, "DB_PATH", _d_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            c = conn.cursor()
+            c.execute("""INSERT INTO rescue_queue
+                (phone, name, category, original_channel, reason, status,
+                 created_at, updated_at, tried_channels)
+                VALUES ('+79000000001','TG','Покупатели','telegram',
+                        'no_delivery_confirmation','pending',
+                        datetime('now'),datetime('now'),'telegram')""")
+
+        _tg_fail = db.pending_rescues(limit=10, cooldown_seconds=0,
+                                      exclude_tried="max")
+        check("провал в Telegram виден фазе MAX (не только провалы WABA)",
+              any(r["phone"] == "+79000000001" for r in _tg_fail),
+              f"взято {[r['phone'] for r in _tg_fail]}")
+        check("при этом MAX не берёт то, что уже пробовал",
+              all("max" not in (r.get("tried_channels") or "")
+                  for r in _tg_fail))
+
+        # Исчерпали все каналы → уводим в конец очереди
+        _rid = _tg_fail[0]["id"]
+        db.mark_rescue_tried(_rid, "max")
+        db.mark_rescue_deferred(_rid, "2999-01-01T00:00:00+00:00")
+        _after = db.pending_rescues(limit=10, cooldown_seconds=0)
+        check("отложенный контакт НЕ выдаётся до retry_after",
+              all(r["phone"] != "+79000000001" for r in _after),
+              f"выдано {[r['phone'] for r in _after]}")
+
+        # Свежий pending должен идти ПЕРЕД просроченным deferred — «в последние»
+        with db.db_conn() as conn:
+            conn.execute("""INSERT INTO rescue_queue
+                (phone, name, category, original_channel, reason, status,
+                 created_at, updated_at, tried_channels, retry_after)
+                VALUES ('+79000000002','FRESH','Покупатели','waba',
+                        'no_delivery_confirmation','deferred',
+                        datetime('now'),datetime('now'),'',
+                        '2000-01-01T00:00:00+00:00')""")
+        _order = db.pending_rescues(limit=10, cooldown_seconds=0,
+                                    exclude_tried="telegram")
+        check("просроченный deferred возвращается в работу",
+              any(r["phone"] == "+79000000002" for r in _order),
+              f"выдано {[r['phone'] for r in _order]}")
+
+        # Теперь оба в работе: pending обязан быть раньше deferred
+        with db.db_conn() as conn:
+            conn.execute("UPDATE rescue_queue SET status='pending', "
+                         "retry_after=NULL WHERE phone = '+79000000002'")
+            conn.execute("INSERT INTO rescue_queue "
+                         "(phone,name,category,original_channel,reason,status,"
+                         " created_at,updated_at,tried_channels,retry_after) "
+                         "VALUES ('+79000000003','OLD','Покупатели','waba',"
+                         "'no_delivery_confirmation','deferred',"
+                         "datetime('now'),datetime('now'),'telegram',"
+                         "'2000-01-01T00:00:00+00:00')")
+        _order2 = db.pending_rescues(limit=10, cooldown_seconds=0,
+                                     exclude_tried="max")
+        _pending = [r["phone"] for r in _order2 if r["status"] == "pending"]
+        _deferred = [r["phone"] for r in _order2 if r["status"] == "deferred"]
+        check("pending идут раньше просроченных deferred",
+              bool(_pending) and bool(_deferred)
+              and _order2.index(_order2[0]) < _order2.index(
+                  next(r for r in _order2 if r["status"] == "deferred")),
+              f"порядок {[r['phone'] for r in _order2]}")
+        check("tried_channels отложенного сброшен для новой попытки",
+              all(r.get("tried_channels") in ("", None)
+                  for r in _order2 if r["status"] == "deferred"))
+        check("deferred считается отдельным счётчиком",
+              db.count_deferred_rescues() >= 1)
+        check("в вызове pending_rescues фазы отката нет фильтра по каналу",
+              "original_channel=" not in inspect.getsource(
+                  sender._run_all_phases).split("def _run_phase")[0]
+              .split("pending = db.pending_rescues")[-1][:300])
+finally:
+    try:
+        os.unlink(_d_db.name)
+    except OSError:
+        pass
 
 # W2. Запуск, который стартует СРАЗУ с отката (BULK_PHASE_ORDER=telegram,max).
 # Живой случай 2026-10-06: Telegram пропущен как «пусто», потому что сторож
