@@ -529,15 +529,23 @@ def _drain_rescue_queue(current_state: dict, max_items: int = 2) -> int:
             log.warning(f"rescue send failed for {phone}: {e}")
             ok = False
 
+        # КОНКРЕТНЫЙ канал, а не 'telegram_or_max': _run_one_contact
+        # возвращает только bool, поэтому берём last_success_channel,
+        # который выставил сам успешный канал. Иначе в отчёте нельзя
+        # отличить откат в Telegram от отката в MAX, а это ровно то, что
+        # нужно знать при разборе «кто пережил WABA, а кто нет».
+        # Читаем ДО восстановления saved_channel — иначе значение уже затёрто.
+        _succ = current_state.get("last_success_channel") or ""
+
         # Восстанавливаем channel ДО следующего rescue (чтобы не накапливалось)
         current_state["last_success_channel"] = saved_channel
 
         if ok:
             db.mark_rescue_success(
-                r["id"], channel="telegram_or_max",
+                r["id"], channel=_succ or "telegram_or_max",
                 message_id=f"rescued_from_{r['id']}",
             )
-            log.info(f"  ✅ Rescued {phone} via Personal")
+            log.info(f"  ✅ Rescued {phone} via {_succ or 'personal'}")
             processed += 1
         else:
             db.mark_rescue_attempt(r["id"], error="all_personal_failed")
