@@ -60,14 +60,37 @@ __all__ = [
 ]
 
 
-def _apply_run_hours(argv: list) -> None:
-    """Обрабатывает --run-hours N, ставя BULK_RUN_HOURS в окружение.
+def _apply_int_flag(argv: list, flag: str, env_key: str, title: str,
+                    minimum: int = 1) -> None:
+    """Разбирает флаг вида --flag N и кладёт число в os.environ[env_key].
 
-    Флаг есть для удобства («легко запускать»), но config читает BULK_RUN_HOURS
-    при импорте, а sender импортируется в самом верху файла. Поэтому ставим
-    переменную окружения ДО вызова sender: загрузчик .env не перезаписывает
-    непустое значение из os.environ, так флаг работает без правки .env.local.
+    Флаги нужны для удобства запуска, но config читает переменные при
+    импорте, а sender импортируется в самом верху файла. Поэтому ставим их
+    в окружение ДО вызова sender: загрузчик .env не перезаписывает непустые
+    значения из os.environ, так флаги работают без правки .env.local.
     """
+    if flag not in argv:
+        return
+    i = argv.index(flag)
+    if i + 1 >= len(argv):
+        print(f"❌ {flag} требует число: {flag} 20", file=sys.stderr)
+        raise SystemExit(2)
+    raw = str(argv[i + 1]).strip()
+    try:
+        val = int(raw)
+    except ValueError:
+        print(f"❌ {flag}: '{raw}' не целое число", file=sys.stderr)
+        raise SystemExit(2)
+    if val < minimum:
+        print(f"❌ {flag} должен быть >= {minimum} "
+              f"(0 = без ограничения)", file=sys.stderr)
+        raise SystemExit(2)
+    os.environ[env_key] = raw
+    print(f"🔬 {title}: {val}", file=sys.stderr)
+
+
+def _apply_run_hours(argv: list) -> None:
+    """Обрабатывает --run-hours N, ставя BULK_RUN_HOURS в окружение."""
     if "--run-hours" not in argv:
         return
     i = argv.index("--run-hours")
@@ -96,6 +119,14 @@ USAGE = """bulkmessage — массовая рассылка через Wazzup24
   py main.py sender --run-hours 10 один процесс, который сам крутит фазы
                                    10 часов от старта (планировщик не нужен)
 
+Тестовый прогон (сначала 10-20, потом полный объём):
+  py main.py sender --waba-limit 20              только 20 сообщений WABA
+  py main.py sender --run-hours 2 --waba-limit 20   то же, но на 2 часа
+
+Дневные лимиты (жёсткие, env их не превысит):
+  WABA 250/день · Telegram 50/день · MAX 15/день
+  Откаты: WABA провалился → TG (50) → MAX (15)
+
 Проверки:
   py main.py preflight             лимиты, каналы, токены, вебхук
   py main.py report                воронка за сегодня
@@ -114,6 +145,8 @@ USAGE = """bulkmessage — массовая рассылка через Wazzup24
 def main() -> None:
     """Default entry point: runs the sender (back-compat with old single-process mode)."""
     _apply_run_hours(sys.argv[1:])
+    _apply_int_flag(sys.argv[1:], "--waba-limit", "BULK_WABA_RUN_LIMIT",
+                    "Тестовый прогон: не больше N сообщений WABA за запуск")
     run_sender()
 
 
@@ -125,6 +158,8 @@ if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "sender"
     if mode == "sender":
         _apply_run_hours(sys.argv[2:])
+        _apply_int_flag(sys.argv[2:], "--waba-limit", "BULK_WABA_RUN_LIMIT",
+                        "Тестовый прогон: не больше N сообщений WABA за запуск")
         run_sender()
     elif mode == "tracker":
         from bulkmessage.tracker import run as run_tracker

@@ -497,6 +497,16 @@ TARGET_SUCCESS_PER_DAY = int(os.environ.get("BULK_TARGET_SUCCESS_PER_DAY", "60")
 # Safety cap: максимум попыток в день (чтоб не долбить 24/7 если данные плохие).
 MAX_ATTEMPTS_PER_DAY = int(os.environ.get("BULK_MAX_ATTEMPTS_PER_DAY", "200"))
 
+# Лимит отправок WABA в ОДНОМ запуске (0 = не ограничивать, берётся
+# дневной лимит BULK_LIMIT_WABA).
+#
+# Нужен для первых боевых прогонов: вместо 250 сообщений сразу отдать
+# 10–20, посмотреть в отчёте реальную конверсию доставки и жалоб, и только
+# потом отпускать полный объём. Ставится флагом:
+#     py main.py sender --run-hours 2 --waba-limit 20
+# или постоянно в .env.local: BULK_WABA_RUN_LIMIT=20
+WABA_RUN_LIMIT = int(os.environ.get("BULK_WABA_RUN_LIMIT", "0") or 0)
+
 # --- Фазовая рассылка (WABA-проход → TG → MAX) ---
 # Раньше каскад был по-контактным: waba → tg → max внутри _run_one_contact с
 # break на первом HTTP 2xx. Из-за этого WABA отдавал 2xx на всё, sender считал

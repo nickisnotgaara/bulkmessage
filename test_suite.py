@@ -2700,6 +2700,82 @@ check("main.py отвергает --run-hours <= 0",
       "hours <= 0" in _main_src)
 check("main.py печатает справку по --help", "USAGE" in _main_src)
 
+# ---------------------------------------------------------------------------
+# T. ЛИМИТ ЗАПУСКА WABA (--waba-limit) для первых боевых прогонов
+# ---------------------------------------------------------------------------
+section("T. ЛИМИТ ЗАПУСКА WABA (--waba-limit)")
+check("config.WABA_RUN_LIMIT существует", hasattr(config, "WABA_RUN_LIMIT"))
+check("WABA_RUN_LIMIT по умолчанию 0 (без ограничения)",
+      int(getattr(config, "WABA_RUN_LIMIT", 0)) == 0,
+      f"got {getattr(config, 'WABA_RUN_LIMIT', None)}")
+check("main.py понимает --waba-limit", "--waba-limit" in _main_src)
+check("main.py ставит BULK_WABA_RUN_LIMIT через общий разбор флагов",
+      '"BULK_WABA_RUN_LIMIT"' in _main_src
+      and 'os.environ[env_key]' in _main_src)
+check("main.py отвергает --waba-limit < 1 (через _apply_int_flag)",
+      "_apply_int_flag" in _main_src and 'minimum: int = 1' in _main_src)
+
+_wl_src = inspect.getsource(sender._run_all_phases)
+check("фаза WABA применяет WABA_RUN_LIMIT", "WABA_RUN_LIMIT" in _wl_src)
+check("лимит запуска НЕ превышает дневной кап канала",
+      "min(_run_cap, _cap_waba)" in _wl_src)
+check("лимит запуска режет список ДО отправки (срез targets)",
+      "targets = targets[:_run_cap]" in _wl_src)
+# Важно: лимит запуска режет ТОЛЬКО WABA. Откаты TG/MAX он не трогает —
+# иначе тестовый прогон на 20 человек не дотянул бы fallback.
+# Проверяем по коду ветки отката: там _run_cap использоваться не должен.
+_wl_waba_branch = _wl_src.split("else:")[0]
+_wl_fallback_branch = _wl_src.split("else:")[-1]
+check("лимит запуска не применяется к откатным каналам",
+      "_run_cap" not in _wl_fallback_branch,
+      f"в ветке отката: {'_run_cap' if '_run_cap' in _wl_fallback_branch else 'нет'}")
+
+# Функциональная проверка на изолированной БД: лимит режет фазу,
+# а при значении больше дневного капа всё равно упирается в 250.
+_save_wl = getattr(config, "WABA_RUN_LIMIT", 0)
+_wl_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_wl_db.close()
+try:
+    with patch.object(config, "DB_PATH", _wl_db.name), \
+         patch.object(config, "STATE_PATH", _wl_db.name + ".state.json"), \
+         patch.object(config, "BULK_BYPASS_SAFE_HOURS", True):
+        db.init_db()
+        _wl_phones = [f"7999900{i:04d}" for i in range(60)]
+        with db.db_conn() as _c:
+            for _p in _wl_phones:
+                db.upsert_contact(_c, _p, "WL", "Покупатели")
+            _c.commit()
+        _wl_sent: list = []
+
+        def _wl_fake(contact, channels, backoffs, psk, cur, cascade_override=None):
+            _wl_sent.append(contact["phone"])
+            return True
+
+        _wl_sel = [{"phone": p, "name": "WL", "category": "Покупатели"}
+                   for p in _wl_phones]
+        for _lim, _exp in ((10, 10), (20, 20), (250, 60), (999, 60)):
+            _wl_sent.clear()
+            config.WABA_RUN_LIMIT = _lim
+            with patch.object(sender, "_run_one_contact", _wl_fake), \
+                 patch.object(sender, "_sleep_phase", lambda s, st: None), \
+                 patch.object(sender, "_wait_until_active_window",
+                              lambda log: False), \
+                 patch.object(sender, "_phase_fits", lambda ch, n: True), \
+                 patch.object(state, "max_attempts_reached", lambda st: False):
+                sender._run_all_phases(
+                    _wl_sel, {"v": False}, {}, {}, cycle_no=1,
+                )
+            check(f"--waba-limit {_lim} -> отправлено {_exp}",
+                  len(_wl_sent) == _exp, f"got {len(_wl_sent)}")
+            check(f"--waba-limit {_lim}: без дублей",
+                  len(_wl_sent) == len(set(_wl_sent)))
+finally:
+    config.WABA_RUN_LIMIT = _save_wl
+    try:
+        os.unlink(_wl_db.name)
+    except OSError:
+        pass
+
 
 print()
 print("=" * 70)

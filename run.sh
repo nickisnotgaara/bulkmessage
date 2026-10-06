@@ -18,6 +18,10 @@
 #   bash run.sh url             # текущий публичный URL вебхука
 #   bash run.sh doctor          # preflight-проверки
 #
+# Тестовый прогон (СНАЧАЛА делай так, потом полный объём):
+#   bash run.sh 2  live 20      # 20 сообщений WABA, 2 часа
+#   bash run.sh 10 live         # полный объём: до 250 WABA + откаты
+#
 # Логи:
 #   /tmp/webhook.log            вебхук, туннель, подписка Wazzup
 #   /tmp/bulk.log               рассылка
@@ -35,6 +39,15 @@ cd "$APP_DIR" || { echo "FAIL: нет каталога $APP_DIR"; exit 1; }
 MODE="${1:-run}"
 HOURS="${2:-10}"
 RUN_MODE="${3:-live}"
+# 4-й аргумент: ограничить число сообщений WABA в этом запуске.
+# Пусто или 0 = без ограничения (берётся дневной лимит 250).
+WABA_LIMIT="${4:-}"
+
+SENDER_ARGS=(--run-hours "$HOURS")
+if [ -n "$WABA_LIMIT" ] && [ "$WABA_LIMIT" != "0" ]; then
+  SENDER_ARGS+=(--waba-limit "$WABA_LIMIT")
+  echo "🔬 Тестовый прогон: максимум $WABA_LIMIT сообщений WABA за запуск"
+fi
 
 kill_screen() { screen -S "$1" -X quit 2>/dev/null; sleep 1; }
 
@@ -90,8 +103,10 @@ start_sender() {
   kill_screen bulk
   rm -f "$BULK_LOG"
   # --run-hours: один процесс на $HOURS часов. Планировщик не нужен.
+  # --waba-limit (если задан 4-м аргументом) режет только фазу WABA,
+  # откаты TG/MAX работают в любом случае.
   screen -dmS bulk -L -Logfile "$BULK_LOG" \
-    "$PY" main.py sender --run-hours "$HOURS"
+    "$PY" main.py sender "${SENDER_ARGS[@]}"
   echo "✅ рассылка запущена на ${HOURS}ч ($RUN_MODE), лог: $BULK_LOG"
 }
 
@@ -118,5 +133,9 @@ case "$MODE" in
   status) show_status ;;
   url)    grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$HOOK_LOG" 2>/dev/null | head -1 ;;
   doctor) "$PY" main.py preflight ;;
-  *) echo "usage: $0 [run [часы] [dry]] | stop | status | url | doctor"; exit 1 ;;
+  *) echo "usage: $0 [run [часы] [dry|live] [лимит_WABA]] | stop | status | url | doctor"
+     echo "примеры:"
+     echo "  bash run.sh 2 live 20     # ТЕСТ: 20 сообщений WABA на 2 часа"
+     echo "  bash run.sh 10 live       # полный объём: до 250 WABA + откаты TG 50 / MAX 15"
+     exit 1 ;;
 esac

@@ -1588,9 +1588,22 @@ def _run_all_phases(
             if not state.channel_has_quota_with_headroom(cur, "waba"):
                 log.info("🛑 WABA: квота исчерпана — фаза пропущена")
                 continue
-            targets = _collect_fresh_waba_targets(filtered, cur)[: int(
-                state.channel_effective_cap(cur, "waba")
-            )]
+            targets = _collect_fresh_waba_targets(filtered, cur)
+            # Дневной кап канала (250) — верхняя граница по лимитам Meta.
+            _cap_waba = int(state.channel_effective_cap(cur, "waba"))
+            # Лимит запуска (--waba-limit N): для первых боевых прогонов,
+            # когда вместо 250 сообщений сразу надо отдать 10–20.
+            _run_cap = int(getattr(config, "WABA_RUN_LIMIT", 0) or 0)
+            if _run_cap > 0:
+                _run_cap = min(_run_cap, _cap_waba)
+                if len(targets) > _run_cap:
+                    log.info(
+                        f"🔬 ТЕСТОВЫЙ РЕЖИМ: WABA ограничен { _run_cap } "
+                        f"сообщениями в этом запуске (BULK_WABA_RUN_LIMIT), "
+                        f"в базе доступно {len(targets)}"
+                    )
+                targets = targets[:_run_cap]
+            targets = targets[:_cap_waba]
             if not targets:
                 log.info("🛑 WABA: нет свежих контактов — фаза пропущена")
                 continue
