@@ -81,6 +81,25 @@ _AUTH_KEYWORDS = (
     "channel not found",
 )
 
+# Ошибки уровня ОДНОГО КОНТАКТА, не уровня канала. Проверяются раньше
+# _AUTH_KEYWORDS, иначе они классифицировались бы как AUTH и гасили канал.
+#
+# Реальный случай 2026-10-06, Telegram: «Пользователь сменил @никнейм или
+# удалил аккаунт». Код Wazzup/TG — CHAT_WRITE_FORBIDDEN, и подстрока
+# «forbidden» стоит в _AUTH_KEYWORDS. Итог был бы: один недовольный
+# получатель → halt Telegram на 24 часа → минус 50 откатов в день.
+_CONTACT_KILL_KEYWORDS = (
+    "chat_write_forbidden",
+    "user_is_blocked",
+    "user_not_found",
+    "chat_id_invalid",
+    "peer_id_invalid",
+    "сменил @никнейм",
+    "удалил аккаунт",
+    "заблокировал бота",
+    "blocked by the user",
+)
+
 _RATE_KEYWORDS = (
     "rate limit",
     "too many",
@@ -126,10 +145,26 @@ def is_configured() -> bool:
 
 
 def classify_error(detail: str, http_status: Optional[int] = None) -> ErrorKind:
-    """Классификация ошибок Wazzup по тексту ответа и HTTP-коду."""
+    """Классификация ошибок Wazzup по тексту ответа и HTTP-коду.
+
+    ПОРЯДОК ПРОВЕРОК ВАЖЕН. Ошибки одного КОНТАКТА проверяются раньше
+    общих слов про аутентификацию, потому что иначе один заблокировавший
+    пользователь роняет весь канал:
+
+      * Telegram отдаёт `CHAT_WRITE_FORBIDDEN` («пользователь заблокировал
+        бота / сменил @никнейм / удалил аккаунт»). Слово «forbidden» есть
+        в _AUTH_KEYWORDS, поэтому раньше такой отказ классифицировался как
+        AUTH и гасил канал на 24 часа — а это отказ ОДНОГО контакта;
+      * `USER_IS_BLOCKED`, `USER_NOT_FOUND` — то же самое.
+
+    Реальный 401/403 от самого Wazzup по-прежнему ловится первым: это
+    проблема аккаунта/ключа, и там гасить канал правильно.
+    """
     s = (detail or "").lower()
     if http_status in (401, 403):
         return ErrorKind.AUTH
+    if any(k in s for k in _CONTACT_KILL_KEYWORDS):
+        return ErrorKind.PERMANENT
     if any(k in s for k in _AUTH_KEYWORDS):
         return ErrorKind.AUTH
     if any(k in s for k in _PERMANENT_KEYWORDS):

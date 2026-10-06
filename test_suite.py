@@ -3124,6 +3124,45 @@ check("лимиты печатаются только для активных к
 check("неиспользуемые каналы печатаются отдельной строкой",
       "Не используются" in _w3_src)
 
+# W4. TELEGRAM: «пользователь сменил @никнейм или удалил аккаунт».
+#
+# Два бага, оба найдены на живом прогоне 2026-10-06:
+#  1) Wazzup/TG отдаёт CHAT_WRITE_FORBIDDEN. Подстрока «forbidden» стоит в
+#     _AUTH_KEYWORDS, поэтому отказ ОДНОГО контакта классифицировался как AUTH
+#     и гасил весь канал Telegram на 24 часа (минус все 50 откатов в день).
+#  2) Ветка PERMANENT у telegram/max только заполняла permanent_skipped —
+#     память сессии. На диск не писалось, и следующий запуск снова долбился
+#     в тот же удалённый аккаунт.
+check("CHAT_WRITE_FORBIDDEN = PERMANENT, а не AUTH",
+      classify_error("CHAT_WRITE_FORBIDDEN: user changed username")
+      == ErrorKind.PERMANENT,
+      f"got {classify_error('CHAT_WRITE_FORBIDDEN: user changed username')}")
+check("USER_IS_BLOCKED = PERMANENT",
+      classify_error("USER_IS_BLOCKED") == ErrorKind.PERMANENT,
+      f"got {classify_error('USER_IS_BLOCKED')}")
+check("русский текст Wazzup про удалённый аккаунт = PERMANENT",
+      classify_error("Пользователь сменил @никнейм или удалил аккаунт")
+      == ErrorKind.PERMANENT,
+      f"got {classify_error('Пользователь сменил @никнейм или удалил аккаунт')}")
+check("настоящий 401 от Wazzap всё ещё AUTH (канал гасим)",
+      classify_error("", 401) == ErrorKind.AUTH,
+      f"got {classify_error('', 401)}")
+check("HTTP 403 от самого Wazzap — AUTH, канал гасим",
+      classify_error("HTTP 403", 403) == ErrorKind.AUTH,
+      f"got {classify_error('HTTP 403', 403)}")
+check("CHAT_WRITE_FORBIDDEN при ответе 200 не роняет канал",
+      classify_error("CHAT_WRITE_FORBIDDEN", 200) == ErrorKind.PERMANENT,
+      f"got {classify_error('CHAT_WRITE_FORBIDDEN', 200)}")
+
+_r_perm_src = inspect.getsource(sender._run_one_contact)
+_r_perm_at = _r_perm_src.rindex("ErrorKind.PERMANENT")
+_r_perm_branch = _r_perm_src[_r_perm_at:_r_perm_at + 900]
+check("PERMANENT у мессенджеров пишется в bad_phones НА ДИСК",
+      "bad_phones.mark_bad" in _r_perm_branch,
+      "в ветке PERMANENT нет записи на диск — метка умрёт вместе с процессом")
+check("PERMANENT у мессенджеров ставит mark_unreachable",
+      "state.mark_unreachable" in _r_perm_branch)
+
 # W2. Запуск, который стартует СРАЗУ с отката (BULK_PHASE_ORDER=telegram,max).
 # Живой случай 2026-10-06: Telegram пропущен как «пусто», потому что сторож
 # отрабатывал только ПОСЛЕ первой фазы, и откат ушёл в MAX — рискованный

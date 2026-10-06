@@ -1106,10 +1106,17 @@ def _run_one_contact(
 
         if kind == ErrorKind.PERMANENT:
             permanent_skipped.setdefault(phone, set()).add(channel)
+            # Сохраняем НА ДИСК. Раньше отказ Telegram/MAX жил только в
+            # permanent_skipped — памяти сессии, — и следующий запуск снова
+            # стучался в тот же мёртвый аккаунт: «сменил @никнейм / удалил
+            # аккаунт», «user not found». У WABA и SMS здесь стоял
+            # mark_unreachable + bad_phones, у мессенджеров — нет.
+            state.mark_unreachable(current_state, phone, channel)
+            bad_phones.mark_bad(phone, channel, reason=f"permanent: {detail[:120]}")
             _persist_failure(phone, name, category, channel, text, detail, "permanent")
             log.info(
                 f"      🚫 PERMANENT — {channel} помечен как невалидный для этого "
-                f"контакта, пробуем другие каналы"
+                f"контакта НАВСЕГДА (bad_phones), пробуем другие каналы"
             )
             backoffs[channel] = 0
             continue
