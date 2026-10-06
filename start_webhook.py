@@ -529,13 +529,21 @@ def main() -> int:
             print(f"❌ Подписка не удалась: {detail}")
             print(f"   Повторить вручную: py setup_webhook.py --url {webhook_url}")
 
-    # 5) ЗАПИСЬ В .env.local, чтобы sender знал про вебхук
-    if not args.keep_url:
-        old_url = write_env_value("WAZZUP_WEBHOOK_URL", webhook_url)
-        old_pub = write_env_value("BULK_PUBLIC_WEBHOOK_URL", webhook_url)
-        write_env_value("BULK_PUBLIC_WEBHOOK_PATH", path)
-        print(f"✅ WAZZUP_WEBHOOK_URL записан в .env.local")
+    # 5) ЗАПИСЬ В .env.local, чтобы sender/preflight знали про вебхук.
+    #    URL пишем ВСЕГДА (иначе preflight ругается «webhook not set» и report
+    #    предупреждает, что доставку подтвердить нечем). А --keep-url влияет
+    #    только на откат: по умолчанию quick tunnel умирает вместе с процессом,
+    #    и на выходе мы возвращаем .env.local как было.
+    old_url = write_env_value("WAZZUP_WEBHOOK_URL", webhook_url)
+    old_pub = write_env_value("BULK_PUBLIC_WEBHOOK_URL", webhook_url)
+    write_env_value("BULK_PUBLIC_WEBHOOK_PATH", path)
+    # Маркер с PID — на случай, если процесс убьют без finally.
+    record_running_url(webhook_url)
+    print(f"✅ WAZZUP_WEBHOOK_URL записан в .env.local")
 
+    if args.keep_url:
+        print("   --keep-url: URL останется в .env.local после остановки.")
+    else:
         def _restore() -> None:
             restore_env_value("WAZZUP_WEBHOOK_URL", old_url)
             restore_env_value("BULK_PUBLIC_WEBHOOK_URL", old_pub)
@@ -544,8 +552,6 @@ def main() -> int:
                   "(quick tunnel умирает вместе с процессом).")
 
         atexit.register(_restore)
-        # Маркер с PID — на случай, если процесс убьют без finally.
-        record_running_url(webhook_url)
 
     print()
     print("=" * 66)

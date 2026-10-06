@@ -63,10 +63,17 @@ def run_preflight() -> int:
             )
         else:
             headroom_cap = state.channel_effective_cap(state.load_state(), ch)
+            # Потолок личных каналов ПЕР-КАНАЛЬНЫЙ (TG 50, MAX 15). Раньше здесь
+            # стоял общий MAX_PERSONAL_DAILY_HARD_CAP=30, и preflight ставил ❌
+            # на telegram=50 — красный статус, хотя лимит выставлен корректно.
+            personal_cap = getattr(
+                config, "PERSONAL_CHANNEL_HARD_CAPS", {}
+            ).get(ch, config.MAX_PERSONAL_DAILY_HARD_CAP)
             all_ok &= _check(
                 f"  {ch}",
-                cap <= config.MAX_PERSONAL_DAILY_HARD_CAP if ch in ("telegram", "max") else True,
-                f"hard_cap={cap}, effective_with_headroom={headroom_cap}",
+                cap <= personal_cap if ch in ("telegram", "max") else True,
+                f"hard_cap={cap} (потолок {personal_cap}), "
+                f"effective_with_headroom={headroom_cap}",
             )
 
     # 3. Wazzup channels per active channel (transport = Wazzup для ВСЕХ каналов)
