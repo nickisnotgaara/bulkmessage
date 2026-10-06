@@ -560,6 +560,17 @@ PHASE_GRACE_MINUTES = int(os.environ.get("BULK_PHASE_GRACE_MINUTES", "5"))
 # статусы по предыдущему каналу. По той же причине сопровождается сторожом.
 RESCUE_SETTLE_MINUTES = int(os.environ.get("BULK_RESCUE_SETTLE_MINUTES", "5"))
 
+# Сторож здоровья канала перед фазой отката. Живой случай 2026-10-06:
+# Telegram принимал отправки (HTTP 200) и НИ ОДНОЙ не доставлял — канал не
+# авторизован в Wazzup. Фаза продолжала жечь личный лимит, пока её не
+# остановили вручную. Теперь при N отправках без единого подтверждения
+# фаза пропускается, а очередь остаётся нетронутой для следующего канала.
+CHANNEL_HEALTH_GUARD = os.environ.get("BULK_CHANNEL_HEALTH_GUARD", "1") != "0"
+CHANNEL_HEALTH_MIN_SAMPLE = int(
+    os.environ.get("BULK_CHANNEL_HEALTH_MIN_SAMPLE", "5"))
+CHANNEL_HEALTH_WINDOW_HOURS = int(
+    os.environ.get("BULK_CHANNEL_HEALTH_WINDOW_HOURS", "6"))
+
 # Сколько дней контакт, которому WABA НЕ доставил, исключается из WABA-пула.
 # НЕОБХОДИМО отдельный маркер: reachability_cache живёт всего 24 часа
 # (REACHABILITY_CACHE_TTL_HOURS), и без этого контакт на следующий день снова

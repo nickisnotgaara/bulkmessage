@@ -1427,6 +1427,56 @@ def _sleep_phase(seconds: float, stop_requested: dict) -> None:
         slept += 30
 
 
+def channel_delivery_health(channel: str, min_sample: int = 5,
+                             window_hours: int = 6) -> dict:
+    """Здоровье канала по недавней истории: доставилось хоть что-нибудь или нет.
+
+    Нужно, потому что Wazzup принимает отправку с HTTP 200 и молчит, если
+    канал не авторизован. Живой случай 2026-10-06: 8 отправок в Telegram,
+    0 подтверждений доставки, все с красной иконкой в интерфейсе — и фаза
+    продолжала жечь личный лимит, пока её не остановили вручную.
+
+    Возвращает {"ok": bool, "sent": int, "delivered": int, "reason": str}.
+    При недостаточной выборке ok=True: это «не знаем», а не «сломан».
+    """
+    empty = {"ok": True, "sent": 0, "delivered": 0, "reason": "нет данных"}
+    try:
+        import sqlite3 as _sq
+        from . import config as _cfg
+        dbp = Path(getattr(_cfg, "DB_PATH", "data/crm.db"))
+        if not dbp.exists():
+            return empty
+        con = _sq.connect(f"file:{dbp}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT COUNT(*) AS total, "
+                "       SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END) AS dlv "
+                "FROM messages WHERE channel = ? "
+                "  AND created_at >= datetime('now', ?)",
+                (channel, f"-{int(window_hours)} hours"),
+            ).fetchone()
+        finally:
+            con.close()
+        sent = int(row[0] or 0)
+        delivered = int(row[1] or 0)
+    except Exception as e:
+        log.debug(f"channel_delivery_health({channel}): не посчитали: {e}")
+        return empty
+
+    min_sample = int(getattr(config, "CHANNEL_HEALTH_MIN_SAMPLE", min_sample))
+
+    if sent < min_sample:
+        return {"ok": True, "sent": sent, "delivered": delivered,
+                "reason": f"мало данных для вывода ({sent} < {min_sample})"}
+    if delivered == 0:
+        return {"ok": False, "sent": sent, "delivered": 0,
+                "reason": (f"{sent} отправок за {window_hours}ч и НИ ОДНОГО "
+                           f"подтверждения доставки — канал не авторизован "
+                           f"или сломан")}
+    return {"ok": True, "sent": sent, "delivered": delivered,
+            "reason": f"доставлено {delivered} из {sent}"}
+
+
 def _run_phase(
     phase_ch: str,
     items: list[dict],
@@ -1689,6 +1739,22 @@ def _run_all_phases(
             )
         else:
             # Фаза отката: берём провалы WABA из rescue_queue, FIFO.
+            # ПЕРЕД чтением очереди проверяем здоровье канала: сегодня
+            # Telegram принимал отправки (HTTP 200) и не доставлял ни одной,
+            # а фаза продолжала жечь личный лимит, пока не остановили руками.
+            if getattr(config, "CHANNEL_HEALTH_GUARD", True):
+                _h = channel_delivery_health(phase_ch)
+                if not _h["ok"]:
+                    log.error(
+                        f"🩺 Канал {phase_ch.upper()} НЕ РАБОТАЕТ: {_h['reason']}. "
+                        f"Фаза пропущена, очередь не тронута — откат уйдёт "
+                        f"следующим каналом. Проверь авторизацию канала в Wazzup."
+                    )
+                    continue
+                if _h["sent"] >= int(
+                        getattr(config, "CHANNEL_HEALTH_MIN_SAMPLE", 5)):
+                    log.info(f"🩺 {phase_ch.upper()}: {_h['reason']}")
+
             limit = int(state.channel_effective_cap(state.load_state(), phase_ch))
             # exclude_tried: контакт, которому фаза TG уже не смогла
             # доставить, НЕ должен снова попасть в фазу MAX — иначе

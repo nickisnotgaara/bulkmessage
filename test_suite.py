@@ -3163,6 +3163,57 @@ check("PERMANENT у мессенджеров пишется в bad_phones НА �
 check("PERMANENT у мессенджеров ставит mark_unreachable",
       "state.mark_unreachable" in _r_perm_branch)
 
+# W5. СТОРОЖ ЗДОРОВЬЯ КАНАЛА. Живой случай 2026-10-06: Telegram принимал
+# отправки (HTTP 200) и не доставлял НИ ОДНОЙ — канал не авторизован в
+# Wazzup. Фаза жгла личный лимит, пока её не остановили руками. Теперь
+# фаза отката должна пропустить канал, который не доставляет ничего.
+_h_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_h_db.close()
+try:
+    with patch.object(config, "DB_PATH", _h_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            for i in range(8):
+                cid = db.upsert_contact(
+                    conn, phone=f"+7999555{i:04d}", name="H",
+                    category="Покупатели")
+                db.insert_message(conn, contact_id=cid, channel="telegram",
+                                  message_text="t", message_id=f"h{i}",
+                                  status="sent")  # delivered_at НЕ задан
+        _h_bad = sender.channel_delivery_health("telegram", min_sample=5)
+        check("канал без единого подтверждения помечается как нерабочий",
+              _h_bad["ok"] is False, f"ok={_h_bad['ok']} reason={_h_bad['reason']}")
+        check("сторож видит все 8 отправок",
+              _h_bad["sent"] == 8, f"sent={_h_bad['sent']}")
+
+        # Теперь подтверждаем половину — канал снова считается живым
+        with db.db_conn() as conn:
+            conn.execute("UPDATE messages SET delivered_at = datetime('now') "
+                         "WHERE id % 2 = 0 AND channel='telegram'")
+        _h_ok = sender.channel_delivery_health("telegram", min_sample=5)
+        check("канал с подтверждениями считается рабочим",
+              _h_ok["ok"] is True, f"ok={_h_ok['ok']} reason={_h_ok['reason']}")
+
+        # Мало данных = «не знаем», а не «сломан»
+        _h_none = sender.channel_delivery_health("max", min_sample=5)
+        check("канал без истории не считается сломанным",
+              _h_none["ok"] is True, f"ok={_h_none['ok']}")
+
+    # Фаза отката обязана вызывать сторож ДО первой отправки
+    _h_src = inspect.getsource(sender._run_all_phases)
+    check("сторож здоровья вызывается в фазе отката",
+          "channel_delivery_health" in _h_src)
+    check("при нерабочем канале фаза пропускается (continue)",
+          "Фаза пропущена, очередь не тронута" in _h_src)
+    check("сторож здоровья можно отключить флагом",
+          hasattr(config, "CHANNEL_HEALTH_GUARD"))
+finally:
+    for _f in (_h_db.name,):
+        try:
+            os.unlink(_f)
+        except OSError:
+            pass
+
 # W2. Запуск, который стартует СРАЗУ с отката (BULK_PHASE_ORDER=telegram,max).
 # Живой случай 2026-10-06: Telegram пропущен как «пусто», потому что сторож
 # отрабатывал только ПОСЛЕ первой фазы, и откат ушёл в MAX — рискованный
