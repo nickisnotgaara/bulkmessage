@@ -61,13 +61,18 @@ __all__ = [
 
 
 def _apply_int_flag(argv: list, flag: str, env_key: str, title: str,
-                    minimum: int = 1) -> None:
-    """Разбирает флаг вида --flag N и кладёт число в os.environ[env_key].
+                    minimum: int = 1, config_attr: str | None = None) -> None:
+    """Разбирает флаг вида --flag N и кладёт число в os.environ[env_key]
+    И в атрибут модуля config.
 
-    Флаги нужны для удобства запуска, но config читает переменные при
-    импорте, а sender импортируется в самом верху файла. Поэтому ставим их
-    в окружение ДО вызова sender: загрузчик .env не перезаписывает непустые
-    значения из os.environ, так флаги работают без правки .env.local.
+    Флаги нужны для удобства запуска, но config читает переменные ОДИН РАЗ
+    при импорте, а sender импортируется в самом верху файла. Поэтому одного
+    os.environ мало: config.WABA_RUN_LIMIT уже вычислен и остался 0.
+    Именно так `--waba-limit 15` молча отправлял 250: флаг печатался в лог,
+    окружение менялось, а sender читал нулевое значение из config.
+
+    Пишем в оба места: os.environ — чтобы ничего не перезаписал загрузчик
+    .env, config_attr — чтобы sender увидел значение в том же процессе.
     """
     if flag not in argv:
         return
@@ -86,6 +91,8 @@ def _apply_int_flag(argv: list, flag: str, env_key: str, title: str,
               f"(0 = без ограничения)", file=sys.stderr)
         raise SystemExit(2)
     os.environ[env_key] = raw
+    if config_attr is not None:
+        setattr(config, config_attr, val)
     print(f"🔬 {title}: {val}", file=sys.stderr)
 
 
@@ -108,6 +115,10 @@ def _apply_run_hours(argv: list) -> None:
               "(без флага — один проход, как раньше)", file=sys.stderr)
         raise SystemExit(2)
     os.environ["BULK_RUN_HOURS"] = raw
+    # config прочитал переменные при импорте, поэтому одного окружения мало:
+    # без этой строки --run-hours печатался в лог, но sender видел RUN_HOURS=0
+    # и делал ровно один круг фаз вместо длинного прогона.
+    config.RUN_HOURS = hours
     print(f"⏱️  Длинный прогон: {hours:g} часов от старта "
           f"(BULK_RUN_HOURS={raw})", file=sys.stderr)
 
@@ -146,7 +157,8 @@ def main() -> None:
     """Default entry point: runs the sender (back-compat with old single-process mode)."""
     _apply_run_hours(sys.argv[1:])
     _apply_int_flag(sys.argv[1:], "--waba-limit", "BULK_WABA_RUN_LIMIT",
-                    "Тестовый прогон: не больше N сообщений WABA за запуск")
+                    "Тестовый прогон: не больше N сообщений WABA за запуск",
+                    config_attr="WABA_RUN_LIMIT")
     run_sender()
 
 
@@ -159,7 +171,8 @@ if __name__ == "__main__":
     if mode == "sender":
         _apply_run_hours(sys.argv[2:])
         _apply_int_flag(sys.argv[2:], "--waba-limit", "BULK_WABA_RUN_LIMIT",
-                        "Тестовый прогон: не больше N сообщений WABA за запуск")
+                        "Тестовый прогон: не больше N сообщений WABA за запуск",
+                    config_attr="WABA_RUN_LIMIT")
         run_sender()
     elif mode == "tracker":
         from bulkmessage.tracker import run as run_tracker

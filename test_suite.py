@@ -2938,6 +2938,90 @@ finally:
         except OSError:
             pass
 
+# ---------------------------------------------------------------------------
+# V. РЕГРЕССИЯ: флаги --waba-limit / --run-hours печатались, но НЕ работали.
+#
+# На живом запуске `main.py sender --waba-limit 15` отправил 31 сообщение
+# вместо 15: флаг разбирался и печатался в лог («не больше N…: 15»), но
+# _apply_int_flag клал число только в os.environ. Модуль config читает
+# переменные ОДИН РАЗ при импорте, а main.py импортирует sender в самом
+# верху файла — поэтому config.WABA_RUN_LIMIT навсегда оставался 0.
+# У --run-hours был тот же баг: config.RUN_HOURS = 0, то есть длинный
+# прогон молно сводился к одному кругу фаз.
+#
+# Ни один тест этого не ловил: тесты limit'а подставляли config.WABA_RUN_LIMIT
+# напрямую, минуя разбор флагов.
+# ---------------------------------------------------------------------------
+section("V. РЕГРЕССИЯ: ФЛАГИ ДОХОДЯТ ДО config")
+# main.py раньше НЕ импортировался: старые проверки только искали строки в
+# исходнике ('os.environ[env_key]' в файле), из-за чего живой прогон тихо
+# уходил мимо лимита. Здесь импортируем по-настоящему и зовём функции.
+import importlib.util as _ilu
+_m_spec = _ilu.spec_from_file_location("bm_main", "main.py")
+main = _ilu.module_from_spec(_m_spec)
+_m_spec.loader.exec_module(main)
+
+_save_wl = config.WABA_RUN_LIMIT
+_save_rh = config.RUN_HOURS
+try:
+    # V1: env -> config для --waba-limit
+    config.WABA_RUN_LIMIT = 0
+    os.environ["BULK_WABA_RUN_LIMIT"] = "0"
+    main._apply_int_flag(["--waba-limit", "15"], "--waba-limit",
+                         "BULK_WABA_RUN_LIMIT", "T", config_attr="WABA_RUN_LIMIT")
+    check("--waba-limit 15 попадает в os.environ",
+          os.environ.get("BULK_WABA_RUN_LIMIT") == "15",
+          f"got {os.environ.get('BULK_WABA_RUN_LIMIT')!r}")
+    check("--waba-limit 15 попадает в config.WABA_RUN_LIMIT",
+          config.WABA_RUN_LIMIT == 15, f"got {config.WABA_RUN_LIMIT}")
+    check("--waba-limit 15 реально ограничивает отправку",
+          min(250, 15) == 15)
+
+    # V2: env -> config для --run-hours
+    config.RUN_HOURS = 0
+    os.environ["BULK_RUN_HOURS"] = "0"
+    main._apply_run_hours(["--run-hours", "2.5"])
+    check("--run-hours 2.5 попадает в os.environ",
+          os.environ.get("BULK_RUN_HOURS") == "2.5",
+          f"got {os.environ.get('BULK_RUN_HOURS')!r}")
+    check("--run-hours 2.5 попадает в config.RUN_HOURS",
+          config.RUN_HOURS == 2.5, f"got {config.RUN_HOURS}")
+
+    # V3: сквозной путь как в бою — sender читает именно config.WABA_RUN_LIMIT.
+    _v_sent = []
+    _v_sel = [{"phone": f"+7999000{i:04d}", "name": "V",
+               "category": "Покупатели"} for i in range(40)]
+    _v_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    _v_db.close()
+    try:
+        with patch.object(config, "DB_PATH", _v_db.name), \
+             patch.object(config, "STATE_PATH", _v_db.name + ".json"), \
+             patch.object(config, "BULK_BYPASS_SAFE_HOURS", True), \
+             patch.object(config, "WABA_RUN_LIMIT", 15), \
+             patch.object(sender, "_sleep_phase", lambda s, st: None), \
+             patch.object(sender, "_wait_until_active_window",
+                          lambda log: False), \
+             patch.object(sender, "_phase_fits", lambda ch, n: True), \
+             patch.object(state, "max_attempts_reached", lambda st: False), \
+             patch.object(sender, "_run_one_contact",
+                          lambda c, chs, b, ps, st, **kw: (
+                              _v_sent.append(c["phone"]) or True)):
+            db.init_db()  # rescue_queue создаётся миграцией
+            sender._run_all_phases(_v_sel, {"v": False}, {}, {}, cycle_no=1)
+        check("sender._run_all_phases уважает config.WABA_RUN_LIMIT=15",
+              len(_v_sent) == 15, f"отправлено {len(_v_sent)}")
+    finally:
+        for _f in (_v_db.name, _v_db.name + ".json"):
+            try:
+                os.unlink(_f)
+            except OSError:
+                pass
+finally:
+    config.WABA_RUN_LIMIT = _save_wl
+    config.RUN_HOURS = _save_rh
+    os.environ.pop("BULK_WABA_RUN_LIMIT", None)
+    os.environ.pop("BULK_RUN_HOURS", None)
+
 print()
 print("=" * 70)
 print(f" TOTAL: {passed} passed, {failed} failed")
