@@ -3115,6 +3115,56 @@ check("sweep_unconfirmed_deliveries по умолчанию = CONFIRM_TIMEOUT_MI
 check("RESCUE_SETTLE_MINUTES настроен",
       int(getattr(config, "RESCUE_SETTLE_MINUTES", 0)) > 0)
 
+# W2. Запуск, который стартует СРАЗУ с отката (BULK_PHASE_ORDER=telegram,max).
+# Живой случай 2026-10-06: Telegram пропущен как «пусто», потому что сторож
+# отрабатывал только ПОСЛЕ первой фазы, и откат ушёл в MAX — рискованный
+# канал. Здесь сторож обязан наполнить очередь ДО чтения первой фазой.
+_w2_swept: list = []
+_w2_sent: list = []
+
+
+def _w2_sweep(limit=50, minutes=None):
+    _w2_swept.append(minutes)
+    return 0
+
+
+try:
+    _w2_sel = [{"phone": f"+7999666{i:04d}", "name": "W2",
+                "category": "Покупатели"} for i in range(3)]
+    with patch.object(config, "DB_PATH", _w_db.name), \
+         patch.object(config, "STATE_PATH", _w_db.name + ".json"), \
+         patch.object(config, "BULK_BYPASS_SAFE_HOURS", True), \
+         patch.object(config, "PHASE_ORDER", ["telegram", "max"]), \
+         patch.object(config, "CHANNEL_DAILY_LIMITS",
+                      {"whatsapp": 60, "telegram": 50, "max": 15,
+                       "waba": 250, "sms": 50}), \
+         patch.object(sender, "_sleep_phase", lambda s, st: None), \
+         patch.object(sender, "_wait_until_active_window", lambda log: False), \
+         patch.object(sender, "_phase_fits", lambda ch, n: True), \
+         patch.object(state, "max_attempts_reached", lambda st: False), \
+         patch.object(reconcile, "sweep_unconfirmed_deliveries", _w2_sweep), \
+         patch.object(db, "pending_rescues",
+                      lambda **kw: [
+                          {"id": 1, "phone": "+79996660000", "name": "W2",
+                           "category": "Покупатели"}
+                      ] if kw.get("exclude_tried") == "telegram" else []), \
+         patch.object(sender, "_run_one_contact",
+                      lambda c, chs, b, ps, st, **kw: _w2_sent.append(
+                          chs[0] if chs else "?") or True):
+        db.init_db()  # rescue_queue создаётся миграцией
+        sender._run_all_phases(_w2_sel, {"v": False}, {}, {}, cycle_no=1)
+
+    check("запуск сразу с отката: сторож вызван ДО первой фазы",
+          len(_w2_swept) >= 1, f"вызовов {len(_w2_swept)}")
+    check("запуск сразу с отката: первым ушёл Telegram, не MAX",
+          _w2_sent and _w2_sent[0] == "telegram",
+          f"каналы {_w2_sent}")
+    check("в MAX не ушло никого после успешного Telegram",
+          "max" not in _w2_sent, f"каналы {_w2_sent}")
+finally:
+    _w2_swept.clear()
+    _w2_sent.clear()
+
 # ---------------------------------------------------------------------------
 # W. РЕГРЕССИЯ: ФАЗЫ ОТКАТА БЫЛИ ПУСТЫМИ (это и есть «не доставилось,
 # но другим каналом не отправили»).

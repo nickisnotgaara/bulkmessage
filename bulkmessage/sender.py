@@ -1633,6 +1633,15 @@ def _run_all_phases(
                     _sleep_phase(short, stop_requested)
                     _sweep_silence_into_rescue(getattr(
                         config, "RESCUE_SETTLE_MINUTES", 5))
+        elif phase_ch != "waba":
+            # Первая фаза, а откатать уже нечего: запуск начат сразу с
+            # Telegram/MAX (BULK_PHASE_ORDER=telegram,max), WABA в этом
+            # прогоне не участвовал. Раньше сторож отрабатывал только ПОСЛЕ
+            # первой фазы, поэтому откат читал пустую очередь и пропускал
+            # Telegram, а отправлять уходил MAX — самый рискованный канал.
+            # Наполняем очередь ДО чтения.
+            _sweep_silence_into_rescue(getattr(
+                config, "RESCUE_SETTLE_MINUTES", 5))
 
         if phase_ch == "waba":
             # Ждём открытия активного окна (10:00 МСК) перед первой фазой.
