@@ -2384,10 +2384,14 @@ try:
             # Номер в очереди rescue (был провал, ждёт отката)
             _mdb.pending_rescues.return_value = [{"phone": "+79993330033"}]
             _r30_contacts = [
-                {"phone": "+79993330011", "name": "fresh1", "category": "Buyers"},
-                {"phone": "+79993330022", "name": "exhausted", "category": "Buyers"},
-                {"phone": "+79993330023", "name": "cooldown", "category": "Buyers"},
-                {"phone": "+79993330033", "name": "in_queue", "category": "Buyers"},
+                {"phone": "+79993330011", "name": "fresh1", "category": "Покупатели"},
+                {"phone": "+79993330022", "name": "exhausted", "category": "Покупатели"},
+                {"phone": "+79993330023", "name": "cooldown", "category": "Покупатели"},
+                {"phone": "+79993330033", "name": "in_queue", "category": "Покупатели"},
+                # Категории без одобренного шаблона Meta (Знакомый/Услуги/
+                # Прораб): в WABA попасть не должны — отправка вернёт
+                # BUILD_TEMPLATE_ERROR и слот потратится впустую.
+                {"phone": "+79993330044", "name": "notemplate", "category": "Услуги"},
             ]
             _r30_fresh = sender._collect_fresh_waba_targets(_r30_contacts, _r30)
             _r30_phones = [c["phone"] for c in _r30_fresh]
@@ -2398,7 +2402,10 @@ try:
                   "+79993330023" not in _r30_phones, f"got {_r30_phones}")
             check("номер из rescue_queue исключён из фазы 1",
                   "+79993330033" not in _r30_phones, f"got {_r30_phones}")
-            check("в фазу 1 попал ровно 1 свежий из 4", len(_r30_fresh) == 1)
+            check("в фазу 1 попал ровно 1 свежий из 5 (остальные отсеяны)",
+                  len(_r30_fresh) == 1, f"got {len(_r30_fresh)}")
+            check("контакт БЕЗ одобренного шаблона Meta исключён из WABA",
+                  "+79993330044" not in _r30_phones, f"got {_r30_phones}")
 finally:
     try:
         Path(_r30_f.name).unlink()

@@ -1333,7 +1333,15 @@ def _collect_fresh_waba_targets(
         место в фазах TG/MAX, второй раз в WABA они только сожгут слот;
       • номера из waba_exhausted (долгоживущий маркер провала, TTL 30 дней);
       • номера в cooldown для waba;
-      • номера, помеченные bad_phones для waba.
+      • номера, помеченные bad_phones для waba;
+      • контакты БЕЗ одобренного шаблона Meta.
+
+    Последнее — не перестраховка, а требование API: холодная рассылка в WABA
+    допускается ТОЛЬКО по одобренному шаблону, у которого есть categoryName и
+    templateId. В базе 308 контактов с категориями «Знакомый/Услуги/Прораб»,
+    для которых шаблона нет: build_message для них возвращает заглушку в 67
+    символов, а Wazzup отвечает BUILD_TEMPLATE_ERROR. То есть слот WABA
+    тратится впустую, а человек получает отказ вместо сообщения.
     """
     queued: set[str] = set()
     try:
@@ -1344,6 +1352,7 @@ def _collect_fresh_waba_targets(
 
     fresh: list[dict] = []
     skipped_queued = skipped_exhausted = skipped_cooldown = skipped_bad = 0
+    skipped_no_template = 0
     for c in contacts:
         phone = c.get("phone")
         if not phone or phone in queued:
@@ -1358,6 +1367,11 @@ def _collect_fresh_waba_targets(
         if bad_phones.is_bad(phone, "waba"):
             skipped_bad += 1
             continue
+        # Нет одобренного шаблона Meta -> отправка вернёт ошибку шаблона.
+        if templates.normalize_category(
+                c.get("category", "")) not in config.ALLOWED_CATEGORIES:
+            skipped_no_template += 1
+            continue
         fresh.append(c)
 
     log.info("─" * 70)
@@ -1365,7 +1379,8 @@ def _collect_fresh_waba_targets(
     log.info(
         f"      исключено: в очереди {skipped_queued}, "
         f"WABA-исчерпан {skipped_exhausted}, "
-        f"cooldown {skipped_cooldown}, bad {skipped_bad}"
+        f"cooldown {skipped_cooldown}, bad {skipped_bad}, "
+        f"без шаблона Meta {skipped_no_template}"
     )
     log.info("─" * 70)
     return fresh
