@@ -1162,18 +1162,40 @@ def _run_one_contact(
             f"Деталь: {detail[:120]}"
         )
 
-    # Если контакт НИГДЕ не доставлен (sent_any=False), помечаем как полностью мёртвый
-    # для экспорта (data/failed_today.json)
+    # Если контакт НИГДЕ не доставлен (sent_any=False), помечаем как полностью
+    # мёртвый для экспорта (data/failed_today.json).
+    #
+    # ВАЖНО: считаем мёртвым только когда исчерпаны ВСЕ рабочие каналы, а не
+    # те, что попали в КАСКАД ЭТОЙ отправки. Фаза отката отправляет контакт
+    # одним каналом (cascade_override=[phase_ch]) — раньше отказ в Telegram
+    # тут же означал «контакт мёртв», и до MAX он уже не доходил, хотя MAX был
+    # доступен и мог бы сработать. Ровно та цепочка, ради которой всё
+    # затевалось: TG не нашёл человека → пробуем MAX.
     if not sent_any and cascade:
         failed_channels = [ch for ch in cascade]
-        failed_contacts.mark_fully_failed(
-            phone=phone, name=name, category=category, channels_failed=failed_channels
-        )
-        log.info(
-            f"   ☠️ Контакт {phone} ({name}) полностью мёртв — "
-            f"fail'нули все {len(failed_channels)} канала. "
-            f"Записан в data/failed_today.json"
-        )
+        _all_channels = set(_cascade_order()) | {"waba"}
+        _still_open = [
+            ch for ch in _all_channels
+            if ch not in set(failed_channels)
+            and ch in set(getattr(config, "PHASE_ORDER", []) or [])
+            and not bad_phones.is_bad(phone, ch)
+        ]
+        if _still_open:
+            log.info(
+                f"   ↪ Контакт {phone} не доставлен в "
+                f"{', '.join(failed_channels)}, но ещё открыты каналы: "
+                f"{', '.join(sorted(_still_open))} — остаётся в rescue-очереди"
+            )
+        else:
+            failed_contacts.mark_fully_failed(
+                phone=phone, name=name, category=category,
+                channels_failed=failed_channels,
+            )
+            log.info(
+                f"   ☠️ Контакт {phone} ({name}) полностью мёртв — "
+                f"fail'нули все {len(failed_channels)} канала. "
+                f"Записан в data/failed_today.json"
+            )
 
     return sent_any
 
@@ -1567,8 +1589,9 @@ def _run_phase(
                     _tried = set()
                 _fallbacks = [c for c in _phase_order_channels() if c != "waba"]
                 if _fallbacks and set(_fallbacks).issubset(_tried):
+                    from datetime import timedelta as _td
                     _tomorrow = (
-                        datetime.now(timezone.utc) + timedelta(days=1)
+                        datetime.now(timezone.utc) + _td(days=1)
                     ).isoformat()
                     db.mark_rescue_deferred(rid, _tomorrow)
                     log.info(
@@ -1678,6 +1701,7 @@ def _run_all_phases(
     backoffs: dict,
     permanent_skipped: dict,
     cycle_no: int = 1,
+    only_phase: Optional[str] = None,
 ) -> dict[str, int]:
     """Один полный круг фаз: WABA → TG → MAX.
 
@@ -1688,8 +1712,15 @@ def _run_all_phases(
     `filtered` — контакты, отобранные для ЭТОГО круга. В длинном режиме он
     пересобирается каждый круг, поэтому новые контакты подхватываются, а уже
     отправленные отсеиваются по базе.
+
+    `only_phase` — прогнать ОДНУ фазу из схемы, не трогая config.PHASE_ORDER.
+    Нужен сквозным стендам: они гоняют фазы по очереди, а логика отсрочки
+    («исчерпаны ли ВСЕ каналы отката») обязана смотреть на полный порядок из
+    конфига, а не на подмножество текущего прогона.
     """
     phase_order = list(getattr(config, "PHASE_ORDER", []) or [])
+    if only_phase:
+        phase_order = [only_phase]
     phase_stats: dict[str, int] = {}
 
     log.info("=" * 70)
@@ -1702,25 +1733,28 @@ def _run_all_phases(
             break
 
         if phase_no > 0:
-            # Пауза ТОЛЬКО после WABA: ждём события вебхука. Но Wazzup не
-            # шлёт `failed`, поэтому после паузы молчание само становится
-            # провалом — прогоняем сторож и наполняем очередь отката.
-            grace = int(getattr(config, "PHASE_GRACE_MINUTES", 5)) * 60
-            if grace > 0 and phase_order[phase_no - 1] == "waba":
+            # Ждём события вебхука, ПОТОМ превращаем молчание в провал.
+            #
+            # Сторож вызывается ВСЕГДА, а не только когда пауза > 0. Раньше он
+            # лежал внутри `if grace > 0`, и при PHASE_GRACE_MINUTES=0 (или
+            # RESCUE_SETTLE_MINUTES=0) фазы отката читали пустую очередь и не
+            # отправляли НИЧЕГО — цепочка молча вырождалась в один WABA-проход.
+            # Пауза нужна, чтобы долетели статусы; наполнять очередь должна
+            # тишина, а не пауза.
+            prev_phase = phase_order[phase_no - 1]
+            wait_min = int(
+                getattr(config, "PHASE_GRACE_MINUTES", 5)
+                if prev_phase == "waba"
+                else getattr(config, "RESCUE_SETTLE_MINUTES", 5)
+            )
+            if wait_min > 0:
                 log.info(
-                    f"⏸️  Пауза {grace // 60} мин после WABA: ждём подтверждений "
-                    f"доставки (Wazzup не шлёт 'failed', недоказанное = провал)"
+                    f"⏸️  Пауза {wait_min} мин после {prev_phase.upper()}: ждём "
+                    f"подтверждений доставки (Wazzup не шлёт 'failed', "
+                    f"недоказанное = провал)"
                 )
-                _sleep_phase(grace, stop_requested)
-                _sweep_silence_into_rescue(grace // 60)
-            elif phase_order[phase_no - 1] != "waba":
-                # Вторая и последующие фазы отката: короткая пауза, чтобы
-                # долетели статусы по предыдущему каналу, затем снова сторож.
-                short = int(getattr(config, "RESCUE_SETTLE_MINUTES", 5)) * 60
-                if short > 0:
-                    _sleep_phase(short, stop_requested)
-                    _sweep_silence_into_rescue(getattr(
-                        config, "RESCUE_SETTLE_MINUTES", 5))
+                _sleep_phase(wait_min * 60, stop_requested)
+            _sweep_silence_into_rescue(max(0, wait_min))
         elif phase_ch != "waba":
             # Первая фаза, а откатать уже нечего: запуск начат сразу с
             # Telegram/MAX (BULK_PHASE_ORDER=telegram,max), WABA в этом
@@ -1728,8 +1762,8 @@ def _run_all_phases(
             # первой фазы, поэтому откат читал пустую очередь и пропускал
             # Telegram, а отправлять уходил MAX — самый рискованный канал.
             # Наполняем очередь ДО чтения.
-            _sweep_silence_into_rescue(getattr(
-                config, "RESCUE_SETTLE_MINUTES", 5))
+            _sweep_silence_into_rescue(max(
+                0, int(getattr(config, "RESCUE_SETTLE_MINUTES", 5))))
 
         if phase_ch == "waba":
             # Ждём открытия активного окна (10:00 МСК) перед первой фазой.
