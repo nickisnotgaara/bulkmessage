@@ -29,6 +29,7 @@ import json
 import logging
 import sys
 import tempfile
+import time
 import inspect
 import ast
 from datetime import datetime, timedelta, timezone
@@ -2411,8 +2412,11 @@ check("фильтр добавляет условие по каналу в WHERE
 check("rescue_queue индексирован по (status, created_at)",
       "idx_rescue_status" in inspect.getsource(db.init_rescue_queue))
 _src_run = inspect.getsource(sender.run)
+# Фазы вынесены из run() в _run_all_phases, чтобы длинный прогон мог
+# крутить их повторно до дедлайна, а тесты — гонять по отдельности.
+_src_phases = inspect.getsource(sender._run_all_phases)
 check("run() объявляет фазы в config.PHASE_ORDER",
-      "PHASE_ORDER" in _src_run)
+      "PHASE_ORDER" in _src_phases)
 _src_phase_fn = inspect.getsource(sender._run_phase)
 check("фаза ограничена одним каналом (cascade_override=[phase_ch])",
       'cascade_override=[phase_ch]' in _src_phase_fn)
@@ -2420,9 +2424,10 @@ check("фаза ограничена одним каналом (cascade_override
 # он считает ПРИНЯТИЕ, и 250 принятых WABA остановили бы цикл до фазы отката.
 check("цель дня НЕ прерывает фазы (вызова state.target_reached нет)",
       "state.target_reached(" not in _src_run
+      and "state.target_reached(" not in _src_phases
       and "state.target_reached(" not in _src_phase_fn)
 check("фаза TG берёт только провалы WABA",
-      'original_channel="waba"' in _src_run)
+      'original_channel="waba"' in _src_phases)
 check("после TG rescue получает терминальный статус",
       "mark_rescue_success" in _src_phase_fn
       and "mark_rescue_attempt" in _src_phase_fn)
@@ -2596,6 +2601,71 @@ finally:
         Path(_r33_f.name).unlink()
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# S. ДЛИННЫЙ ПРОГОН (--run-hours): один процесс на N часов, без планировщика
+# ---------------------------------------------------------------------------
+section("S. ДЛИННЫЙ ПРОГОН (--run-hours)")
+check("config.RUN_HOURS существует", hasattr(config, "RUN_HOURS"))
+check("RUN_HOURS выключен по умолчанию", float(config.RUN_HOURS) == 0.0,
+      f"got {config.RUN_HOURS}")
+check("config.RUN_LOOP_PAUSE_MINUTES существует",
+      hasattr(config, "RUN_LOOP_PAUSE_MINUTES"))
+check("sender._run_all_phases вынесена на уровень модуля",
+      callable(getattr(sender, "_run_all_phases", None)))
+check("sender._run_seconds_left() существует",
+      callable(getattr(sender, "_run_seconds_left", None)))
+check("sender._select_contacts_for_cycle() существует",
+      callable(getattr(sender, "_select_contacts_for_cycle", None)))
+check("run() вызывает _run_all_phases (фазы крутятся в цикле)",
+      "_run_all_phases" in _src_run)
+
+# Ключевая регрессия: без дедлайна пауза обязана остаться в границах
+# канала. Раньше min(секунды_окна, inf) давал не inf, и пауза WABA
+# растягивалась до 3.3 часа вместо 30 секунд — то есть ОДИН проход
+# рассылки растягивался на дни.
+_saved_dl_s = sender._RUN_DEADLINE
+try:
+    sender._RUN_DEADLINE = None
+    check("без дедлайна остаётся бесконечное время",
+          sender._run_seconds_left() == float("inf"))
+    _lo_s, _hi_s = sender._phase_delay_bounds("waba")
+    _d_s = sender._phase_delay("waba", seconds_left=36000, remaining_msgs=3)
+    check("без дедлайна пауза в границах канала (10-30с)",
+          _lo_s <= _d_s <= _hi_s, f"got {_d_s:.0f}s, bounds {_lo_s}-{_hi_s}")
+
+    # С дедлайном пауза растягивается, иначе 250 сообщений уйдут за 1.4ч.
+    sender._RUN_DEADLINE = time.time() + 10 * 3600
+    _d2_s = sender._phase_delay("waba", seconds_left=36000, remaining_msgs=3)
+    check("с дедлайном 10ч пауза растянута (≈3.3ч на сообщение)",
+          10000 < _d2_s < 14000, f"got {_d2_s:.0f}s = {_d2_s/3600:.2f}h")
+
+    # Дедлайн прошёл — отправлять больше нельзя.
+    sender._RUN_DEADLINE = time.time() - 10
+    check("после дедлайна остаётся 0 секунд",
+          sender._run_seconds_left() == 0.0)
+    check("после дедлайна пауза нулевая (цикл встаёт)",
+          sender._phase_delay("waba", 36000, 3) == 0.0)
+finally:
+    sender._RUN_DEADLINE = _saved_dl_s
+
+# _select_contacts_for_cycle обязан отсекать уже отправленных — иначе
+# второй круг отправил бы те же контакты повторно.
+_sel_src = inspect.getsource(sender._select_contacts_for_cycle)
+check("отбор контактов отсекает уже отправленных (get_sent_phones)",
+      "get_sent_phones" in _sel_src)
+check("отбор контактов уважает cooldown",
+      "is_phone_in_cooldown" in _sel_src)
+
+# Флаг разбирается в main.py и пишет BULK_RUN_HOURS в окружение.
+_main_src = Path("main.py").read_text(encoding="utf-8")
+check("main.py понимает --run-hours", "--run-hours" in _main_src)
+check("main.py ставит BULK_RUN_HOURS в окружение",
+      'os.environ["BULK_RUN_HOURS"]' in _main_src)
+check("main.py отвергает --run-hours <= 0",
+      "hours <= 0" in _main_src)
+check("main.py печатает справку по --help", "USAGE" in _main_src)
 
 
 print()

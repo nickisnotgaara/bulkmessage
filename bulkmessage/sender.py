@@ -14,7 +14,7 @@ import os
 import random
 import signal
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -1234,6 +1234,32 @@ def _phase_seconds_left(channel: str) -> float:
     return (end_dt - now).total_seconds()
 
 
+# Дедлайн текущего запуска sender'а (timestamp, UTC) и счётчик кругов.
+# Ставится один раз в начале run(), когда включён режим длинного прогона
+# (BULK_RUN_HOURS). Держим в модуле, потому что пауза между сообщениями
+# (_phase_delay) тоже должна о нём знать: иначе 250 сообщений уходят
+# за 1.4 часа по паузе 10-30 секунд, и «10-часовой» прогон заканчивается
+# через час с четвертью.
+_RUN_DEADLINE: Optional[float] = None
+_RUN_CYCLE = 0
+
+
+def _run_deadline() -> Optional[float]:
+    """Абсолютный дедлайн запуска (unix ts, UTC) или None."""
+    return _RUN_DEADLINE
+
+
+def _run_seconds_left() -> float:
+    """Сколько секунд осталось до дедлайна запуска.
+
+    Возвращает float('inf'), если режим длинного прогона выключен —
+    тогда ограничителем остаётся только safe-hours окна.
+    """
+    if _RUN_DEADLINE is None:
+        return float("inf")
+    return max(0.0, _RUN_DEADLINE - time.time())
+
+
 def _phase_delay_bounds(channel: str) -> tuple[int, int]:
     if channel == "waba":
         return (config.WABA_DELAY_MIN, config.WABA_DELAY_MAX)
@@ -1249,13 +1275,37 @@ def _phase_delay(channel: str, seconds_left: float, remaining_msgs: int) -> floa
     гарантированно укладывается в своё окно. Со случайными 300-900с суммарное
     σ для 45 сообщений ≈19 минут при запасе 20 — то есть ~10% вероятности
     вылеза за 19:00. С детерминированной задержкой исход не зависит от броска.
+
+    В режиме длинного прогона учитывается общий дедлайн запуска, а не только
+    конец safe-окна: иначе фазой уходит 1.4 часа вместо 10 (пауза WABA
+    ограничена сверху 30 секундами, а оконных часов остаётся много).
     """
     lo, hi = _phase_delay_bounds(channel)
     if remaining_msgs <= 0:
         return 0.0
     if not getattr(config, "PHASE_DETERMINISTIC_DELAY", False):
         return random.uniform(lo, hi)
-    return max(lo, min(hi, seconds_left / remaining_msgs))
+
+    # Режим длинного прогона включается ТОЛЬКО если задан дедлайн.
+    # Важно: min(36000, inf) даёт 36000, а не inf — если не проверить это
+    # отдельно, без флага пауза растягивается до «окно / остаток» и WABA
+    # уходит 3 сообщения по 3.3 часа вместо 30 секунд.
+    run_left = _run_seconds_left()
+    if run_left == float("inf"):
+        # Старое поведение: пауза упирается в границы канала.
+        return max(lo, min(hi, seconds_left / remaining_msgs))
+
+    # Остаток = что кончится раньше: окно канала или дедлайн прогона.
+    left = min(seconds_left, run_left)
+    if left <= 0:
+        return 0.0
+    per_msg = left / remaining_msgs
+
+    # Верхняя граница паузы поднимается до «размазать по оставшемуся
+    # времени»: без этого 250 сообщений уходят за 1.4 часа (пауза WABA
+    # ограничена 30 секундами) и «10-часовой» прогон заканчивается сразу.
+    ceiling = max(hi, per_msg)
+    return max(lo, min(ceiling, per_msg))
 
 
 def _collect_fresh_waba_targets(
@@ -1438,6 +1488,145 @@ def _run_phase(
                 stop_requested,
             )
     return done
+
+
+def _select_contacts_for_cycle(
+    all_contacts: Optional[list] = None,
+) -> list:
+    """Контакты для ОДНОГО круга фаз, пересобираются каждый круг.
+
+    В длинном режиме важно пересобирать список каждый круг: подхватываются
+    новые контакты из Excel, а уже отправленные отсекаются по crm.db
+    (get_sent_phones) и по cooldown. Без пересборки второй круг
+    отправлял бы те же контакты повторно.
+    """
+    if all_contacts is None:
+        try:
+            all_contacts = contacts.load_contacts(config.EXCEL_PATH)
+        except FileNotFoundError:
+            log.error(f"Файл контактов не найден: {config.EXCEL_PATH}")
+            return []
+
+    try:
+        with db.db_conn() as conn:
+            sent_phones = db.get_sent_phones(conn)
+    except Exception:
+        sent_phones = set()
+
+    cur = state.reset_daily_if_new_day(state.load_state())
+    out = []
+    for c in all_contacts:
+        phone = c.get("phone")
+        if not phone or phone in sent_phones:
+            continue
+        if state.is_phone_in_cooldown(cur, phone, "waba"):
+            continue
+        out.append(c)
+    return out
+
+
+def _run_all_phases(
+    filtered: list,
+    stop_requested: dict,
+    backoffs: dict,
+    permanent_skipped: dict,
+    cycle_no: int = 1,
+) -> dict[str, int]:
+    """Один полный круг фаз: WABA → TG → MAX.
+
+    Вынесено из run(), чтобы:
+      * в режиме длинного прогона крутить её многократно до дедлайна;
+      * тестировать её отдельно, не запуская весь sender.
+
+    `filtered` — контакты, отобранные для ЭТОГО круга. В длинном режиме он
+    пересобирается каждый круг, поэтому новые контакты подхватываются, а уже
+    отправленные отсеиваются по базе.
+    """
+    phase_order = list(getattr(config, "PHASE_ORDER", []) or [])
+    phase_stats: dict[str, int] = {}
+
+    log.info("=" * 70)
+    log.info(f"ФАЗОВЫЙ РЕЖИМ: {' → '.join(phase_order)}"
+             + (f"  (круг {cycle_no})" if cycle_no > 1 else ""))
+    log.info("=" * 70)
+
+    for phase_no, phase_ch in enumerate(phase_order):
+        if stop_requested["v"]:
+            break
+
+        if phase_no > 0:
+            # Пауза ТОЛЬКО после WABA: ждём явные failed-события вебхука,
+            # которые и формируют пул для отката. Без вебхука пул будет пуст.
+            grace = int(getattr(config, "PHASE_GRACE_MINUTES", 5)) * 60
+            if grace > 0 and phase_order[phase_no - 1] == "waba":
+                log.info(
+                    f"⏸️  Пауза {grace // 60} мин после WABA: ждём события "
+                    f"'failed' от вебхука (без них откат не знает, кому идти)"
+                )
+                _sleep_phase(grace, stop_requested)
+
+        if phase_ch == "waba":
+            # Ждём открытия активного окна (10:00 МСК) перед первой фазой.
+            if _wait_until_active_window(log):
+                pass
+            cur = state.load_state()
+            if not state.channel_has_quota_with_headroom(cur, "waba"):
+                log.info("🛑 WABA: квота исчерпана — фаза пропущена")
+                continue
+            targets = _collect_fresh_waba_targets(filtered, cur)[: int(
+                state.channel_effective_cap(cur, "waba")
+            )]
+            if not targets:
+                log.info("🛑 WABA: нет свежих контактов — фаза пропущена")
+                continue
+            if not _phase_fits("waba", len(targets)):
+                continue
+            log.info(
+                f"▶️  ФАЗА 1 · WABA · {len(targets)} свежих контактов · "
+                f"окно {config.WABA_SAFE_HOURS_START}–"
+                f"{config.WABA_SAFE_HOURS_END} МСК"
+            )
+            phase_stats["waba"] = _run_phase(
+                "waba", targets, "WABA", stop_requested
+            )
+        else:
+            # Фаза отката: берём провалы WABA из rescue_queue, FIFO.
+            limit = int(state.channel_effective_cap(state.load_state(), phase_ch))
+            # exclude_tried: контакт, которому фаза TG уже не смогла
+            # доставить, НЕ должен снова попасть в фазу MAX — иначе
+            # он получит второе-третье сообщение за один прогон.
+            pending = db.pending_rescues(
+                limit=limit, cooldown_seconds=0, original_channel="waba",
+                exclude_tried=phase_ch,
+            )
+            if not pending:
+                log.info(
+                    f"▶️  Фаза {phase_ch.upper()}: пусто (нет провалов WABA "
+                    f"в очереди для этого канала)"
+                )
+                continue
+            items = [
+                {
+                    "phone": r["phone"],
+                    "name": r.get("name") or "—",
+                    "category": r.get("category") or "—",
+                    "rescue_id": r["id"],
+                }
+                for r in pending
+            ]
+            if not _phase_fits(phase_ch, len(items)):
+                continue
+            log.info(
+                f"▶️  ФАЗА {phase_no + 1} · {phase_ch.upper()} · "
+                f"{len(items)} откатов · окно "
+                f"{config.PERSONAL_SAFE_HOURS_START}–"
+                f"{config.PERSONAL_SAFE_HOURS_END} МСК"
+            )
+            phase_stats[phase_ch] = _run_phase(
+                phase_ch, items, phase_ch.upper(), stop_requested
+            )
+
+    return phase_stats
 
 
 def run() -> None:
@@ -1882,91 +2071,68 @@ def run() -> None:
         # Итог считается по delivered_today в финальной воронке.
         backoffs: dict[str, int] = {}
         permanent_skipped: dict[str, set[str]] = {}
-        phase_order = list(getattr(config, "PHASE_ORDER", []) or [])
-        phase_stats: dict[str, int] = {}
 
-        log.info("=" * 70)
-        log.info(f"ФАЗОВЫЙ РЕЖИМ: {' → '.join(phase_order)}")
-        log.info("=" * 70)
+        # Режим длинного прогона: один процесс крутит круги фаз, пока не
+        # выйдет дедлайн BULK_RUN_HOURS от старта. Без него — один круг
+        # (старое поведение), и дальше процесс завершается.
+        run_hours = float(getattr(config, "RUN_HOURS", 0) or 0)
+        loop_pause = float(getattr(config, "RUN_LOOP_PAUSE_MINUTES", 10) or 0)
 
-        for phase_no, phase_ch in enumerate(phase_order):
+        if run_hours > 0:
+            _RUN_DEADLINE = time.time() + run_hours * 3600
+            _dl = datetime.fromtimestamp(_RUN_DEADLINE, tz=timezone.utc)
+            _dl_local = _dl.astimezone(config.now_tz().tzinfo)
+            log.info("=" * 70)
+            log.info(
+                f"⏱️  ДЛИННЫЙ ПРОГОН: {run_hours:g}ч от старта "
+                f"(дедлайн {_dl_local.strftime('%H:%M')} МСК)"
+            )
+            log.info(
+                "   Планировщик НЕ нужен: sender сам перезапускает фазы, "
+                "пока не истечёт время или не кончится база."
+            )
+            log.info("=" * 70)
+
+        all_phase_stats: dict[str, int] = {}
+        while True:
+            # Каждый круг пересобирает список контактов: подхватываются новые,
+            # уже отправленные отсекаются по БД.
+            cycle_filtered = _select_contacts_for_cycle(all_contacts)
+            cycle_stats = _run_all_phases(
+                cycle_filtered, stop_requested, backoffs, permanent_skipped,
+                cycle_no=(_RUN_CYCLE + 1),
+            )
+            for _ch, _n in cycle_stats.items():
+                all_phase_stats[_ch] = all_phase_stats.get(_ch, 0) + _n
+            _RUN_CYCLE += 1
+
+            if run_hours <= 0:
+                break
+            left = _run_seconds_left()
+            if left <= 0:
+                log.info("⏹️  Дедлайн длинного прогона достигнут — выходим.")
+                break
             if stop_requested["v"]:
                 break
-
-            if phase_no > 0:
-                # Пауза ТОЛЬКО после WABA: ждём явные failed-события вебхука,
-                # которые и формируют пул для отката. Без вебхука пул будет пуст.
-                grace = int(getattr(config, "PHASE_GRACE_MINUTES", 5)) * 60
-                if grace > 0 and phase_order[phase_no - 1] == "waba":
-                    log.info(
-                        f"⏸️  Пауза {grace // 60} мин после WABA: ждём события "
-                        f"'failed' от вебхука (без них откат не знает, кому идти)"
-                    )
-                    _sleep_phase(grace, stop_requested)
-
-            if phase_ch == "waba":
-                # Ждём открытия активного окна (10:00 МСК) перед первой фазой.
-                if _wait_until_active_window(log):
-                    pass
-                cur = state.load_state()
-                if not state.channel_has_quota_with_headroom(cur, "waba"):
-                    log.info("🛑 WABA: квота исчерпана — фаза пропущена")
-                    continue
-                targets = _collect_fresh_waba_targets(filtered, cur)[: int(
-                    state.channel_effective_cap(cur, "waba")
-                )]
-                if not targets:
-                    log.info("🛑 WABA: нет свежих контактов — фаза пропущена")
-                    continue
-                if not _phase_fits("waba", len(targets)):
-                    continue
+            cur_chk = state.reset_daily_if_new_day(state.load_state())
+            if state.max_attempts_reached(cur_chk):
                 log.info(
-                    f"▶️  ФАЗА 1 · WABA · {len(targets)} свежих контактов · "
-                    f"окно {config.WABA_SAFE_HOURS_START}–"
-                    f"{config.WABA_SAFE_HOURS_END} МСК"
+                    "🛑 SAFETY CAP — больше попыток сегодня делать нельзя."
                 )
-                phase_stats["waba"] = _run_phase(
-                    "waba", targets, "WABA", stop_requested
-                )
-            else:
-                # Фаза отката: берём провалы WABA из rescue_queue, FIFO.
-                limit = int(state.channel_effective_cap(state.load_state(), phase_ch))
-                # exclude_tried: контакт, которому фаза TG уже не смогла
-                # доставить, НЕ должен снова попасть в фазу MAX — иначе
-                # он получит второе-третье сообщение за один прогон.
-                pending = db.pending_rescues(
-                    limit=limit, cooldown_seconds=0, original_channel="waba",
-                    exclude_tried=phase_ch,
-                )
-                if not pending:
-                    log.info(
-                        f"▶️  Фаза {phase_ch.upper()}: пусто (нет провалов WABA "
-                        f"в очереди для этого канала)"
-                    )
-                    continue
-                items = [
-                    {
-                        "phone": r["phone"],
-                        "name": r.get("name") or "—",
-                        "category": r.get("category") or "—",
-                        "rescue_id": r["id"],
-                    }
-                    for r in pending
-                ]
-                if not _phase_fits(phase_ch, len(items)):
-                    continue
-                log.info(
-                    f"▶️  ФАЗА {phase_no + 1} · {phase_ch.upper()} · "
-                    f"{len(items)} откатов · окно "
-                    f"{config.PERSONAL_SAFE_HOURS_START}–"
-                    f"{config.PERSONAL_SAFE_HOURS_END} МСК"
-                )
-                phase_stats[phase_ch] = _run_phase(
-                    phase_ch, items, phase_ch.upper(), stop_requested
-                )
+                break
 
+            # Ничего не отправилось? Не гоняем пустые круги впустую.
+            if not any(cycle_stats.values()):
+                log.info(
+                    f"😴 Круг отработал вхолостую (база/очередь пусты), жду "
+                    f"{loop_pause:g} мин до следующего"
+                )
+            _sleep_phase(min(loop_pause, left) * 60, stop_requested)
+
+        phase_stats = all_phase_stats
         log.info("─" * 70)
-        log.info(f"📦 Фазы отработаны: {phase_stats or '—'}")
+        log.info(f"📦 Фазы отработаны (кругов: {_RUN_CYCLE}): "
+                 f"{phase_stats or '—'}")
         try:
             log.info(
                 f"📋 Очередь на SMS (осталось pending): "
