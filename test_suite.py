@@ -97,10 +97,12 @@ check("TG limit > 0", config.CHANNEL_DAILY_LIMITS["telegram"] > 0)
 check("MAX limit > 0", config.CHANNEL_DAILY_LIMITS["max"] > 0)
 check("WABA limit > 0", config.CHANNEL_DAILY_LIMITS["waba"] > 0)
 check(
-    "Personal каналы ≤ MAX_PERSONAL_DAILY_HARD_CAP (защита оригинальных аккаунтов)",
-    config.CHANNEL_DAILY_LIMITS["telegram"] <= 30
-    and config.CHANNEL_DAILY_LIMITS["max"] <= 30,
-    f"got {config.CHANNEL_DAILY_LIMITS}",
+    "Personal каналы ≤ своего per-channel hard cap (защита оригинальных аккаунтов)",
+    config.CHANNEL_DAILY_LIMITS["telegram"]
+    <= config.PERSONAL_CHANNEL_HARD_CAPS["telegram"]
+    and config.CHANNEL_DAILY_LIMITS["max"]
+    <= config.PERSONAL_CHANNEL_HARD_CAPS["max"],
+    f"got {config.CHANNEL_DAILY_LIMITS}, caps {config.PERSONAL_CHANNEL_HARD_CAPS}",
 )
 check("DELAY_MIN > 0", config.DELAY_MIN > 0)
 check(
@@ -2508,9 +2510,19 @@ check("headroom снят: WABA-эффективный кап = 250",
       ) == 250,
       f"headroom={config.HEADROOM_PCT} cap="
       f"{state.channel_effective_cap({'waba_tier': '0', 'date': config.now_tz().strftime('%Y-%m-%d')}, 'waba')}")
-check("TG и MAX укладываются в hard cap 30",
-      state.channel_effective_cap({}, "telegram") <= 30
-      and state.channel_effective_cap({}, "max") <= 30)
+check("TG и MAX укладываются в свой per-channel hard cap",
+      state.channel_effective_cap({}, "telegram")
+      <= config.PERSONAL_CHANNEL_HARD_CAPS["telegram"]
+      and state.channel_effective_cap({}, "max")
+      <= config.PERSONAL_CHANNEL_HARD_CAPS["max"])
+# Лимит из env НЕ может превысить жёсткий потолок канала: защита должна
+# держать даже если владелец поставит 999 в .env.local.
+check("_safe_limit режет значение по hard_cap (min)",
+      "min(val, hard_cap)" in inspect.getsource(config._safe_limit))
+check("TG=50 и MAX=15 — потолки владельца, MAX ниже прежних 30",
+      config.PERSONAL_CHANNEL_HARD_CAPS["telegram"] == 50
+      and config.PERSONAL_CHANNEL_HARD_CAPS["max"] == 15,
+      f"got {config.PERSONAL_CHANNEL_HARD_CAPS}")
 
 # --- R32c: вебхук — жёсткое условие фаз отката ---
 check("preflight предупреждает, что без вебхука фазы отката пусты",
@@ -2635,18 +2647,39 @@ try:
     check("без дедлайна пауза в границах канала (10-30с)",
           _lo_s <= _d_s <= _hi_s, f"got {_d_s:.0f}s, bounds {_lo_s}-{_hi_s}")
 
-    # С дедлайном пауза растягивается, иначе 250 сообщений уйдут за 1.4ч.
+    # Владелец решил: WABA идёт БЫСТРО (свои 10-30с), а растягиваются
+    # откаты TG/MAX. Растяжка WABA на 10ч означала бы, что вебхук не успевает
+    # принести failed-события, и откаты стартуют на пустом списке провалов.
     sender._RUN_DEADLINE = time.time() + 10 * 3600
-    _d2_s = sender._phase_delay("waba", seconds_left=36000, remaining_msgs=3)
-    check("с дедлайном 10ч пауза растянута (≈3.3ч на сообщение)",
-          10000 < _d2_s < 14000, f"got {_d2_s:.0f}s = {_d2_s/3600:.2f}h")
+    _w_lo, _w_hi = sender._phase_delay_bounds("waba")
+    _d_w = sender._phase_delay("waba", seconds_left=36000, remaining_msgs=250)
+    check("WABA НЕ растягивается: идёт быстро своими 10-30с",
+          _w_lo <= _d_w <= _w_hi, f"got {_d_w:.0f}s, границы {_w_lo}-{_w_hi}")
+    _tg_lo, _tg_hi = sender._phase_delay_bounds("telegram")
+    # Реальный сценарий: 8ч осталось, 50 откатов -> 576с, это внутри
+    # границ канала (300-900с), поэтому растяжка не нужна и не включается.
+    _d_tg = sender._phase_delay("telegram", seconds_left=8 * 3600, remaining_msgs=50)
+    check("TG (откат) укладывается в свой темп 300-900с",
+          _tg_lo <= _d_tg <= _tg_hi,
+          f"got {_d_tg:.0f}s, границы {_tg_lo}-{_tg_hi}")
+    # А вот тут растяжка включается: 8ч на 5 откатов = 5760с >> 900с.
+    _d_tg2 = sender._phase_delay("telegram", seconds_left=8 * 3600, remaining_msgs=5)
+    check("TG растягивается, когда остаток больше границы канала",
+          _d_tg2 > _tg_hi, f"got {_d_tg2:.0f}s, граница {_tg_hi}")
+    _mx_lo, _mx_hi = sender._phase_delay_bounds("max")
+    _d_mx = sender._phase_delay("max", seconds_left=5 * 3600, remaining_msgs=15)
+    check("MAX (откат) растягивается на остаток дедлайна",
+          _d_mx > _mx_hi, f"got {_d_mx:.0f}s, граница {_mx_hi}")
+    check("флаг PHASE_STRETCH_FALLBACK_ONLY включён",
+          getattr(config, "PHASE_STRETCH_FALLBACK_ONLY", False) is True)
 
     # Дедлайн прошёл — отправлять больше нельзя.
     sender._RUN_DEADLINE = time.time() - 10
     check("после дедлайна остаётся 0 секунд",
           sender._run_seconds_left() == 0.0)
-    check("после дедлайна пауза нулевая (цикл встаёт)",
-          sender._phase_delay("waba", 36000, 3) == 0.0)
+    check("после дедлайна откатная фаза не ждёт (пауза 0)",
+          sender._phase_delay("telegram", 36000, 50) == 0.0,
+          f"got {sender._phase_delay('telegram', 36000, 50):.0f}s")
 finally:
     sender._RUN_DEADLINE = _saved_dl_s
 

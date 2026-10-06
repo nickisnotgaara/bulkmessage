@@ -153,27 +153,42 @@ WABA_TIER_LIMITS = {
 
 # ЖЁСТКИЙ код-лимит для Personal-каналов. Никакой env override не может
 # превысить это значение (защита от случайного скачка cap для original account).
-MAX_PERSONAL_DAILY_HARD_CAP = 30
+#
+# ВНИМАНИЕ: кап стал ПЕР-КАНАЛЬНЫМ. Раньше он был один общий на TG и MAX
+# (30), из-за чего BULK_LIMIT_TELEGRAM=50 молча резался до 30 — владелец
+# ставил 50, а фактически выходило 30, и причина была неочевидна.
+# Теперь у каждого канала своя потолок, и лимит из .env.local режет именно
+# его: TG до 50, MAX до 15.
+#
+# Почему MAX остаётся низким (15): 3–5 жалоб Meta = перманентный бан
+# ЛИЧНОГО аккаунта MAX. Владелец сознательно выбрал 15 вместо прежних 30.
+MAX_PERSONAL_DAILY_HARD_CAP = 30  # legacy-значение, ниже не используется
+
+# Жёсткие потолки для личных аккаунтов: env НЕ может их превысить.
+PERSONAL_CHANNEL_HARD_CAPS = {
+    "telegram": 50,
+    "max": 15,
+}
 
 ORIGINAL_ACCOUNT_DAILY_HARD_CAPS = {
     "waba": 250,
-    "telegram": 40,
-    "max": 25,
+    "telegram": 50,
+    "max": 15,
 }
 
-# --- Daily limits: 60 на КАЖДЫЙ канал (whatsapp, telegram, max) ---
-# 60 контактов × 3 канала = 180 сообщений в день максимум.
-# Phase 0.2 (оригинальный аккаунт): TG=40, MAX=25 (понижены для anti-bank).
+# --- Daily limits ---
 # WABA — отдельный ключ (BULK_LIMIT_WABA) или авто из tier.
-# Personal-каналы ограничены жёстким MAX_PERSONAL_DAILY_HARD_CAP=30.
+# Personal-каналы ограничены PERSONAL_CHANNEL_HARD_CAPS (TG 50, MAX 15).
 def _safe_limit(ch: str, default: int, hard_cap: int = 10**9) -> int:
     val = int(os.environ.get(f"BULK_LIMIT_{ch.upper()}", str(default)))
     return min(val, hard_cap)
 
 CHANNEL_DAILY_LIMITS = {
     "whatsapp": _safe_limit("whatsapp", 60),
-    "telegram": _safe_limit("telegram", 40, hard_cap=MAX_PERSONAL_DAILY_HARD_CAP),
-    "max": _safe_limit("max", 25, hard_cap=MAX_PERSONAL_DAILY_HARD_CAP),
+    "telegram": _safe_limit(
+        "telegram", 40, hard_cap=PERSONAL_CHANNEL_HARD_CAPS["telegram"]),
+    "max": _safe_limit(
+        "max", 15, hard_cap=PERSONAL_CHANNEL_HARD_CAPS["max"]),
     "waba": _safe_limit("waba", 250),
     # SMS — fallback последней надежды. НЕ ограничен MAX_PERSONAL_DAILY_HARD_CAP:
     # SMS идёт через агрегатор с зарегистрированным именем отправителя, а не через
@@ -506,6 +521,19 @@ RUN_HOURS = float(os.environ.get("BULK_RUN_HOURS", "0") or 0)
 # события вебхука или просто держим процесс живым до дедлайна).
 RUN_LOOP_PAUSE_MINUTES = float(
     os.environ.get("BULK_RUN_LOOP_PAUSE_MINUTES", "10") or 10
+)
+# Растягивать ли паузу до дедлайна ТОЛЬКО на откатных фазах (TG/MAX).
+#
+# 1 = да (рекомендуется): WABA отрабатывает быстро своими 10-30 секундами,
+#     чтобы вебхук успел принести failed-события, а откаты TG/MAX занимают
+#     остаток времени. Именно это и нужно владельцу: «сначала быстро по
+#     WABA, потом по ошибкам — откат, всё за 10 часов».
+# 0 = нет: все фазы, включая WABA, растягиваются равномерно на дедлайн.
+#     Тогда 250 сообщений идут по 2.4 минуты, а вебхук не успевает
+#     подтвердить доставку до старта отката — TG/MAX стартуют на пустом
+#     списке провалов.
+PHASE_STRETCH_FALLBACK_ONLY = bool(
+    os.environ.get("BULK_PHASE_STRETCH_FALLBACK_ONLY", "1")
 )
 
 # Пауза между последней отправкой фазы WABA и стартом фазы Telegram: столько
