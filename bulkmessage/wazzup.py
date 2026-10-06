@@ -372,6 +372,51 @@ def is_personal_channel(channel_transport: str) -> bool:
 _CHANNEL_NAME_CACHE: dict[str, str] = {}
 _CHANNELS_FETCHED = False
 
+# Кэш маппинга НОМЕРА НАШЕГО АККАУНТА (plainId) → channel name.
+#
+# Зачем: Wazzup НЕ присылает channelId ни в одном реальном событии — проверено
+# на всех 139 сохранённых payload'ах в data/pending_webhooks.jsonl: поле
+# channelId отсутствует в 139 из 139. Поэтому `channel_name_for(channel_id)`
+# в бою не вызывается НИКОГДА и канал определяется только по chatType/platform.
+# А там `whatsapp` → 'whatsapp', и sender, который шлёт через канал 'waba',
+# получает для своего же сообщения канал 'whatsapp'.
+#
+# Последствия были не косметические:
+#   - delivered_today копился в 'whatsapp', а квоты/статистика читают 'waba';
+#   - mark_waba_exhausted() не вызывался (ветка `if channel == "waba"`);
+#   - complaint halt вешался на 'whatsapp', а sender проверяет halt по 'waba';
+#   - cooldown писался в last_delivery_per_channel['whatsapp'].
+#
+# В webhook есть `from`/`to`/`chat_id` — там лежит наш собственный номер
+# аккаунта с суффиксом '@c.us'. По нему канал определяется однозначно.
+#
+# Именно ОДНОЗНАЧНО для семейства транспорта: у нас все три канала (WABA,
+# Telegram, MAX) сидят на одном номере 79771501819, поэтому сам по себе
+# номер не различает каналы. Различает семейство, которое приходит в
+# payload'е как platform/chatType. Поэтому кэш хранит СПИСОК имён.
+_PLAINID_NAME_CACHE: dict[str, list] = {}
+
+_FAMILY_OF_NAME = {
+    "telegram": "telegram",
+    "max": "max",
+    "waba": "whatsapp",
+    "whatsapp": "whatsapp",
+}
+
+
+def _transport_to_name(transport: str) -> str:
+    """transport Wazzup → внутреннее имя канала."""
+    transport = (transport or "").lower()
+    if transport in ("telegram", "tg", "tgapi"):
+        return "telegram"
+    if transport in ("max", "vk", "maxapi"):
+        return "max"
+    if transport in ("wapi", "whatsapp_business", "waba"):
+        return "waba"
+    if transport in ("whatsapp", "whapi"):
+        return "whatsapp"
+    return "waba"  # неизвестный → считаем WABA (безопаснее для лимитов)
+
 
 def _fetch_channels_cached() -> list[dict]:
     """Получить список каналов один раз за процесс. Если API недоступен — []."""
@@ -389,18 +434,18 @@ def _fetch_channels_cached() -> list[dict]:
         transport = (ch.get("transport") or "").lower()
         if not cid:
             continue
-        # Маппинг transport → bulkmessage channel name.
-        if transport in ("telegram", "tg", "tgapi"):
-            name = "telegram"
-        elif transport in ("max", "vk", "maxapi"):
-            name = "max"
-        elif transport in ("wapi", "whatsapp_business", "waba"):
-            name = "waba"
-        elif transport in ("whatsapp", "whapi"):
-            name = "whatsapp"  # Personal WhatsApp через Wazzup QR
-        else:
-            name = "waba"  # неизвестный → считаем WABA (безопаснее для лимитов)
+        name = _transport_to_name(transport)
         _CHANNEL_NAME_CACHE[cid] = name
+        # Тот же канал, но опознаваемый по номеру аккаунта — единственный
+        # способ определить канал в реальных payload'ах Wazzup (channelId
+        # в них не приходит). Нормализуем через normalize_phone, потому
+        # что в событии лежит '79771501819@c.us', а здесь — '79771501819'.
+        plain = ch.get("plainId") or ch.get("name") or ""
+        norm = normalize_phone(plain) if plain else ""
+        if norm:
+            bucket = _PLAINID_NAME_CACHE.setdefault(norm, [])
+            if name not in bucket:
+                bucket.append(name)
     return list(_CHANNEL_NAME_CACHE.values())
 
 
@@ -416,6 +461,63 @@ def channel_name_for(channel_id: str) -> Optional[str]:
         return _CHANNEL_NAME_CACHE[channel_id]
     _fetch_channels_cached()
     return _CHANNEL_NAME_CACHE.get(channel_id)
+
+
+def channel_name_for_raw(value, chat_type: str = "") -> Optional[str]:
+    """Опознать канал по «сырому» значению из payload'а Wazzup.
+
+    Принимает то, что реально лежит в событии: '79159997393@c.us',
+    '751747704', None. JID-хвост отрезается, номер нормализуется, дальше
+    ищем в кэше plainId → [channel names].
+
+    Нужен потому, что channelId в payload'ах не приходит (0 из 139), и
+    без этого резолва по chatType WhatsApp-отправка определялась как
+    'whatsapp' вместо 'waba' — счётчики доставки, cooldown, complaint halt
+    и пул WABA уезжали в отдельный канал, которого sender не знает.
+
+    Номер НЕ различает каналы сам по себе (все три канала на одном
+    номере), поэтому сверяемся с семейством из chatType/platform:
+      chatType='whatsapp' + единственный whatsapp-канал → 'waba';
+      chatType='telegram'/'max' → соответствующее имя.
+    Если каналов семейства ровно один (обычный случай) — берём его.
+    """
+    if not value:
+        return None
+    raw = str(value).split("@", 1)[0].split(":", 1)[0].strip()
+    if not raw or not re.fullmatch(r"\d{5,15}", raw):
+        return None
+    num = normalize_phone(raw)
+    if not num:
+        return None
+    if num not in _PLAINID_NAME_CACHE:
+        _fetch_channels_cached()
+    names = _PLAINID_NAME_CACHE.get(num)
+    if not names:
+        return None
+    if len(names) == 1:
+        return names[0]
+
+    # Несколько каналов на одном номере → решает семейство из payload'а.
+    ct = (chat_type or "").lower().strip()
+    if ct in ("telegram", "tg", "tgapi"):
+        family = "telegram"
+    elif ct in ("max", "vk", "maxapi"):
+        family = "max"
+    elif ct in ("whatsapp", "waba", "whatsgroup", "whapi"):
+        family = "whatsapp"
+    else:
+        family = ""
+    if family:
+        cands = [n for n in names if _FAMILY_OF_NAME.get(n) == family]
+        if len(cands) == 1:
+            return cands[0]
+        # Внутри семейства неоднозначность (WABA И Personal на одном
+        # номере) — такие каналы различимы только по channelId, которого
+        # нет. Отдаём 'whatsapp': sender проверяет halt по 'waba', но
+        # иначе мы бы записали доставку в канал, которым не отправляли.
+        if cands:
+            return "whatsapp" if "whatsapp" in cands else cands[0]
+    return None
 
 
 def normalize_phone(phone) -> str:

@@ -42,6 +42,12 @@ def load_contacts(path: str) -> list[dict]:
     # Имя — СТРОГО из столбца «Имя контакта». Любой другой «имя*» игнорируем.
     name_keys_exact = ("имя контакта",)
     cat_keys = ("категория", "статус", "category", "status")
+    # Признак согласия на рассылку. Если в таблице есть такой столбец —
+    # контакты без согласия можно отсечь флагом CONSENT_REQUIRED_FOR_COLD.
+    consent_keys = (
+        "согласие", "согласие на рассылку", "согласие получено",
+        "opt-in", "optin", "opt_in", "consent", "подписка", "рассылка",
+    )
 
     def find_idx(keys: tuple[str, ...]) -> list[int]:
         """Точные совпадения заголовков, в порядке переданных ключей."""
@@ -55,6 +61,7 @@ def load_contacts(path: str) -> list[dict]:
     phone_idxs = find_idx(phone_keys)
     name_idxs = find_idx(name_keys_exact)
     cat_idxs = find_idx(cat_keys)
+    consent_idxs = find_idx(consent_keys)
 
     def pick_phone(row) -> str:
         for i in phone_idxs:
@@ -86,6 +93,13 @@ def load_contacts(path: str) -> list[dict]:
                     return v
         return ""
 
+    def pick_consent(row) -> str:
+        """Признак согласия из таблицы. Пусто = unknown (данных нет)."""
+        for i in consent_idxs:
+            if i < len(row) and row[i]:
+                return str(row[i]).strip().lower()
+        return ""
+
     contacts: list[dict] = []
     seen: set[str] = set()
     skipped_no_phone = 0
@@ -101,5 +115,10 @@ def load_contacts(path: str) -> list[dict]:
         name = pick_name(row)
         category = pick_category(row)
         seen.add(phone)
-        contacts.append({"phone": phone, "name": name, "category": category})
+        contacts.append({
+            "phone": phone,
+            "name": name,
+            "category": category,
+            "consent": pick_consent(row),
+        })
     return contacts

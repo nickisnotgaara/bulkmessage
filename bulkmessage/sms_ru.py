@@ -195,6 +195,84 @@ def is_auth_like_error(status_code: Optional[int]) -> bool:
     return status_code in _ERR_AUTH
 
 
+def is_daily_limit_reached(status_code: int) -> bool:
+    """Код означает: дневной лимит АККАУНТА исчерпан (не лимит на номер).
+
+    206 — «Будет превышен или уже превышен дневной лимит на отправку».
+    Остальные из _ERR_RATE (201, 230-233) относятся к конкретному номеру или
+    к повтору одинакового текста — там номер виноват, а не аккаунт.
+
+    Разница принципиальна для каскада: при 206 SMS-канал надо ОСТАНОВИТЬ на
+    остаток дня, иначе sender будет биться в лимит по каждому rescue-контакту,
+    помечая нормальные номера как failed.
+    """
+    return status_code == 206
+
+
+def get_daily_limit() -> tuple[bool, int, int, str]:
+    """Реальный дневной лимит аккаунта SMS.RU.
+
+    SMS.RU отдаёт его на GET /my/limit?api_id=...&json=1:
+        {"status": "OK", "total_limit": 5000, "used_today": 1250}
+
+    Без этого запроса приходится ГАДАТЬ потолок, а потом discover'ить его
+    через код 206 в середине rescue-очереди. Возвращает
+    (ok, total_limit, used_today, detail).
+    """
+    api_id = (config.SMSRU_API_ID or "").strip()
+    if not api_id:
+        return False, 0, 0, "BULK_SMSRU_API_ID не задан"
+    url = (
+        f"{config.SMSRU_BASE_URL.rstrip('/')}/my/limit"
+        f"?api_id={api_id}&json=1"
+    )
+    try:
+        with urlopen(url, timeout=_HTTP_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+    except (HTTPError, URLError, TimeoutError, OSError,
+            json.JSONDecodeError) as e:
+        return False, 0, 0, f"не удалось получить лимит: {e}"[:200]
+    if not isinstance(data, dict):
+        return False, 0, 0, "неожиданный формат ответа /my/limit"
+    # ВАЖНО: SMS.RU отдаёт total_limit/used_today СТРОКАМИ ("10", а не 10).
+    # Первая версия парсера ждала int, молчала и падала в fallback — лимит
+    # не показывался, а это ровно та цифра, ради которой всё затевалось.
+    total = _as_int(data.get("total_limit"))
+    used = _as_int(data.get("used_today"))
+    if not total:
+        blob = json.dumps(data, ensure_ascii=False)
+        total = _first_int(blob, '"total_limit"')
+        used = _first_int(blob, '"used_today"')
+    if not total:
+        return False, 0, 0, f"нет total_limit в ответе: {str(data)[:150]}"
+    return True, total, used, "OK"
+
+
+def _as_int(v: Any) -> int:
+    """SMS.RU отдаёт числа строками — приводим без потери тишины."""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if s.isdigit():
+            return int(s)
+    return 0
+
+
+def _first_int(blob: str, key: str) -> int:
+    """Первое целое после "key": в JSON-строке. 0 если не нашлось.
+
+    Значение может быть как числом (100), так и строкой ("10") — поэтому
+    допускаем необязательные кавычки.
+    """
+    import re as _re
+    m = _re.search(_re.escape(key) + r'\s*:\s*"?(\d+)"?', blob)
+    return int(m.group(1)) if m else 0
+
+
 def _post_form(path: str, params: dict[str, Any], timeout: int = _HTTP_TIMEOUT):
     """POST form-encoded с одним retry на сетевую ошибку/5xx.
 

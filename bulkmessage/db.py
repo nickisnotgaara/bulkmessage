@@ -35,6 +35,118 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in c.fetchall())
 
 
+# --- Согласие на рассылку (opt-in) -----------------------------------------
+# Ч.1 ст.18 ФЗ-38: реклама по сетям электросвязи, включая мессенджеры, только
+# при предварительном согласии, и БРЕМЯ ДОКАЗЫВАНИЯ лежит на рекламораспространителе.
+# Мета-политика WhatsApp: business-initiated сообщения только opt-in контактам.
+# Поэтому храним согласие явно, а не «где-то в CRM».
+#
+# Три состояния:
+#   granted — есть согласие, можно писать
+#   unknown — данных нет (холодная база). Поведение задаёт
+#            config.CONSENT_REQUIRED_FOR_COLD: 0 = писать (старое поведение),
+#            1 = пропускать
+#   denied  — человек отказался. УВАЖАЕТСЯ ВСЕГДА, независимо от флага:
+#            отписка не обсуждается и не отключается настройкой.
+CONSENT_GRANTED = "granted"
+CONSENT_UNKNOWN = "unknown"
+CONSENT_DENIED = "denied"
+
+_CONSENT_VALUES = (CONSENT_GRANTED, CONSENT_UNKNOWN, CONSENT_DENIED)
+
+
+def normalize_consent(value) -> str:
+    """Приводит любой ввод (из Excel, AmoCRM, API) к трём состояниям."""
+    if value is None:
+        return CONSENT_UNKNOWN
+    s = str(value).strip().lower()
+    if s in ("granted", "yes", "y", "true", "1", "да", "1", "согласие",
+             "согласие получено", "opt-in", "optin", "подписан", "ok", "+"):
+        return CONSENT_GRANTED
+    if s in ("denied", "no", "n", "false", "0", "нет", "отказ", "отписка",
+             "opt-out", "optout", "unsubscribe", "stop", "блок", "-"):
+        return CONSENT_DENIED
+    return CONSENT_UNKNOWN
+
+
+def set_consent(
+    phone: str, value, source: str = "", conn: sqlite3.Connection | None = None
+) -> str:
+    """Проставляет согласие контакту. source — откуда (amocrm_stage, excel, manual).
+
+    ВАЖНО: если контакта ещё нет — он СОЗДАЁтся. Раньше был только UPDATE,
+    и это была дыра в отписке: человек писал «стоп» в первый раз, номера
+    ещё не было в базе, UPDATE не задевал ни одной строки, а контакт
+    потом создавался в process_incoming_message уже с consent='unknown'.
+    Итог: отписка была записана в лог, помечалась обработанной — и терялась.
+    Для ФЗ-38 (ч.1 ст.18) это самая дорогая ошибка такого класса: мы
+    продолжаем писать тому, кто попросил не писать.
+    """
+    st = normalize_consent(value)
+    ts = datetime.now(timezone.utc).isoformat()
+
+    def _apply(c: sqlite3.Connection) -> None:
+        cur = c.execute(
+            "UPDATE contacts SET consent=?, consent_source=?, consent_at=? WHERE phone=?",
+            (st, source or None, ts, phone),
+        )
+        if cur.rowcount == 0:
+            # Контакта не было — создаём, иначе согласие потеряется.
+            c.execute(
+                "INSERT INTO contacts (phone, name, category, consent, "
+                "consent_source, consent_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(phone) DO UPDATE SET consent=excluded.consent, "
+                "consent_source=excluded.consent_source, consent_at=excluded.consent_at",
+                (phone, "", "", st, source or None, ts, ts),
+            )
+
+    if conn is not None:
+        _apply(conn)
+    else:
+        with db_conn() as c2:
+            _apply(c2)
+    return st
+
+
+def get_consent(phone: str) -> str:
+    """Текущее согласие контакта. Если контакта нет — unknown."""
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT consent FROM contacts WHERE phone=?", (phone,))
+        row = c.fetchone()
+    if row is None or not row[0]:
+        return CONSENT_UNKNOWN
+    return row[0] if row[0] in _CONSENT_VALUES else CONSENT_UNKNOWN
+
+
+def may_send_cold(phone: str) -> bool:
+    """Разрешена ли холодная отправка (WABA/TG/MAX/SMS) этому контакту.
+
+    denied → False ВСЕГДА.
+    unknown → по config.CONSENT_REQUIRED_FOR_COLD.
+    granted → True.
+    """
+    st = get_consent(phone)
+    if st == CONSENT_DENIED:
+        return False
+    if st == CONSENT_GRANTED:
+        return True
+    return not getattr(config, "CONSENT_REQUIRED_FOR_COLD", 0)
+
+
+def consent_stats() -> dict:
+    """Сводка по согласию — для отчёта и для понимания риска."""
+    out = {v: 0 for v in _CONSENT_VALUES}
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT consent, COUNT(*) FROM contacts GROUP BY consent")
+        for val, n in c.fetchall():
+            out[val if val in _CONSENT_VALUES else CONSENT_UNKNOWN] = n
+    out["total"] = sum(out[v] for v in _CONSENT_VALUES)
+    return out
+
+
 def init_db() -> None:
     with db_conn() as conn:
         c = conn.cursor()
@@ -45,10 +157,22 @@ def init_db() -> None:
                 phone TEXT UNIQUE NOT NULL,
                 name TEXT,
                 category TEXT,
+                consent TEXT NOT NULL DEFAULT 'unknown',
+                consent_source TEXT,
+                consent_at TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
+        # Миграция для существующих баз: consent-колонки могло не быть.
+        if not _has_column(conn, "contacts", "consent"):
+            c.execute(
+                "ALTER TABLE contacts ADD COLUMN consent TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        if not _has_column(conn, "contacts", "consent_source"):
+            c.execute("ALTER TABLE contacts ADD COLUMN consent_source TEXT")
+        if not _has_column(conn, "contacts", "consent_at"):
+            c.execute("ALTER TABLE contacts ADD COLUMN consent_at TEXT")
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -475,10 +599,17 @@ def init_rescue_queue() -> None:
                 rescued_channel TEXT,
                 rescued_message_id TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                tried_channels TEXT NOT NULL DEFAULT ''
             )
             """
         )
+        # Миграция для БД, созданных до появления tried_channels.
+        if not _has_column(conn, "rescue_queue", "tried_channels"):
+            c.execute(
+                "ALTER TABLE rescue_queue ADD COLUMN tried_channels "
+                "TEXT NOT NULL DEFAULT ''"
+            )
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_rescue_status "
             "ON rescue_queue(status, created_at)"
@@ -535,27 +666,51 @@ def enqueue_rescue(
         return c.lastrowid
 
 
-def pending_rescues(limit: int = 5, cooldown_seconds: int = 60) -> list[dict]:
+def pending_rescues(
+    limit: int = 5,
+    cooldown_seconds: int = 60,
+    original_channel: Optional[str] = None,
+    exclude_tried: Optional[str] = None,
+) -> list[dict]:
     """Возвращает список pending rescues, готовых к обработке.
 
     Не возвращает записи, у которых last_attempt_at свежее cooldown_seconds
     (чтобы не спамить Personal каналы).
+
+    original_channel — фильтр по каналу, на котором была неудача (например
+    'waba'). Нужен фазовой рассылке: фаза Telegram берёт только провалы WABA,
+    а не всё подряд из очереди.
+
+    exclude_tried — канал отката, который для этой записи УЖЕ пробовали
+    (tried_channels). Без этого фильтра фаза MAX брала те же записи, что
+    только что отработала фаза Telegram, и контакт получал второе сообщение.
     """
     from datetime import datetime, timezone, timedelta
 
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=cooldown_seconds)).isoformat()
+    sql = (
+        "SELECT * FROM rescue_queue "
+        "WHERE status = 'pending' "
+        "AND (last_attempt_at IS NULL OR last_attempt_at < ?)"
+    )
+    args: list = [cutoff]
+    if original_channel:
+        sql += " AND original_channel = ?"
+        args.append(original_channel)
+    if exclude_tried:
+        # «telegram» не должен попадать в «telegram,telegram,» — сравниваем
+        # по целому токену, поэтому LIKE с границами через запятую.
+        sql += (
+            " AND (tried_channels IS NULL OR tried_channels = ''"
+            " OR (',' || tried_channels || ',') NOT LIKE ?)"
+        )
+        args.append(f"%,{exclude_tried},%")
+    sql += " ORDER BY created_at ASC LIMIT ?"
+    args.append(limit)
+
     with db_conn() as conn:
         c = conn.cursor()
-        rows = c.execute(
-            """
-            SELECT * FROM rescue_queue
-            WHERE status = 'pending'
-              AND (last_attempt_at IS NULL OR last_attempt_at < ?)
-            ORDER BY created_at ASC
-            LIMIT ?
-            """,
-            (cutoff, limit),
-        ).fetchall()
+        rows = c.execute(sql, args).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -580,6 +735,47 @@ def mark_rescue_attempt(rescue_id: int, error: Optional[str] = None) -> None:
             WHERE id = ?
             """,
             (now, now, rescue_id),
+        )
+
+
+def _split_tried(raw: Optional[str]) -> list[str]:
+    return [x for x in (raw or "").split(",") if x]
+
+
+def rescue_tried_channels(rescue_id: int) -> list[str]:
+    """Какие каналы отката уже пробовали для этой записи."""
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT tried_channels FROM rescue_queue WHERE id = ?",
+            (rescue_id,),
+        ).fetchone()
+    return _split_tried(row["tried_channels"] if row else "")
+
+
+def mark_rescue_tried(rescue_id: int, channel: str) -> None:
+    """Отмечает канал отката как использованный.
+
+    Зачем: без этого одна запись в очереди обслуживалась ВСЕМИ фазами
+    подряд (TG → MAX → SMS), и контакт получал три сообщения подряд в
+    разные каналы — после отказа в первом. Для отказов по номеру (нет
+    аккаунта) это просто мусор, а для отказа с жалобой — прямой путь к
+    бану личного аккаунта.
+    """
+    if not rescue_id or not channel:
+        return
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT tried_channels FROM rescue_queue WHERE id = ?",
+            (rescue_id,),
+        ).fetchone()
+        if row is None:
+            return
+        tried = _split_tried(row["tried_channels"])
+        if channel not in tried:
+            tried.append(channel)
+        conn.execute(
+            "UPDATE rescue_queue SET tried_channels = ?, updated_at = ? WHERE id = ?",
+            (",".join(tried), datetime.now(timezone.utc).isoformat(), rescue_id),
         )
 
 
@@ -661,6 +857,53 @@ def get_all_reachability_for_phone(
         "SELECT * FROM channel_reachability WHERE phone = ?", (phone,)
     ).fetchall()
     return {r["channel"]: r for r in rows}
+
+
+def find_unconfirmed(
+    minutes: int = 60,
+    limit: int = 200,
+    channels: tuple = ("waba", "telegram", "max", "whatsapp"),
+    max_age_hours: int = 24,
+) -> list[sqlite3.Row]:
+    """Сообщения, ПРИНЯТЫЕ транспортом, но БЕЗ подтверждения доставки.
+
+    Это страховка на случай, когда вебхук не пришёл вовсе: без неё сообщение
+    навсегда остаётся в статусе `sent`, и rescue-очередь его никогда не видит
+    — контакт просто тихо исчезает из воронки. Wazzup обычно присылает
+    delivery_status за секунды-минуты, поэтому 60 минут — консервативный порог.
+
+    ВАЖНО: есть и верхняя граница `max_age_hours`. Без неё первый запуск
+    поднял бы в rescue ВСЮ историю (в реальной базе — 150 сообщений от июля,
+    2,5 месяца назад) и повторно отрекламировал бы старым контактам, выбив
+    дневной бюджет. Сторож ловит только «свежее принятое, но не подтверждённое».
+    """
+    c_limit = minutes * 60
+    age_limit = max_age_hours * 3600
+    marks = ",".join("?" * len(channels))
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            f"""
+            SELECT m.id AS message_pk, m.channel, m.message_id, m.sent_at,
+                   m.created_at, ct.id AS contact_id, ct.phone, ct.name,
+                   ct.category
+            FROM messages m
+            JOIN contacts ct ON ct.id = m.contact_id
+            WHERE m.status = 'sent'
+              AND m.delivered_at IS NULL
+              AND m.read_at IS NULL
+              AND m.answered_at IS NULL
+              AND m.channel IN ({marks})
+              AND CAST(strftime('%s','now') AS INTEGER) -
+                  CAST(strftime('%s', COALESCE(m.sent_at, m.created_at)) AS INTEGER) > ?
+              AND CAST(strftime('%s','now') AS INTEGER) -
+                  CAST(strftime('%s', COALESCE(m.sent_at, m.created_at)) AS INTEGER) < ?
+            ORDER BY m.id ASC
+            LIMIT ?
+            """,
+            (*channels, c_limit, age_limit, limit),
+        )
+        return c.fetchall()
 
 
 def waba_recently_failed(phone: str, hours: int = 24) -> bool:

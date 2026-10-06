@@ -102,17 +102,28 @@ def _load_dotenv() -> None:
       .env.local    → локальные overrides (если есть)
       .env.docker   → только в Docker
 
-    Каждый следующий файл override'ит предыдущие. Если переменная
-    уже в os.environ (например, задана через export в shell),
-    она НЕ перезаписывается — это позволяет override'ить
-    секреты через переменные окружения без правки файлов.
+    Каждый следующий файл override'ит предыдущие. Если переменная уже задана
+    в окружении НЕПУСТЫМ значением (например, через export в shell) —
+    она НЕ перезаписывается: это позволяет override'ить секреты через
+    переменные окружения без правки файлов.
+
+    ВАЖНО: пустое значение НЕ считается «уже заданным». Раньше проверка была
+    `if key not in os.environ`, и это ломало всё: в .env лежит
+    `WAZZUP_WEBHOOK_URL=` (пусто), поэтому os.environ получал пустую строку
+    из .env, а .env.local уже не мог её переопределить. Итог: сколько бы ни
+    вписывали webhook URL в .env.local, sender видел пустоту и preflight
+    писал «webhook не задан» — причём молча, без единого предупреждения.
+    Теперь пустое значение пропускается, и .env.local работает как задумано.
     """
     candidates = _candidate_env_files()
     for env_path in candidates:
         parsed = _parse_env_file(env_path)
         for key, val in parsed.items():
-            if key not in os.environ:
-                os.environ[key] = val
+            if os.environ.get(key):
+                continue  # реально задано окружением/более приоритетным файлом
+            if not val:
+                continue  # пустышки ничего не добавляют
+            os.environ[key] = val
 
 
 _load_dotenv()
@@ -179,6 +190,11 @@ SMSRU_API_ID = os.environ.get("BULK_SMSRU_API_ID", "").strip()
 # Буквенный отправитель (alphanumeric sender), согласованный с SMS.RU.
 # Без него SMS.RU отвечает ошибкой 221.
 SMSRU_SENDER_NAME = os.environ.get("BULK_SMSRU_SENDER_NAME", "").strip()
+# Цена одного сегмента SMS по прайсу SMS.RU (НДС включён). Используется только
+# для оценки затрат в логах — реальная цена считается на стороне SMS.RU.
+SMSRU_COST_PER_SEGMENT = float(
+    os.environ.get("BULK_SMSRU_COST_PER_SEGMENT", "8.36") or "8.36"
+)
 # 0 = полностью выключить SMS-канал (каскад работает как раньше, 3 мессенджера).
 SMSRU_ENABLED = int(os.environ.get("BULK_SMSRU_ENABLED", "1") or "1")
 # 1 = добавлять test=1 ко всем вызовам SMS.RU (сервис ничего не отправляет,
@@ -289,6 +305,43 @@ COMPLAINT_HALT_THRESHOLD_WABA = int(os.environ.get("BULK_COMPLAINT_HALT_WABA", "
 COMPLAINT_WINDOW_HOURS = int(os.environ.get("BULK_COMPLAINT_WINDOW_HOURS", "24"))
 COMPLAINT_HALT_DURATION_HOURS = int(
     os.environ.get("BULK_COMPLAINT_HALT_HOURS", "24")
+)
+
+# Circuit breaker: сколько подряд отказов перегрузки (PEER_FLOOD, FLOOD_WAIT,
+# rate-limit) до полной остановки канала на 1 час. Эти ошибки не являются
+# жалобами, поэтому complaint-пороги их не ловят, но по факту канал после
+# серии таких отказов перестаёт отвечать.
+OVERLOAD_STREAK_LIMIT = int(os.environ.get("BULK_OVERLOAD_STREAK_LIMIT", "5"))
+OVERLOAD_HALT_HOURS = int(os.environ.get("BULK_OVERLOAD_HALT_HOURS", "1"))
+
+# Сторож подтверждений: сколько ждать delivery_status, прежде чем считать
+# сообщение недоставленным и отправить контакт в rescue. Вебхук — единственный
+# источник запуска fallback; если он молчит, контакт иначе навсегда остаётся
+# в статусе 'sent' и тихо исчезает. Wazzup присылает статус за секунды-минуты,
+# поэтому 60 минут — консервативный порог с запасом.
+CONFIRM_TIMEOUT_MINUTES = int(
+    os.environ.get("BULK_CONFIRM_TIMEOUT_MINUTES", "60") or "60"
+)
+# Верхняя граница: сторож НЕ трогает сообщения старше этого возраста. Без неё
+# первый запуск поднял бы в rescue всю историю (в реальной базе — 150 сообщений
+# от июля, 2,5 месяца назад) и повторно отрекламировал бы старым контактам,
+# выбив дневной бюджет.
+CONFIRM_MAX_AGE_HOURS = int(
+    os.environ.get("BULK_CONFIRM_MAX_AGE_HOURS", "24") or "24"
+)
+
+# Согласие на рассылку. Ч.1 ст.18 ФЗ-38 + политика Meta: business-initiated
+# сообщения только opt-in контактам, бремя доказывания на рекламораспространителе.
+#
+# 0 (по умолчанию) — писать контактам со статусом consent='unknown' (старое
+#   поведение: вся база считалась рабочей).
+# 1 — писать ТОЛЬКО тем, у кого consent='granted'. Включайте, когда разделите
+#   базу по согласию (например, по этапу сделки в AmoCRM).
+#
+# ВНИМАНИЕ: consent='denied' (отписка) уважается ВСЕГДА, независимо от этого
+# флага. Отключить отписку настройкой нельзя.
+CONSENT_REQUIRED_FOR_COLD = int(
+    os.environ.get("BULK_CONSENT_REQUIRED_FOR_COLD", "0") or "0"
 )
 
 # Adaptive decay: жалоба в день → cap × decay на следующий день.
@@ -428,6 +481,37 @@ ACTIVE_HOURS_END = int(os.environ.get("BULK_ACTIVE_HOURS_END", "0"))
 TARGET_SUCCESS_PER_DAY = int(os.environ.get("BULK_TARGET_SUCCESS_PER_DAY", "60"))
 # Safety cap: максимум попыток в день (чтоб не долбить 24/7 если данные плохие).
 MAX_ATTEMPTS_PER_DAY = int(os.environ.get("BULK_MAX_ATTEMPTS_PER_DAY", "200"))
+
+# --- Фазовая рассылка (WABA-проход → TG → MAX) ---
+# Раньше каскад был по-контактным: waba → tg → max внутри _run_one_contact с
+# break на первом HTTP 2xx. Из-за этого WABA отдавал 2xx на всё, sender считал
+# это успехом, и до Telegram дело не доходило (100 отправок → 28 доставок без
+# переключения). Теперь выбор канала задаётся ФАЗОЙ, а не контактом.
+PHASE_ORDER = [
+    ch.strip()
+    for ch in os.environ.get("BULK_PHASE_ORDER", "waba,telegram,max").split(",")
+    if ch.strip()
+]
+
+# Пауза между последней отправкой фазы WABA и стартом фазы Telegram: столько
+# ждём события `failed` от вебхука. Вебхук — единственный источник подтверждения
+# доставки; без этой паузы фаза TG стартует на пустом списке провалов.
+PHASE_GRACE_MINUTES = int(os.environ.get("BULK_PHASE_GRACE_MINUTES", "5"))
+
+# Сколько дней контакт, которому WABA НЕ доставил, исключается из WABA-пула.
+# НЕОБХОДИМО отдельный маркер: reachability_cache живёт всего 24 часа
+# (REACHABILITY_CACHE_TTL_HOURS), и без этого контакт на следующий день снова
+# получил бы один из 250 драгоценных WABA-слотов, хотя заведомо не доходит.
+WABA_EXHAUSTED_TTL_DAYS = int(os.environ.get("BULK_WABA_EXHAUSTED_TTL_DAYS", "30"))
+
+# Детерминированные задержки вместо случайных: перед каждой отправкой фазы
+# ждём clamp(остаток_окна / остаток_сообщений, MIN, MAX). Так фаза гарантированно
+# укладывается в своё окно. При случайных 300-900с суммарное σ для 45 сообщений
+# ≈19 минут, а запас был всего 20 — то есть ~10% вероятности вылеза за 19:00.
+PHASE_DETERMINISTIC_DELAY = os.environ.get(
+    "BULK_PHASE_DETERMINISTIC_DELAY", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
 
 
 def is_within_active_hours(dt: datetime | None = None) -> bool:
@@ -622,24 +706,19 @@ def preflight_check(test_phone: str = "") -> dict:
 
     # Нормализуем: channels может быть list[dict] или dict (Wazzup API менялся).
     live_channel_ids: set[str] = set()
-    if isinstance(channels, list):
-        for c in channels:
-            if isinstance(c, dict):
-                cid = c.get("channelId")
-                if isinstance(cid, str) and cid:
-                    live_channel_ids.add(cid)
-    elif isinstance(channels, dict):
-        for v in channels.values():
-            if isinstance(v, dict):
-                cid = v.get("channelId")
-                if isinstance(cid, str) and cid:
-                    live_channel_ids.add(cid)
-            elif isinstance(v, list):
-                for c in v:
-                    if isinstance(c, dict):
-                        cid = c.get("channelId")
-                        if isinstance(cid, str) and cid:
-                            live_channel_ids.add(cid)
+
+    def _collect_ids(node) -> None:
+        if isinstance(node, dict):
+            cid = node.get("channelId")
+            if isinstance(cid, str) and cid:
+                live_channel_ids.add(cid)
+            for v in node.values():
+                _collect_ids(v)
+        elif isinstance(node, list):
+            for v in node:
+                _collect_ids(v)
+
+    _collect_ids(channels)
 
     for ch in active:
         expected_cid = wazzup.channel_id_for(ch)
@@ -659,5 +738,19 @@ def preflight_check(test_phone: str = "") -> dict:
             result["channels"][ch] = {
                 "ok": True, "detail": f"channelId={expected_cid[:8]}…", "http": 200
             }
+
+    # Инвентаризация каналов. В Wazzup «канал» = один аккаунт мессенджера, и
+    # оплата идёт за КАЖДЫЙ канал отдельно. Поэтому полезно видеть, сколько
+    # каналов реально оплачено, а сколько из них задействовано конфигом:
+    # bulkmessage адресует ровно один UUID на канал (get_wazzup_channel_id_for),
+    # поэтому лишние каналы в аккаунте молча простаивают.
+    used_ids = {wazzup.channel_id_for(ch) for ch in active if wazzup.channel_id_for(ch)}
+    unused_ids = sorted(live_channel_ids - used_ids) if live_channel_ids else []
+    result["channel_inventory"] = {
+        "live_total": len(live_channel_ids),
+        "used": len(used_ids),
+        "unused": len(unused_ids),
+        "unused_ids": unused_ids[:20],
+    }
 
     return result

@@ -55,6 +55,45 @@ def process_incoming_message(channel: str, msg: dict) -> None:
 
     log.info(f"📩 REPLY received: {phone} via {channel}: {raw_text[:120]}")
 
+    # --- Авто-отписка --------------------------------------------------------
+    # Человек написал «стоп» — это отказ от рассылки. Зак. ст.18 ФЗ-38 требует
+    # прекратить отправку по его отказу, а Meta считает игнорирование отписки
+    # жалобой. Ловим и русские, и английские формулировки.
+    _low = raw_text.strip().lower().strip(".,!?… ")
+    _optout_stems = (
+        "стоп", "stop", "stop_", "unsubscribe", "отпишись", "отписка",
+        "не пиши", "не пишите", "не беспокоить", "не надо писать",
+        "не interested", "удали", "удалите", "удали меня", "отказаться",
+    )
+    if any(_low.startswith(s) or s in _low for s in _optout_stems):
+        try:
+            db.set_consent(phone, db.CONSENT_DENIED, source=f"auto_optout:{channel}")
+            log.warning(
+                f"🚫 OPT-OUT: {phone} отказался от рассылки "
+                f"(«{raw_text[:40]}») — больше не пишем ни в один канал"
+            )
+        except Exception as e:
+            log.warning(f"opt-out save failed for {phone}: {e}")
+
+    # 24ч-окно WABA открывает ОТВЕТ КОНТАКТА. Раньше это не фиксировалось
+    # вообще, поэтому sender всегда считал окно закрытым и слал шаблон даже
+    # тем, кто ответил (упущенная возможность), а на повторном касании
+    # наоборот уходил в free text не отвечавшему (Meta → 131047).
+    if channel in ("waba", "whatsapp"):
+        try:
+            from datetime import datetime, timezone as _tz
+            from . import state as _st
+            _cur = _st.load_state()
+            _st.reset_daily_if_new_day(_cur)
+            _st.set_waba_inbound_meta(
+                _cur, phone, datetime.now(_tz.utc).isoformat())
+            _st.save_state(_cur)
+            log.info(
+                f"   🪟 24ч-окно WABA открыто для {phone} (ответ контакта)"
+            )
+        except Exception as e:
+            log.warning(f"waba inbound window update failed: {e}")
+
     with db.db_conn() as conn:
         contact = db.get_contact_by_phone(conn, phone)
         if not contact:
@@ -159,7 +198,21 @@ def process_delivery_status(channel: str, msg: dict) -> None:
         elif status == "read":
             kwargs.update({"status": "read", "delivered_at": True, "read_at": True})
         elif status == "failed":
-            kwargs.update({"status": "failed", "last_error": msg.get("status", "failed")})
+            # Причина отказа лежит в `detail`, а status всегда равен
+            # 'error'/'failed'. Раньше сюда писался status, и в БД у всех
+            # провалов стояло одинаковое 'error' — разобрать, что именно
+            # сломалось (PHONE_NOT_OCCUPIED / PEER_FLOOD / rate-limit),
+            # было невозможно. В rescue-очередь причина шла правильно,
+            # в messages терялась.
+            _reason = (
+                msg.get("detail")
+                or (msg.get("error") if isinstance(msg.get("error"), str) else None)
+                or status
+            )
+            kwargs.update({
+                "status": "failed",
+                "last_error": str(_reason)[:200],
+            })
         else:
             kwargs["status"] = status
         db.update_message_status(conn, **kwargs)
@@ -169,6 +222,74 @@ def process_delivery_status(channel: str, msg: dict) -> None:
     sync_message_to_sheet(
         contact_id=contact_id, channel=channel, status=status, message_pk=message_pk
     )
+
+    # Phase 8: доставка подтверждена вебхуком — только теперь это «доставлено».
+    # accepted_today уже был увеличен в момент HTTP 2xx; здесь мы доводим
+    # счётчик доставки. Именно эта пара счётчиков делает fallback возможным:
+    # без подтверждения неизвестно, дошло сообщение или нет.
+    try:
+        from . import state as state_mod
+        cur_state = state_mod.load_state()
+        cur_state = state_mod.reset_daily_if_new_day(cur_state)
+        if status in ("delivered", "read"):
+            state_mod.record_delivered(cur_state, channel)
+            state_mod.record_delivery_outcome(cur_state, channel, ok=True)
+            # Cooldown по паре (номер, канал): только подтверждённая доставка
+            # включает откат на 96ч. Неподтверждённая отправка (свип уведёт её
+            # в rescue) контакт не должна запирать.
+            # `phone` сверху — это ОТПРАВИТЕЛЬ в status-вебхуке, поэтому
+            # номер берём из БД по contact_id, а не из payload.
+            if contact_id:
+                with db.db_conn() as conn3:
+                    row3 = conn3.execute(
+                        "SELECT phone FROM contacts WHERE id = ?", (contact_id,)
+                    ).fetchone()
+                if row3 and row3["phone"]:
+                    from datetime import datetime as _dt, timezone as _tz
+                    state_mod.record_delivery_confirmed(
+                        cur_state, row3["phone"], channel, _dt.now(_tz.utc).isoformat()
+                    )
+            log.info(
+                f"   📊 доставлено подтверждено: {channel} "
+                f"delivered_today={state_mod.channel_delivered_today(cur_state, channel)}"
+            )
+        elif status == "failed":
+            state_mod.record_failed_delivery(cur_state, channel)
+            # WABA: явный failed от вебхука — единственный сигнал, по которому
+            # номер выводится из WABA-пула. reachability_cache ниже протухает
+            # за 24ч, а нам номер нужно исключать надолго (по умолчанию 30
+            # дней), иначе он завтра снова заберёт один из 250 слотов, хотя
+            # заведомо не доходит. Phone — из БД по contact_id: в статусном
+            # вебхуке поле from это ОТПРАВИТЕЛЬ.
+            if channel == "waba" and contact_id:
+                with db.db_conn() as conn4:
+                    row4 = conn4.execute(
+                        "SELECT phone FROM contacts WHERE id = ?", (contact_id,)
+                    ).fetchone()
+                if row4 and row4["phone"]:
+                    state_mod.mark_waba_exhausted(
+                        cur_state, row4["phone"],
+                        (msg.get("detail") or msg.get("error") or "failed")[:200],
+                    )
+                    log.info(
+                        f"   🚫 WABA исчерпан: {row4['phone']} исключён из "
+                        f"WABA-пула на "
+                        f"{getattr(config, 'WABA_EXHAUSTED_TTL_DAYS', 30)} дней"
+                    )
+            # Circuit breaker: серия PEER_FLOOD/FLOOD_WAIT/rate-limit гасит канал.
+            # Причина лежит в detail, а не в status (status всегда "error").
+            tripped = state_mod.record_delivery_outcome(
+                cur_state, channel, ok=False,
+                error_text=(msg.get("detail") or msg.get("status") or ""),
+            )
+            if tripped:
+                log.error(
+                    f"   🛑 CIRCUIT BREAKER: {channel} остановлен на 1ч "
+                    f"после серии отказов перегрузки"
+                )
+        state_mod.save_state(cur_state)
+    except Exception as e:
+        log.warning(f"delivery accounting failed: {e}")
 
     # Phase 7: reachability cache update (используется cascade'ом как pre-check).
     # Если WABA delivery status == 'delivered'/'read' → этот канал reachable.
@@ -193,9 +314,12 @@ def process_delivery_status(channel: str, msg: dict) -> None:
         except Exception as e:
             log.warning(f"reachability cache update failed: {e}")
 
-    # Phase 7: rescue queue — WABA delivery failure → cascade TG/MAX.
-    # Sender reads queue between contacts и шлёт Personal автоматически.
-    if channel == "waba" and status == "failed":
+    # Phase 7: rescue queue — доставка не удалась → следующий канал каскада.
+    # Раньше условие было `channel == "waba"`, но канал в вебхуке без channelId
+    # определяется как "whatsapp", поэтому ветка была недостижима и очередь
+    # оставалась пустой при 899 отказах. Теперь rescue работает для любого канала.
+    RESCUE_SKIP = ("sms",)  # SMS — последний в каскаде, откатываться некуда
+    if status == "failed" and channel not in RESCUE_SKIP:
         try:
             contact_phone = None
             contact_name = None
@@ -210,35 +334,50 @@ def process_delivery_status(channel: str, msg: dict) -> None:
                     contact_name = crow["name"]
                     contact_category = crow["category"]
             if contact_phone:
-                reason = (msg.get("status") or "delivery_failed")[:200]
+                # Причина из detail — в нём лежит реальная ошибка
+                # (PHONE_NOT_OCCUPIED, no LID found, PEER_FLOOD, ...),
+                # тогда как status всегда равен "error".
+                reason = (msg.get("detail") or msg.get("status") or "delivery_failed")[:200]
                 rid = db.enqueue_rescue(
                     phone=contact_phone,
                     name=contact_name,
                     category=contact_category,
-                    original_channel="waba",
+                    original_channel=channel,
                     reason=reason,
                 )
                 log.info(
-                    f"🚑 WABA failed → enqueued for rescue (id={rid}, phone={contact_phone})"
+                    f"🚑 {channel} failed → enqueued for rescue "
+                    f"(id={rid}, phone={contact_phone}, reason={reason[:60]})"
                 )
         except Exception as e:
             log.warning(f"rescue enqueue failed: {e}")
 
-    # Phase 3.6: complaint halt — если error сигналит о жалобе (spam/report).
-    error_blob = msg.get("error") or {}
+    # Phase 3.6: complaint halt — если error/detail сигналит о жалобе (spam/report).
+    # Wazzup присылает причину строкой в `detail`, а объектного `error` в
+    # доставленных статусах не бывает вовсе — поэтому раньше эта логика
+    # не срабатывала ни разу и таблица complaint_events оставалась пустой.
+    error_blob = msg.get("error") or msg.get("detail") or {}
     if isinstance(error_blob, dict):
-        err_code = (error_blob.get("error") or error_blob.get("code") or "").lower()
-        err_kind = (error_blob.get("description") or "").lower()
+        err_code = str(
+            error_blob.get("error") or error_blob.get("code") or ""
+        ).lower()
+        err_kind = str(
+            error_blob.get("description") or error_blob.get("detail") or ""
+        ).lower()
     else:
         err_code = str(error_blob).lower()
         err_kind = ""
+    # Нормализованный haystack: код + текст описания
+    haystack = f"{err_code} {err_kind}"
     spam_markers = (
-        "spam", "spam_report", "report_spam", "user_complaint",
-        "block", "blocked", "quality_red", "low_quality",
+        "spam", "spam_report", "report_spam", "user_complaint", "complaint",
+        "block", "blocked", "quality_red", "low_quality", "reason_blocked",
     )
-    if any(m in err_code for m in spam_markers) or any(m in err_kind for m in spam_markers):
+    if any(m in haystack for m in spam_markers):
         try:
-            _record_complaint_and_maybe_halt(channel, kind=err_code or "spam_report")
+            _record_complaint_and_maybe_halt(
+                channel, kind=(err_code or "spam_report")[:100]
+            )
         except Exception as e:
             log.warning(f"complaint halt handler error: {e}")
 
@@ -288,7 +427,8 @@ def process_outgoing_message(channel: str, msg: dict) -> None:
 # ============================================================
 
 
-def _wazzup_chat_type_to_channel(chat_type: str, channel_id: str = "") -> str:
+def _wazzup_chat_type_to_channel(chat_type: str, channel_id: str = "",
+                                 raw_ids: Optional[list] = None) -> str:
     """Маппинг Wazzup chatType (+ channelId) → bulkmessage channel name.
 
     Wazzup chatType: 'whatsapp' | 'telegram' | 'max' | 'viber' | 'instagram' |
@@ -298,55 +438,84 @@ def _wazzup_chat_type_to_channel(chat_type: str, channel_id: str = "") -> str:
 
     Приоритет:
       1. Если задан channelId и он есть в кэше Wazzup → берём из кэша.
-      2. Иначе маппим по chatType (Telegram/MAX уникальны).
-      3. Для chatType='whatsapp' без channelId → fallback 'whatsapp' (старый код).
+      2. Если channelId НЕ пришёл (а в реальных payload'ах он не приходит
+         ни разу — 0 из 139 сохранённых событий) → определяем канал по
+         номеру нашего аккаунта из raw_ids (from/to/chat_id + '@c.us').
+      3. Иначе маппим по chatType (Telegram/MAX уникальны).
+      4. Для chatType='whatsapp' без channelId → fallback 'whatsapp'.
     """
-    # 1. По channelId (точнее, учитывает WABA vs Personal)
+    from . import wazzup as _wz
+    # 1) channelId — если вдруг придёт.
     if channel_id:
-        from . import wazzup as _wz
         name = _wz.channel_name_for(channel_id)
         if name:
             return name
 
-    # 2. По chatType (для TG/MAX, где он однозначен)
+    # 2) Номер нашего аккаунта из payload'а. Это рабочий путь: Wazzup шлёт
+    #    'to'/'chat_id'/'from' с нашим же номером + '@c.us'.
+    for raw in (raw_ids or []):
+        name = _wz.channel_name_for_raw(raw, chat_type)
+        if name:
+            return name
+
+    # 3) chatType — для TG/MAX он однозначен.
     ct = (chat_type or "").lower().strip()
     if ct in ("telegram", "tg", "tgapi"):
         return "telegram"
     if ct in ("max", "vk", "maxapi"):
         return "max"
 
-    # 3. Fallback
+    # 4) Fallback
     if ct in ("whatsapp", "waba", "whatsgroup"):
         return "whatsapp"
     return "whatsapp"  # неизвестное → как раньше (default)
 
 
 def _wazzup_extract_message(msg: dict) -> dict:
-    """Нормализует message payload от Wazzup к плоскому виду для process_incoming_message.
+    """Нормализует message payload от Wazzup к плоскому виду.
 
-    Wazzup fields:
-      - messageId (uuid)
-      - chatType (whatsapp/telegram/...)
-      - chatId   (phone or username)
-      - text
-      - timestamp
-      - type: 'incoming' | 'outgoing' | 'status'
-      - status: 'sent' | 'delivered' | 'read' | 'error'
-      - error: {code, description}
-      - channelId
+    Wazzup реально шлёт payload'ы, которые НЕ совпадают с документацией:
+
+      - идентификатор приходит в ``id`` (а не в ``messageId``); в 132 из 138
+        сохранённых событий ``delivery_status`` ключ ``messageId`` отсутствует
+        полностью. Для части событий ``id`` пустой, но есть запасной ``task_id``.
+      - текст сообщения приходит в ``text`` либо ``body``.
+      - ошибка приходит строкой в ``detail``, а не объектом в ``error``
+        (в 132 сохранённых событиях ``error`` не встречается ни разу).
+      - тип канала приходит в ``platform``, а ``chatType`` в событиях
+        ``delivery_status`` отсутствует (0 из 138).
+
+    Поэтому читаем все известные варианты каждого поля.
     """
+    message_id = (
+        msg.get("id")
+        or msg.get("messageId")
+        or msg.get("message_id")
+        or msg.get("task_id")
+    )
+    chat_id = msg.get("chatId") or msg.get("chat_id") or msg.get("to")
+    body = msg.get("text") or msg.get("body") or ""
+    # Wazzup отдаёт ошибку строкой в detail; некоторые каналы — объектом в error.
+    error = msg.get("error")
+    detail = msg.get("detail")
+    if not error and detail:
+        error = {"description": str(detail)}
     return {
-        "id": msg.get("messageId"),
-        "message_id": msg.get("messageId"),
-        "body": msg.get("text") or "",
+        "id": message_id,
+        "message_id": message_id,
+        "body": body,
         "type": msg.get("type"),
-        "chatId": msg.get("chatId"),
-        "chat_id": msg.get("chatId"),
-        "from": msg.get("chatId"),  # входящее = от chatId
+        "chatId": chat_id,
+        "chat_id": chat_id,
+        "from": chat_id,  # входящее = от chatId
         "status": msg.get("status"),
-        "error": msg.get("error"),
+        "error": error,
+        "detail": str(detail) if detail else None,
         "timestamp": msg.get("timestamp"),
         "channelId": msg.get("channelId"),
+        "profile_id": msg.get("profile_id"),
+        # chat_type — то, чем реально пользуется вызов _wazzup_chat_type_to_channel
+        "chatType": (msg.get("chatType") or msg.get("platform") or "").strip().lower(),
     }
 
 
@@ -362,35 +531,50 @@ def process_wazzup_payload(channel_hint: Optional[str], payload: dict) -> None:
     """
     if not isinstance(payload, dict):
         return
-    # Wazzup может слать как list, так и dict-with-list. Нормализуем.
+    # Wazzup реально присылает {"messages": {...}} — СЛОВАРЬ, а не список.
+    # Раньше код разворачивал конверт только если это был list, поэтому 138 из 162
+    # сохранённых payload'ов молча уходили в `ignored event type=''` и при этом
+    # помечались обработанными. Отсюда были пустыми rescue_queue, complaint_events
+    # и channel_reachability.
     items: list = []
-    if "messages" in payload and isinstance(payload["messages"], list):
-        items = payload["messages"]
-    elif "events" in payload and isinstance(payload["events"], list):
-        items = payload["events"]
-    else:
-        # Один объект — оборачиваем в list
+    for key in ("messages", "events"):
+        node = payload.get(key)
+        if isinstance(node, list):
+            items.extend(node)
+        elif isinstance(node, dict):
+            items.append(node)
+    if not items:
+        # Один объект без конверта — оборачиваем
         items = [payload]
 
     for evt in items:
         if not isinstance(evt, dict):
             continue
+        # wh_type — тип события Wazzup. Он должен идти ПЕРЕД type, потому что
+        # в реальных payload'ах поле `type` заполнено ('text'/'chat'/...) и
+        # затеняло wh_type, из-за чего событие не попадало ни в одну ветку.
         evt_type = (
-            evt.get("type")
+            evt.get("wh_type")
+            or evt.get("type")
             or evt.get("event")
-            or evt.get("wh_type")
             or ""
         ).lower()
 
         try:
-            # Канал определяем из payload'а (chatType + channelId), а не из channel_hint.
-            # hint переопределяет только если он задан (для обратной совместимости).
-            # chatType от Wazzup: whatsapp | telegram | max | viber | instagram | …
-            # channelId нужен для различения WABA vs Personal WA (chatType='whatsapp'
-            # для обоих).
-            chat_type = (evt.get("chatType") or "").strip().lower()
+            # Канал: chatType у delivery_status отсутствует, но есть platform.
+            # channelId — единственный способ отличить WABA от Personal WA,
+            # но и он в 132 из 138 событий не приходит.
+            chat_type = (
+                evt.get("chatType") or evt.get("platform") or ""
+            ).strip().lower()
             evt_channel_id = (evt.get("channelId") or "").strip()
-            ch = channel_hint or _wazzup_chat_type_to_channel(chat_type, evt_channel_id)
+            ch = channel_hint or _wazzup_chat_type_to_channel(
+                chat_type, evt_channel_id,
+                # Наш собственный номер: в status-событии это `from`,
+                # во входящем — `chat_id`/`chatId` (уже с '@c.us').
+                [evt.get("from"), evt.get("to"), evt.get("chat_id"),
+                 evt.get("chatId"), evt.get("chat_id_full")],
+            )
 
             if evt_type in ("incoming_message", "message", "incoming"):
                 msg = _wazzup_extract_message(evt)
@@ -515,6 +699,96 @@ def reconcile_pending_webhooks() -> None:
                     (str(e)[:500], row["id"]),
                 )
             log.warning(f"Pending webhook {row['id']} retry failed: {e}")
+
+
+def sweep_unconfirmed_deliveries(limit: int = 50) -> int:
+    """Сторож подтверждений: принято, но не подтверждено доставкой.
+
+    Вебхук — единственный источник, который запускает fallback. Если он
+    потерян или подписка молчит, сообщение навсегда остаётся в статусе
+    `sent`: rescue-очередь его не видит, и контакт тихо исчезает из воронки.
+    Именно это и приводило к «100 отправлено → 28 дошло»: недоставки были,
+    а узнать о них было негде.
+
+    Здесь мы делаем «молчание» явным: помечаем сообщение как `failed`
+    с причиной `no_delivery_confirmation` и ставим контакт в rescue-очередь,
+    откуда sender отправит его следующим каналом.
+
+    Возвращает количество контактов, отправленных в rescue.
+    """
+    minutes = getattr(config, "CONFIRM_TIMEOUT_MINUTES", 60)
+    max_age = getattr(config, "CONFIRM_MAX_AGE_HOURS", 24)
+    try:
+        rows = db.find_unconfirmed(
+            minutes=minutes, limit=limit, max_age_hours=max_age
+        )
+    except Exception as e:
+        log.warning(f"sweep_unconfirmed: выборка не удалась: {e}")
+        return 0
+
+    if not rows:
+        return 0
+
+    log.warning(
+        f"🔍 Сторож подтверждений: {len(rows)} сообщений приняты, но доставка "
+        f"не подтверждена за {minutes} мин (webhook молчит?) — отправляю в rescue"
+    )
+
+    swept = 0
+    try:
+        from . import state as state_mod
+        cur_state = state_mod.load_state()
+        cur_state = state_mod.reset_daily_if_new_day(cur_state)
+    except Exception:
+        cur_state = {}
+
+    with db.db_conn() as conn:
+        for r in rows:
+            channel = r["channel"]
+            try:
+                db.update_message_status(
+                    conn,
+                    message_pk=r["message_pk"],
+                    status="failed",
+                    last_error="no_delivery_confirmation",
+                )
+            except Exception as e:
+                log.warning(f"sweep: не пометить {r['message_id']}: {e}")
+                continue
+
+            # SMS — последний в каскаде, откатываться некуда
+            if channel == "sms":
+                continue
+
+            try:
+                db.enqueue_rescue(
+                    phone=r["phone"],
+                    name=r["name"],
+                    category=r["category"],
+                    original_channel=channel,
+                    reason="no_delivery_confirmation",
+                )
+                swept += 1
+            except Exception as e:
+                log.warning(f"sweep: rescue не поставить {r['phone']}: {e}")
+
+            try:
+                if cur_state:
+                    state_mod.record_failed_delivery(cur_state, channel)
+                    state_mod.record_delivery_outcome(
+                        cur_state, channel, ok=False,
+                        error_text="no_delivery_confirmation",
+                    )
+            except Exception:
+                pass
+
+    if cur_state:
+        try:
+            state_mod.save_state(cur_state)
+        except Exception:
+            pass
+    log.info(f"🔍 Сторож: {swept} контактов отправлены в rescue")
+    return swept
 
 
 def reconcile_message_statuses() -> None:

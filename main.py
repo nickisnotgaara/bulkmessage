@@ -74,12 +74,15 @@ if __name__ == "__main__":
     elif mode == "preflight":
         from bulkmessage.preflight import run_preflight
         sys.exit(run_preflight())
+    elif mode == "report":
+        from bulkmessage.report import main as run_report
+        sys.exit(run_report())
     elif mode == "reset-state":
         from bulkmessage.preflight import reset_state
         sys.exit(reset_state())
     else:
         print(
-            f"Unknown mode: {mode}. Use 'sender'|'tracker'|'preflight'|'reset-state'.",
+            f"Unknown mode: {mode}. Use 'sender'|'tracker'|'preflight'|'report'|'reset-state'.",
             file=sys.stderr,
         )
         sys.exit(1)

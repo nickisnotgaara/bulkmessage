@@ -123,6 +123,22 @@ def run_preflight() -> int:
             print("  ℹ️  BULK_SMSRU_TEST_MODE=1 — ко всем вызовам добавляется test=1")
         else:
             print("  ℹ️  BULK_SMSRU_TEST_MODE=0 — SMS.RU будет слать РЕАЛЬНЫЕ SMS")
+        # Реальный потолок аккаунта SMS.RU. Без этого запроса приходится
+        # гадать лимит, а потом discover'ить его через код 206 в середине
+        # rescue-очереди. Схема «WABA + хвост в SMS» держится целиком на нём.
+        try:
+            _lok, _total, _used, _ldet = sms_ru.get_daily_limit()
+            if _lok:
+                _rem = max(0, _total - _used)
+                all_ok &= _check(
+                    "SMS.RU дневной лимит",
+                    _total >= state.channel_effective_cap(state.load_state(), "sms"),
+                    f"использовано {_used} из {_total}, осталось {_rem}",
+                )
+            else:
+                _check("SMS.RU дневной лимит", False, _ldet)
+        except Exception as e:  # pragma: no cover - defensive
+            _check("SMS.RU дневной лимит", False, f"exception: {e}")
         if not config.DRY_RUN and config.SMSRU_API_ID and name_ok:
             # test=1: SMS.RU ничего не отправляет и не списывает баланс.
             print("  … проверка связи с SMS.RU (test=1, без трат)…")
@@ -169,6 +185,51 @@ def run_preflight() -> int:
     else:
         print("\n── 4. WAZZUP24 API & WEBHOOK ──")
         _check("Skipped (USE_WABA=0)", True, "set BULK_USE_WABA=1 to enable")
+
+    # 4.1 Инвентаризация каналов Wazzup.
+    # В Wazzup «канал» = один аккаунт мессенджера, и оплата идёт за КАЖДЫЙ
+    # канал отдельно. Показываем, сколько каналов подключено и сколько из
+    # них задействовано конфигом: bulkmessage адресует ровно один channelId на
+    # канал (config.get_wazzup_channel_id_for), поэтому «второй аккаунт» в
+    # текущем коде адресовать нечем.
+    # Запрос GET /v3/channels ничего не отправляет, поэтому он НЕ под гейтом
+    # DRY_RUN — иначе инвентаризация была бы не видна ровно на preflight,
+    # который запускают перед боевым стартом.
+    if use_waba and wazzup.is_configured():
+        print("\n── 4.1 КАНАЛЫ WAZZUP (инвентаризация) ──")
+        try:
+            _ok, _detail, _ch = wazzup.get_wazzup_channels()
+            if not _ok:
+                _check("инвентаризация каналов", False, _detail[:80])
+            else:
+                _live = set()
+
+                def _ids(node):
+                    if isinstance(node, dict):
+                        cid = node.get("channelId")
+                        if isinstance(cid, str) and cid:
+                            _live.add(cid)
+                        for v in node.values():
+                            _ids(v)
+                    elif isinstance(node, list):
+                        for v in node:
+                            _ids(v)
+
+                _ids(_ch)
+                _used = {wazzup.channel_id_for(c) for c in active}
+                _used.discard("")
+                _unused = sorted(_live - _used)
+                _check("каналов подключено", True,
+                       f"всего {len(_live)}, задействовано {len(_used)}, "
+                       f"не используется {len(_unused)}")
+                if _unused:
+                    print("      " + ", ".join(u[:8] + "…" for u in _unused[:10])
+                          + (" …" if len(_unused) > 10 else ""))
+                    print("      ⚠️  каждый канал оплачивается отдельно; эти "
+                          "оплачены, но адресовать их нечем — код знает "
+                          "ровно 1 channelId на канал")
+        except Exception as e:  # pragma: no cover - defensive
+            _check("инвентаризация каналов", False, f"exception: {e}"[:80])
 
     # 5. WABA templates (UUID format required!)
     print("\n── 5. WABA TEMPLATES (4 categories, UUID format) ──")
