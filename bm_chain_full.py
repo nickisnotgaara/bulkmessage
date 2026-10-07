@@ -273,7 +273,7 @@ con.execute("UPDATE messages SET sent_at = datetime('now','-2 minutes') "
 con.commit()
 con.close()
 from bulkmessage.reconcile import sweep_unconfirmed_deliveries  # noqa: E402
-sweep_unconfirmed_deliveries(limit=200, minutes=0)
+sweep_unconfirmed_deliveries(limit=200, minutes=0, unknown_minutes=0)
 
 con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
 deferred = con.execute("SELECT COUNT(*) FROM rescue_queue "

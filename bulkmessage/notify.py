@@ -36,6 +36,22 @@ log = logging.getLogger("notify")
 _SENT: list = []
 _THROTTLE: list = []          # таймстемпы отправок за последний час
 _AGG: dict = defaultdict(int)  # успехи, ещё не отправленные агрегатом
+_PER_CONTACT_USED: int = 0     # построчных сообщений в этом прогоне
+
+
+def _per_contact_allowed() -> bool:
+    """Построчный режим и его бюджет на прогон.
+
+    Владельцу нужен статус по каждому контакту, но на 250 контактах это 250
+    сообщений в день. Поэтому режим включается флагом и ограничен потолком:
+    исчерпали — дальше идёт агрегат, ничего не теряется молча.
+    """
+    if not int(getattr(config, "TG_PER_CONTACT", 1)):
+        return False
+    if _PER_CONTACT_USED >= int(getattr(config, "TG_PER_CONTACT_MAX", 120)):
+        return False
+    globals()["_PER_CONTACT_USED"] = _PER_CONTACT_USED + 1
+    return True
 
 
 def _prune_throttle() -> None:
@@ -133,12 +149,88 @@ def event(text: str, level: str = "WARNING") -> None:
     _send(text, level)
 
 
-def channel_switch(phone: str, frm: str, to: str, reason: str) -> None:
-    """Контакт ушёл в другой канал — главное событие для владельца."""
+def channel_switch(phone: str, frm: str, to: str, reason: str,
+                   name: str = "") -> None:
+    """Контакт ушёл в другой канал — главное событие для владельца.
+
+    Раньше сюда уходила строка вроде «🔀 296118091: waba → telegram → max,
+    причина: молчание». По ней невозможно было понять, КТО контакт, что с ним
+    случилось и — главное — что отправки в следующий канал ещё не было:
+    «в очередь» и «отправлено» визуально неразличимы.
+    """
+    who = f"{name} · {phone}" if name else phone
     _send(
-        f"🔀 {phone[-6:]}: {frm} → {to}\n    причина: {reason[:120]}",
+        f"🔀 {who}\n"
+        f"    {frm} НЕ доставил → ставлю в очередь отката → {to}\n"
+        f"    причина: {reason[:140]}",
         "INFO",
     )
+
+
+def contact_sent(phone: str, name: str, channel: str, detail: str = "") -> None:
+    """Статус по контакту: отправка принята транспортом."""
+    if not _per_contact_allowed():
+        return
+    who = f"{name} · {phone}" if name else phone
+    tail = f"\n    {detail[:120]}" if detail else ""
+    _send(f"📤 {who} → {channel} ✅ принято{tail}", "INFO")
+
+
+def contact_failed(phone: str, name: str, channel: str, reason: str,
+                   next_channels: str = "") -> None:
+    """Статус по контакту: канал отказал, контакт уходит в откат."""
+    if not _per_contact_allowed():
+        return
+    who = f"{name} · {phone}" if name else phone
+    nxt = f" → откат: {next_channels}" if next_channels else " → откат"
+    _send(
+        f"📤 {who} → {channel} ❌ НЕ доставил{nxt}\n"
+        f"    {_human_reason(reason)}",
+        "WARNING",
+    )
+
+
+def contact_skipped(phone: str, name: str, channel: str, reason: str) -> None:
+    """Контакт не трогали: причина видна внятно, а не кодом."""
+    if not _per_contact_allowed():
+        return
+    who = f"{name} · {phone}" if name else phone
+    _send(f"⏭️ {who} · {channel}: {_human_reason(reason)}", "INFO")
+
+
+_REASON_RU = (
+    ("no_delivery_confirmation", "нет подтверждения доставки (вебхук молчит)"),
+    ("silent_no_confirmation", "молчание канала, подтверждения нет"),
+    ("delivery_rejected", "канал явно отказал в доставке"),
+    ("delivery_failed", "канал отклонил сообщение"),
+    ("131049", "Meta: контакт уже получил маркетинг сегодня"),
+    ("marketing", "Meta не разрешает шаблон «Маркетинг» этому контакту"),
+    ("CHANNEL_MAX_PHONE_NOT_OCCUPIED", "номер не заведён в MAX"),
+    ("CHAT_WRITE_FORBIDDEN", "Telegram: чат недоступен отправителю"),
+    ("PEER_FLOOD", "Telegram: слив ограничений (холодная рассылка)"),
+    ("BUILD_TEMPLATE_ERROR", "Meta: неверный шаблон"),
+    ("waba_exhausted", "контакт исчерпан в WABA"),
+    ("bad_phones", "номер помечен мёртвым для этого канала"),
+    ("safe_hours", "вне окна безопасного времени"),
+    ("cooldown", "контакт ещё на cooldown в этом канале"),
+    ("already_sent", "сегодня уже отправляли"),
+)
+
+
+def _human_reason(reason: str) -> str:
+    """Переводит технический код отказа в то, что владелец может прочитать.
+
+    В личку уходило «молчание: no_delivery_confirmation» — по этому нельзя
+    было понять, что делать. Здесь та же причина человеческим языком.
+    """
+    raw = (reason or "").strip()
+    if not raw:
+        return "причина не указана"
+    low = raw.lower()
+    for needle, human in _REASON_RU:
+        if needle.lower() in low:
+            return human
+    return raw[:140]
 
 
 def counted_success(channel: str, n: int = 1) -> None:
@@ -168,8 +260,11 @@ def summary(counters: dict, rescue_pending: int, exhausted: int,
     """Итог по каждому каналу из daily_counters (источник истины — SQLite)."""
     try:
         flush_successes()
+        hidden = set(getattr(config, "TG_HIDE_CHANNELS", ()) or ())
         lines = []
         for channel, c in sorted(counters.items()):
+            if channel in hidden:
+                continue
             lines.append(
                 f"  • {channel}: принято {c['accepted']}, "
                 f"доставлено {c['delivered']}, отказ {c['rejected']}, "
@@ -193,3 +288,4 @@ def reset() -> None:
     _SENT.clear()
     _THROTTLE.clear()
     _AGG.clear()
+    globals()["_PER_CONTACT_USED"] = 0

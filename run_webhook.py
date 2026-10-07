@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -25,9 +24,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from bulkmessage import config
-
-# Файл с текущим tunnel URL (чтобы достать URL из другого терминала)
-TUNNEL_URL_FILE = str(Path(config.DATA_DIR) / "tunnel_url.txt")
 
 
 def check_uvicorn():
@@ -96,35 +92,13 @@ def run_tunnel_in_background(local_port: int):
             text=True,
             bufsize=1,
         )
-        # cloudflared pishet stroku s timestamp prefix, nuzhen tolko chistyy URL:
-        # "2026-09-21T14:18:48Z INF |  https://abc-def.trycloudflare.com"
-        url_re = re.compile(r"https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com")
-        seen_url = False
         for line in process.stdout:
-            line = line.rstrip()
-            print(f"[cloudflared] {line}")
-            if "trycloudflare.com" in line and not seen_url:
-                m = url_re.search(line)
-                if not m:
-                    continue
-                url = m.group(0)
-                seen_url = True
-                try:
-                    with open(TUNNEL_URL_FILE, "w", encoding="utf-8") as f:
-                        f.write(url)
-                    os.chmod(TUNNEL_URL_FILE, 0o600)
-                except OSError as e:
-                    print(f"   ! ne smog zapisat {TUNNEL_URL_FILE}: {e}")
+            print(f"[cloudflared] {line.rstrip()}")
+            if "trycloudflare.com" in line:
                 print()
                 print("=" * 70)
-                print("TUNNEL READY")
-                print(f"   URL: {url}")
-                print()
-                print("   Podpisat Wazzup (v drugom terminale):")
-                print(f"     python3 setup_webhook.py --url {url}/webhook")
-                print()
-                print("   Ili odnoy komandoy (URL vstavitsya avtomatom):")
-                print(f"     python3 setup_webhook.py --url \"$(cat {TUNNEL_URL_FILE})/webhook\"")
+                print("🔗 ТУННЕЛЬ ГОТОВ — скопируй URL выше и подпиши Wazzup:")
+                print(f"   py setup_webhook.py --url {line.strip()}")
                 print("=" * 70)
                 print()
         process.wait()

@@ -1023,6 +1023,25 @@ def _iso_within_hours(iso: Optional[str], hours: float) -> bool:
     return (datetime.now(timezone.utc) - ts).total_seconds() < hours * 3600
 
 
+def last_sent_by_phone() -> dict:
+    """{phone: метка последней отправки} по всем каналам.
+
+    Нужна для отбора: владелец требует «сначала тем, кому мы ещё НИКОГДА не
+    писали». Без этого выбор шёл в порядке Excel, и прогон мог целиком уйти
+    в тех, кому уже писали — а те, кто не получил рекламы ни разу, ждали.
+    """
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT ct.phone, MAX(COALESCE(m.sent_at, m.created_at)) AS last_sent
+            FROM messages m JOIN contacts ct ON ct.id = m.contact_id
+            WHERE ct.phone IS NOT NULL AND ct.phone != ''
+            GROUP BY ct.phone
+            """
+        ).fetchall()
+    return {r["phone"]: r["last_sent"] for r in rows}
+
+
 def enqueue_rescue(
     phone: str,
     name: Optional[str],
