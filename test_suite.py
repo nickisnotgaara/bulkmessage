@@ -2595,12 +2595,19 @@ _r33_f.write(json.dumps({"sent_today": {}, "contacts_today": 0,
                          "date": config.now_tz().strftime("%Y-%m-%d"),
                          "last_index": 0}))
 _r33_f.close()
+# Отдельная БД обязательна: _run_phase в конце фазы пишет дневной счётчик
+# (db.upsert_counter 'accepted'). Без этой подмены тест инкрементировал
+# БОЕВОЙ счётчик Telegram на +1 за каждый прогон — квота личного аккаунта
+# списывалась за отправки, которых не было (живой случай 2026-10-07).
+_r33_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_r33_db.close()
 _r33_calls: list = []
 _r33_rescue_ok: list = []
 _r33_rescue_fail: list = []
 _r33_tried: list = []
 try:
     with patch.object(config, "STATE_PATH", _r33_f.name), \
+         patch.object(config, "DB_PATH", _r33_db.name), \
          patch.object(config, "BULK_BYPASS_SAFE_HOURS", True), \
          patch.object(sender, "_sleep_phase", lambda s, st: None), \
          patch.object(sender, "_wait_for_backoffs", lambda b, l: None), \
