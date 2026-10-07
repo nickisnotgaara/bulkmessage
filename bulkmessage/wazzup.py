@@ -219,7 +219,8 @@ def _post_with_retry(url: str, payload: dict, timeout: int = 30) -> tuple[Option
 def send_wazzup(
     *,
     channel_id: str,
-    chat_id: str,
+    chat_id: Optional[str] = None,
+    phone: Optional[str] = None,
     chat_type: str = "whatsapp",
     text: Optional[str] = None,
     template_id: Optional[str] = None,
@@ -242,8 +243,8 @@ def send_wazzup(
         return False, None, "WAZZUP_API_KEY not configured", None
     if not channel_id:
         return False, None, "channel_id required", None
-    if not chat_id:
-        return False, None, "chat_id required", None
+    if not chat_id and not phone:
+        return False, None, "chat_id or phone required", None
     if text and content_uri:
         return False, None, "cannot provide both text and contentUri", None
     if not (text or template_id or content_uri):
@@ -252,8 +253,17 @@ def send_wazzup(
     payload: dict = {
         "channelId": channel_id,
         "chatType": chat_type,
-        "chatId": chat_id,
     }
+    # Для Telegram/MAX номер телефона передаётся в поле `phone`, а НЕ в
+    # `chatId`: по документации Wazzup chatId для telegram/max «не совпадает
+    # с номером телефона» — это внутренний peer id, и он приходит «в ответ на
+    # запрос при отправке исходящего с параметрами phone». Класть номер в
+    # chatId Wazzup принимает молча (HTTP 201), но адресовать peer не может:
+    # Telegram отвечает BAD_CONTACT на КАЖДЫЙ номер, включая self-send.
+    if chat_id:
+        payload["chatId"] = chat_id
+    if phone:
+        payload["phone"] = phone
     if text is not None:
         payload["text"] = text
     if template_id is not None:
@@ -768,8 +778,29 @@ def send_to_channel(
     elif chat_type == "whatsapp":
         chat_id = normalize_phone(phone) or phone
     else:
-        # TG/MAX — chat_id обычно равен phone, без нормализации
+        # TG/MAX — chat_id НЕ равен номеру телефона (это peer id внутри
+        # Telegram). Номер надо отдать в поле `phone`, тогда Wazzup сам
+        # резолвит его в настоящий chatId и вернёт его в ответе.
         chat_id = phone
+
+    use_phone_param = channel in set(
+        getattr(config, "WAZZUP_PHONE_PARAM_CHANNELS", ("telegram",)) or ()
+    )
+    if use_phone_param:
+        digits = normalize_phone(phone)
+        if not digits:
+            return False, None, "phone normalization produced empty phone", None
+        return send_wazzup(
+            channel_id=channel_id,
+            phone=digits,
+            chat_id=None,
+            text=text,
+            chat_type=chat_type,
+            template_id=template_id,
+            template_values=template_values,
+            request_id=request_id,
+        )
+
     if not chat_id:
         return False, None, "phone normalization produced empty chat_id", None
     return send_wazzup(

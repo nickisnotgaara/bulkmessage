@@ -338,6 +338,19 @@ OVERLOAD_HALT_HOURS = int(os.environ.get("BULK_OVERLOAD_HALT_HOURS", "1"))
 PROVIDER_FAIL_STREAK_LIMIT = int(os.environ.get("BULK_PROVIDER_FAIL_STREAK_LIMIT", "3"))
 PROVIDER_HALT_HOURS = int(os.environ.get("BULK_PROVIDER_HALT_HOURS", "6"))
 
+# Каналы, для которых номер телефона уходит в поле `phone`, а НЕ в `chatId`.
+# По документации Wazzup chatId для telegram/max — это внутренний peer id,
+# «не совпадает с номером телефона», и приходит в ответе на отправку по phone.
+# Номер в chatId Wazzup принимает молча (201), но Telegram отвечает
+# BAD_CONTACT на каждый адресат, включая self-send.
+# MAX работает и с `phone`, и с `chatId`, поэтому оставлен на chatId, пока
+# не проверен на живых отправках. Дописать `max` после проверки.
+WAZZUP_PHONE_PARAM_CHANNELS = tuple(
+    c.strip() for c in os.environ.get(
+        "BULK_WAZZUP_PHONE_PARAM_CHANNELS", "telegram"
+    ).split(",") if c.strip()
+)
+
 # Сторож подтверждений: сколько ждать delivery_status, прежде чем считать
 # сообщение недоставленным и отправить контакт в rescue. Вебхук — единственный
 # источник запуска fallback; если он молчит, контакт иначе навсегда остаётся

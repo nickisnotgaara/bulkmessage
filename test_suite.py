@@ -4498,6 +4498,86 @@ finally:
     except OSError:
         pass
 
+# ---------------------------------------------------------------------------
+# N. TELEGRAM: НОМЕР УХОДИТ В `phone`, А НЕ В `chatId`
+# ---------------------------------------------------------------------------
+# Живой случай 2026-10-07: Telegram через Wazzup отвечал HTTP 201 на КАЖДЫЙ
+# номер (включая self-send), а эхо приходило с
+#   BAD_CONTACT: Recipient with this chatId does not exist.
+# Документация Wazzup объяснила почему: для telegram/max chatId — это
+# внутренний peer id, «не совпадает с номером телефона», и приходит в ответе
+# на отправку по параметру `phone`. Класть номер в chatId gateway принимает
+# молча, но адресовать peer не может.
+#
+# Доказательство (chatId 998933930709):
+#   {"chatId": "998933930709"} → 201 → chatId 998933930709 → BAD_CONTACT
+#   {"phone":  "998933930709"} → 201 → chatId 1288960948   → status "sent"
+section("N. TELEGRAM: phone вместо chatId")
+
+check("telegram в списке каналов, которым нужен параметр phone",
+      "telegram" in config.WAZZUP_PHONE_PARAM_CHANNELS,
+      f"{config.WAZZUP_PHONE_PARAM_CHANNELS}")
+check("MAX по умолчанию НЕ переведён (работает и с chatId)",
+      "max" not in config.WAZZUP_PHONE_PARAM_CHANNELS,
+      f"{config.WAZZUP_PHONE_PARAM_CHANNELS}")
+
+# Перехватываем payload — сеть трогать нельзя.
+_captured: list[dict] = []
+
+
+def _fake_post(url, payload, **kw):
+    _captured.append(payload)
+    class _R:
+        status_code = 201
+        text = '{"messageId":"11111111-1111-1111-1111-111111111111",' \
+               '"chatId":"1288960948"}'
+        def json(self):
+            return {"messageId": "11111111-1111-1111-1111-111111111111",
+                    "chatId": "1288960948"}
+    return _R(), None
+
+
+_zz = os.environ.get("WAZZUP_API_KEY", "")
+_zz_saved = os.environ.get("WAZZUP_API_KEY_BAK")
+try:
+    os.environ["WAZZUP_API_KEY"] = "test-key-not-real"
+    import bulkmessage.wazzup as _wz
+    _wz.config.WAZZUP_API_KEY = "test-key-not-real"
+    _wz._post_with_retry = _fake_post
+    _ok, _mid, _det, _st = _wz.send_to_channel(
+        "telegram", "+998933930709", "тест",
+    )
+    check("telegram: отправка принята", _ok is True, f"ok={_ok}")
+    check("telegram: номер ушёл в поле phone",
+          bool(_captured) and _captured[-1].get("phone") == "998933930709",
+          f"payload={_captured[-1] if _captured else None}")
+    check("telegram: НЕ ушёл в поле chatId",
+          bool(_captured) and "chatId" not in _captured[-1],
+          f"payload={_captured[-1] if _captured else None}")
+
+    _captured.clear()
+    _wz.send_to_channel("max", "+79163322370", "тест")
+    check("max: НЕ переведён на phone (работает как есть, не ломаем)",
+          bool(_captured) and "phone" not in _captured[-1]
+          and _captured[-1].get("chatId", "").endswith("79163322370"),
+          f"payload={_captured[-1] if _captured else None}")
+
+    _captured.clear()
+    _wz.send_to_channel("waba", "+79163322370", "тест")
+    check("waba: без '+' в chatId",
+          bool(_captured) and _captured[-1].get("chatId") == "79163322370",
+          f"payload={_captured[-1] if _captured else None}")
+finally:
+    os.environ["WAZZUP_API_KEY"] = _zz
+
+# Без chatId и без phone отправка обязана быть отвергнута локально.
+from bulkmessage import wazzup as _wz2
+_ok2, _mid2, _det2, _st2 = _wz2.send_wazzup(
+    channel_id="x", chat_id=None, phone=None, text="тест",
+)
+check("без chatId и phone отправка отвергнута локально",
+      _ok2 is False and "chat_id or phone" in (_det2 or ""), f"{_det2}")
+
 print()
 print("=" * 70)
 print(f" TOTAL: {passed} passed, {failed} failed")
