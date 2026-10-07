@@ -3082,8 +3082,12 @@ _w_rescued: list = []
 _w_swept_calls: list = []
 
 
-def _w_fake_sweep(limit=50, minutes=None):
-    """Сторож: всё, что sender отправил, но что НЕ подтверждено, — провал."""
+def _w_fake_sweep(limit=50, minutes=None, unknown_minutes=None):
+    """Сторож: всё, что sender отправил, но что НЕ подтверждено, — провал.
+
+    `unknown_minutes` добавлен в 2026-10-07 вместе с трёхзначной доставкой:
+    молчание уходит в откат по длинному горизонту, явный отказ — по короткому.
+    """
     _w_swept_calls.append(minutes)
     # Сторож зовётся перед каждой фазой отката, но очередь наполняется
     # один раз — иначе тест считал бы дубликаты, а не контакты.
@@ -3146,9 +3150,23 @@ finally:
 # Сторож реально уважает переопределение минут.
 check("sweep_unconfirmed_deliveries принимает minutes",
       "minutes" in inspect.signature(reconcile.sweep_unconfirmed_deliveries).parameters)
-check("sweep_unconfirmed_deliveries по умолчанию = CONFIRM_TIMEOUT_MINUTES",
-      "CONFIRM_TIMEOUT_MINUTES" in inspect.getsource(
-          reconcile.sweep_unconfirmed_deliveries))
+# Правка 2026-10-07: молчание больше не равно провалу. Сторож получил ДВА
+# горизонта — короткий для явного отказа и длинный для молчания.
+check("sweep_unconfirmed_deliveries принимает unknown_minutes",
+      "unknown_minutes" in inspect.signature(
+          reconcile.sweep_unconfirmed_deliveries).parameters)
+_src_sweep = inspect.getsource(reconcile.sweep_unconfirmed_deliveries)
+check("сторож различает явный отказ и молчание",
+      "only_status" in _src_sweep and "rejected" in _src_sweep
+      and "unknown" in _src_sweep)
+check("явный отказ: горизонт REJECT_GRACE_MINUTES настроен",
+      int(getattr(config, "REJECT_GRACE_MINUTES", 0)) > 0)
+check("молчание: горизонт UNKNOWN_GRACE_MINUTES консервативный (> часа)",
+      int(getattr(config, "UNKNOWN_GRACE_MINUTES", 0)) >= 60,
+      f"UNKNOWN_GRACE_MINUTES={getattr(config, 'UNKNOWN_GRACE_MINUTES', None)}")
+check("молчание НЕ уходит в откат на горизонте явного отказа",
+      int(getattr(config, "UNKNOWN_GRACE_MINUTES", 0))
+      > int(getattr(config, "REJECT_GRACE_MINUTES", 0)))
 check("RESCUE_SETTLE_MINUTES настроен",
       int(getattr(config, "RESCUE_SETTLE_MINUTES", 0)) > 0)
 
@@ -3377,7 +3395,7 @@ _w2_swept: list = []
 _w2_sent: list = []
 
 
-def _w2_sweep(limit=50, minutes=None):
+def _w2_sweep(limit=50, minutes=None, unknown_minutes=None):
     _w2_swept.append(minutes)
     return 0
 
@@ -3562,6 +3580,297 @@ try:
 finally:
     try:
         os.unlink(_x_db.name)
+    except OSError:
+        pass
+
+# ---------------------------------------------------------------------------
+# П. КОНТРАКТНЫЕ ТЕСТЫ НА РЕАЛЬНЫХ PAYLOAD'АХ
+#
+# 629 юнит-тестов проходили на заглушках, пока боевая интеграция с вебхуком
+# была сломана целиком (процесс на устаревшем коде не разбирал конверт
+# `{"statuses": [...]}` — ноль подтверждений доставки за всю историю).
+# Контракт теперь зафиксирован фикстурами, снятыми с боевого вебхука.
+# ---------------------------------------------------------------------------
+section("P. КОНТРАКТ ВЕБХУКА (реальные payload'ы) + ТРЁХЗНАЧНАЯ ДОСТАВКА")
+import json as _json  # noqa: E402
+from bulkmessage import notify as _notify_mod  # noqa: E402
+from bulkmessage import report  # noqa: E402
+
+_FX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "tests", "fixtures", "webhook_real_payloads.json")
+check("фикстуры боевого вебхука лежат в репозитории", os.path.exists(_FX_PATH))
+_FX = _json.loads(open(_FX_PATH, encoding="utf-8").read()) if os.path.exists(_FX_PATH) else {}
+
+check("конверт статусов распознаётся как статус-событие",
+      reconcile._is_status_event(
+          reconcile._tag(list(_FX.get("statuses_envelope", {})
+                              .get("statuses", [{}]))[0], "statuses"),
+          "statuses"))
+check("конверт сообщений НЕ распознаётся как статус-событие",
+      not reconcile._is_status_event(
+          reconcile._tag(list(_FX.get("messages_envelope_waba", {})
+                              .get("messages", [{}]))[0], "messages"),
+          "messages"))
+check("в статус-событии нет channelId — канал берём из БД",
+      "channelId" not in list(_FX.get("statuses_without_channelId", {})
+                              .get("statuses", [{}])[0]))
+check("разбор конверта статусов есть в обработчике payload'ов",
+      "statuses" in inspect.getsource(reconcile.process_wazzup_payload))
+
+# --- Идемпотентность события + позднее подтверждение снимает откат ----------
+_p_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_p_db.close()
+try:
+    with patch.object(config, "DB_PATH", _p_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            _p_cid = db.upsert_contact(conn, phone="+79990002222",
+                                       name="Поздний", category="Покупатели")
+            _p_pk = db.insert_message(conn, contact_id=_p_cid, channel="waba",
+                                      message_text="t", message_id="mid-late-1",
+                                      status="sent")
+        # Контакт уже стоит в очереди отката (молчание → rescue).
+        db.enqueue_rescue("+79990002222", "Поздний", "Покупатели",
+                          original_channel="waba", reason="no_delivery_confirmation")
+        _p_pending_before = db.count_pending_rescues()
+
+        first = db.apply_delivery_event(_p_pk, "mid-late-1", "waba", "delivered")
+        second = db.apply_delivery_event(_p_pk, "mid-late-1", "waba", "delivered")
+        _p_cancelled = db.cancel_rescue_for_contact("+79990002222")
+
+        with db.db_conn() as conn:
+            _p_row = conn.execute(
+                "SELECT delivery_state FROM messages WHERE id = ?", (_p_pk,)
+            ).fetchone()
+            _p_events = conn.execute(
+                "SELECT COUNT(*) FROM delivery_events WHERE message_id = ?",
+                ("mid-late-1",)).fetchone()[0]
+
+    check("первое событие доставки применено", first is True)
+    check("повтор того же события ИГНОРИРУЕТСЯ (идемпотентность)", second is False)
+    check("в delivery_events ровно одна запись на дубль", _p_events == 1,
+          f"записей {_p_events}")
+    check("сообщение помечено delivered", _p_row["delivery_state"] == "delivered",
+          f"state={_p_row['delivery_state']}")
+    check("поздний delivered СНЯЛ контакт из очереди отката",
+          _p_pending_before == 1 and _p_cancelled == 1 and
+          db.count_pending_rescues() == 0,
+          f"было {_p_pending_before}, снято {_p_cancelled}, осталось "
+          f"{db.count_pending_rescues()}")
+finally:
+    try:
+        os.unlink(_p_db.name)
+    except OSError:
+        pass
+
+# --- Молчание ≠ провал: горизонты разные ------------------------------------
+_c_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_c_db.close()
+try:
+    with patch.object(config, "DB_PATH", _c_db.name), \
+         patch.object(config, "UNKNOWN_GRACE_MINUTES", 720), \
+         patch.object(config, "REJECT_GRACE_MINUTES", 5):
+        db.init_db()
+        with db.db_conn() as conn:
+            _c_cid = db.upsert_contact(conn, phone="+79990003333",
+                                       name="Молчун", category="Покупатели")
+            _c_pk = db.insert_message(conn, contact_id=_c_cid, channel="waba",
+                                      message_text="t", message_id="mid-silent-1",
+                                      status="sent")
+            # Ставим отправку час назад, иначе «молчание» только что началось
+            # и ни один горизонт ещё не выдержан.
+            _c_old = (datetime.now(timezone.utc)
+                      - timedelta(hours=1)).isoformat()
+            conn.execute("UPDATE messages SET sent_at = ?, created_at = ? "
+                         "WHERE id = ?", (_c_old, _c_old, _c_pk))
+        # Горизонт явного отказа — молчание туда НЕ попадает.
+        _c_swept = reconcile.sweep_unconfirmed_deliveries(limit=50, minutes=5,
+                                                          unknown_minutes=720)
+        with db.db_conn() as conn:
+            _c_state = conn.execute(
+                "SELECT delivery_state FROM messages WHERE id = ?",
+                (_c_pk,)).fetchone()["delivery_state"]
+        _c_rescued = db.count_pending_rescues()
+        check("на коротком горизонте молчание НЕ уходит в откат",
+              _c_swept == 0 and _c_rescued == 0,
+              f"swept={_c_swept} в rescue={_c_rescued}")
+        check("молчание помечено unknown, а не rejected",
+              _c_state == "unknown", f"state={_c_state}")
+        check("антикоастинг WABA на этом шаге ещё не поставлен",
+              "+79990003333" not in db.get_active_cooldowns("waba"))
+        # По длинному горизонту — молчание становится откатом. Внутри того же
+        # patch'а на БД, иначе свип пошёл бы по боевой базе.
+        _c_swept2 = reconcile.sweep_unconfirmed_deliveries(limit=50, minutes=5,
+                                                            unknown_minutes=0)
+        check("по длинному горизонту молчание УХОДИТ в откат",
+              _c_swept2 == 1 and db.count_pending_rescues() == 1,
+              f"swept={_c_swept2}, в rescue={db.count_pending_rescues()}")
+        check("антикоастинг WABA поставлен молчащему контакту",
+              "+79990003333" in db.get_active_cooldowns("waba"),
+              f"cooldown={db.get_active_cooldowns('waba')}")
+finally:
+    try:
+        os.unlink(_c_db.name)
+    except OSError:
+        pass
+
+# --- Инвариант: не больше одного сообщения на контакт в канале за сутки -------
+_i_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_i_db.close()
+try:
+    with patch.object(config, "DB_PATH", _i_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            _i_cid = db.upsert_contact(conn, phone="+79990004444",
+                                       name="Инвариант", category="Покупатели")
+        _i_first = db.recent_channel_send("+79990004444", "waba", hours=24)
+        with db.db_conn() as conn:
+            db.insert_message(conn, contact_id=_i_cid, channel="waba",
+                              message_text="t", message_id="mid-inv-1",
+                              status="sent")
+        _i_after = db.recent_channel_send("+79990004444", "waba", hours=24)
+        _i_other_ch = db.recent_channel_send("+79990004444", "telegram", hours=24)
+        _i_old = db.recent_channel_send("+79990004444", "waba", hours=0)
+    check("до отправки дубля-риска нет", _i_first is False)
+    check("после отправки повтор в том же канале заблокирован", _i_after is True)
+    check("другой канал инвариантом не задет", _i_other_ch is False)
+    check("окно в 0 часов не блокирует (окно настраивается)", _i_old is False)
+finally:
+    try:
+        os.unlink(_i_db.name)
+    except OSError:
+        pass
+
+# --- Exhausted: потолок попыток ---------------------------------------------
+_e_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_e_db.close()
+_e_dir = tempfile.mkdtemp()
+try:
+    with patch.object(config, "DB_PATH", _e_db.name), \
+         patch.object(config, "EXHAUST_MAX_ATTEMPTS", 3), \
+         patch.object(config, "EXHAUST_WINDOW_DAYS", 0):
+        db.init_db()
+        _e_rid = db.enqueue_rescue("+79990005555", "Исчерпан", "Покупатели",
+                                   original_channel="waba", reason="test")
+        db.mark_rescue_attempt(_e_rid, error="telegram_failed")
+        db.mark_rescue_tried(_e_rid, "telegram")
+        db.mark_rescue_attempt(_e_rid, error="max_failed")
+        db.mark_rescue_tried(_e_rid, "max")
+        _e_why = db.should_exhaust(_e_rid, ["telegram", "max"])
+        db.mark_rescue_exhausted(_e_rid, _e_why or "test")
+        _e_count = db.count_exhausted_rescues()
+        _e_csv = db.export_exhausted_csv(_e_dir)
+        _e_csv2 = db.export_exhausted_csv(_e_dir)   # второй раз — не дублируем
+    _e_exists = bool(_e_csv) and os.path.exists(_e_csv)
+    check("потолок попыток срабатывает на исчерпании", bool(_e_why), f"why={_e_why}")
+    check("контакт помечен exhausted (стоп автоматики)", _e_count == 1,
+          f"exhausted={_e_count}")
+    check("исчерпанные выгружаются в CSV", _e_exists)
+    check("выгрузка не дублируется в течение суток", _e_csv2 is None)
+    check("в CSV есть телефон контакта",
+          _e_exists and "+79990005555" in open(_e_csv, encoding="utf-8").read())
+finally:
+    try:
+        os.unlink(_e_db.name)
+    except OSError:
+        pass
+
+# --- daily_counters: атомарность и согласованность --------------------------
+_d_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_d_db.close()
+try:
+    with patch.object(config, "DB_PATH", _d_db.name):
+        db.init_db()
+        db.upsert_counter("2026-10-07", "waba", "accepted", 3)
+        db.upsert_counter("2026-10-07", "waba", "accepted", 2)
+        db.upsert_counter("2026-10-07", "waba", "delivered", 1)
+        _d_ct = db.get_counters("2026-10-07")
+        _d_bad = False
+        try:
+            db.upsert_counter("2026-10-07", "waba", "нет_такого")
+        except ValueError:
+            _d_bad = True
+    check("инкремент счётчика атомарен и накопителен",
+          _d_ct["waba"]["accepted"] == 5 and _d_ct["waba"]["delivered"] == 1,
+          f"{_d_ct}")
+    check("доставка не может превысить принятие (источник истины один)",
+          _d_ct["waba"]["delivered"] <= _d_ct["waba"]["accepted"])
+    check("неизвестное поле счётчика отвергается", _d_bad)
+    check("отчёт берёт счётчики из SQLite, а не из state.json",
+          "db.get_counters" in inspect.getsource(report.build_report))
+finally:
+    try:
+        os.unlink(_d_db.name)
+    except OSError:
+        pass
+
+# --- Прозрачность: notify не шумит и не рассылает лишнее --------------------
+_notify_mod.reset()
+with patch.object(config, "TG_MAX_MESSAGES_PER_HOUR", 3):
+    _notify_mod.digest_start(phase_order=["waba", "telegram"], caps={"waba": 187},
+                             contacts_planned=20, rescue_pending=5,
+                             exhausted_total=1, waba_tier=1, code_version="abc1234")
+    _notify_mod.channel_switch("+79990006666", "waba", "telegram", "молчание")
+    _notify_mod.event("halt канала", "ERROR")
+    _notify_mod.event("ещё одно событие", "ERROR")   # сверх лимита — не уходит
+check("дайджест/события не отправляются на тестовом прогоне",
+      _notify_mod.sent_count() == 0,
+      f"отправлено {_notify_mod.sent_count()}")
+check("notify имеет rate-limit на сообщения в личку",
+      hasattr(_notify_mod, "_allowed"))
+check("успехи агрегируются, а не летят построчно",
+      hasattr(_notify_mod, "counted_success") and hasattr(_notify_mod, "summary"))
+_notify_mod.reset()
+
+# --- Параллелизм WABA и независимый tier -----------------------------------
+check("параллелизм настраивается конфигом",
+      int(getattr(config, "WABA_CONCURRENCY", 1)) >= 1)
+check("личные каналы не распараллеливаются",
+      'if phase_ch == "waba":' in inspect.getsource(sender._run_phase))
+check("личные каналы имеют жёсткий потолок",
+      int(config.PERSONAL_CHANNEL_HARD_CAPS["telegram"]) > 0 and
+      int(config.PERSONAL_CHANNEL_HARD_CAPS["max"]) > 0)
+check("квота сверяется с атомарным счётчиком из БД",
+      hasattr(state, "reconcile_sent_from_db"))
+check("tier WABA обновляется независимо от вебхука",
+      hasattr(wazzup, "refresh_waba_tier") and hasattr(wazzup, "fetch_waba_tier"))
+
+# --- Повторный свип того же молчания не плодит дубли ----------------------
+# Реальный баг, найденный сквозным стендом 2026-10-07: молчание перестало
+# переписывать status в 'failed', и сторож на следующей фазе отката снова
+# видел то же сообщение. Контакт, которому Telegram ТОЛЬКО ЧТО доставил,
+# возвращался в очередь по своему старому молчаливому сообщению в WABA и
+# получал дубль в MAX. Лечится меткой swept_at.
+_z_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_z_db.close()
+try:
+    with patch.object(config, "DB_PATH", _z_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            _z_cid = db.upsert_contact(conn, phone="+79990007777",
+                                       name="Повтор", category="Покупатели")
+            _z_pk = db.insert_message(conn, contact_id=_z_cid, channel="waba",
+                                      message_text="t", message_id="mid-rep-1",
+                                      status="sent")
+            _z_old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            conn.execute("UPDATE messages SET sent_at=?, created_at=? WHERE id=?",
+                         (_z_old, _z_old, _z_pk))
+        _z_first = reconcile.sweep_unconfirmed_deliveries(limit=50, minutes=0,
+                                                          unknown_minutes=0)
+        _z_rescued_after_first = db.count_pending_rescues()
+        # Вторая фаза отката (например MAX) — то же молчание, другой вызов.
+        _z_second = reconcile.sweep_unconfirmed_deliveries(limit=50, minutes=0,
+                                                           unknown_minutes=0)
+        _z_rescued_after_second = db.count_pending_rescues()
+    check("первый свип положил молчание в очередь отката",
+          _z_first == 1 and _z_rescued_after_first == 1,
+          f"first={_z_first} rescue={_z_rescued_after_first}")
+    check("повторный свип того же молчания НЕ плодит дубль в очереди",
+          _z_second == 0 and _z_rescued_after_second == 1,
+          f"second={_z_second} rescue={_z_rescued_after_second}")
+finally:
+    try:
+        os.unlink(_z_db.name)
     except OSError:
         pass
 

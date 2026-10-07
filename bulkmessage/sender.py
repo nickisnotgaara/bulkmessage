@@ -653,6 +653,28 @@ def _run_one_contact(
             log.info(f"🚫 SKIP {phone} — не удалось проверить согласие, требуется opt-in")
             return False
 
+    # Инвариант защиты личных аккаунтов: не более одного сообщения на контакт
+    # в одном канале за окно CONTACT_CHANNEL_COOLDOWN_HOURS (24ч).
+    #
+    # Зачем: после трёхзначной доставки молчание может означать и доставку
+    # без события. Даже при 12-часовом горизонте рано или поздно появится
+    # контакт, которому уже отправили — и второй канал продублирует ему
+    # сообщение. Дубликаты в личных аккаунтах = бан. Проверяем ДО расхода
+    # квоты, чтобы «нельзя» не съедало лимит.
+    try:
+        if db.recent_channel_send(phone, channels[0],
+                                  hours=getattr(config,
+                                                "CONTACT_CHANNEL_COOLDOWN_HOURS", 24)):
+            log.info(
+                f"🚫 SKIP {phone} — уже получал сообщение в канале "
+                f"{channels[0]} за последние "
+                f"{getattr(config, 'CONTACT_CHANNEL_COOLDOWN_HOURS', 24)}ч. "
+                f"Дубль в личный аккаунт не отправляем."
+            )
+            return False
+    except Exception as e:
+        log.debug(f"channel-cooldown check failed for {phone}: {e}")
+
     # Выбираем категорию и шаблон (Phase 1.2)
     norm_category = templates.normalize_category(category)
     template_id = waba_templates.ensure_waba_template_for_category(norm_category)
@@ -1271,6 +1293,8 @@ def _phase_seconds_left(channel: str) -> float:
 # через час с четвертью.
 _RUN_DEADLINE: Optional[float] = None
 _RUN_CYCLE = 0
+# Метка старта прогона — для честного «сколько заняло» в итоговом отчёте.
+_RUN_STARTED_AT = 0.0
 
 
 def _run_deadline() -> Optional[float]:
@@ -1523,7 +1547,49 @@ def _run_phase(
     backoffs: dict[str, int] = {}
     permanent_skipped: dict[str, set[str]] = {}
     done = 0
+    _run_accepted = 0
     total = len(items)
+
+    # Скорость WABA. После пополнения баланса tier 1 = 1000/день, и при
+    # последовательной паузе 10–30с это ~9 часов. Поэтому HTTP-отправки идут
+    # конвейером: одновременно в работе до WABA_CONCURRENCY сообщений, а учёт
+    # результатов остаётся ПОСЛЕДОВАТЕЛЬНЫМ и в исходном порядке — иначе мы бы
+    # вернули гонку записи в state.json, которую только что убрали.
+    #
+    # Личные каналы (telegram/max) НИКОГДА не распараллеливаются: их потолок
+    # не скорость, а лимит, и это личные аккаунты владельца.
+    _concurrency = 1
+    if phase_ch == "waba":
+        try:
+            _concurrency = max(1, int(getattr(config, "WABA_CONCURRENCY", 1)))
+        except Exception:
+            _concurrency = 1
+    _pool = None
+    if _concurrency > 1:
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            _pool = ThreadPoolExecutor(max_workers=_concurrency)
+        except Exception as e:
+            log.warning(f"пул воркеров не создался ({e}) — последовательный режим")
+            _pool = None
+
+    def _submit(it: dict):
+        # Каждый поток работает со СВОИМИ копиями backoffs/permanent_skipped:
+        # общие словари из нескольких потоков — та же гонка, только тише.
+        _bo = dict(backoffs)
+        _ps = {k: set(v) for k, v in permanent_skipped.items()}
+        _st = state.reset_daily_if_new_day(state.load_state())
+        return _pool.submit(
+            _run_one_contact, it, [phase_ch], _bo, _ps, _st,
+            cascade_override=[phase_ch],
+        ), _bo, _ps
+
+    _inflight: dict = {}
+    for i, item in enumerate(items[:_concurrency]):
+        if _pool is not None:
+            _f, _bo, _ps = _submit(item)
+            _inflight[_f] = (item, _bo, _ps)
+    _next_index = _concurrency
     for i, item in enumerate(items):
         if stop_requested["v"]:
             log.info("⛔ Остановка по сигналу")
@@ -1548,16 +1614,43 @@ def _run_phase(
         state.increment_attempts(cur)
         state.save_state(cur)
 
-        try:
-            ok = _run_one_contact(
-                item, [phase_ch], backoffs, permanent_skipped, cur,
-                cascade_override=[phase_ch],
-            )
-        except Exception as e:
-            log.warning(f"фаза {phase_ch}: сбой на {item.get('phone')}: {e}")
-            ok = False
+        if _pool is not None:
+            fut = next(iter(_inflight))
+            item, _bo, _ps = _inflight.pop(fut)
+            # Дотерпливаем конвейер: следующий контакт уходит в сеть, пока мы
+            # считаем этот.
+            if _next_index < total:
+                _f2, _bo2, _ps2 = _submit(items[_next_index])
+                _inflight[_f2] = (items[_next_index], _bo2, _ps2)
+                _next_index += 1
+            try:
+                ok = fut.result()
+            except Exception as e:
+                log.warning(f"фаза {phase_ch}: сбой на {item.get('phone')}: {e}")
+                ok = False
+            # Сливаем результаты потока обратно и сразу сверяем квоту с БД:
+            # состояние в файле могло потерять обновление из-за параллельных
+            # потоков, а квотные решения принимаются по daily_counters.
+            backoffs.update({k: v for k, v in _bo.items() if v})
+            permanent_skipped.update({k: v for k, v in _ps.items() if v})
+            try:
+                cur = state.load_state()
+                cur = state.reconcile_sent_from_db(cur, phase_ch)
+            except Exception:
+                pass
+        else:
+            try:
+                ok = _run_one_contact(
+                    item, [phase_ch], backoffs, permanent_skipped, cur,
+                    cascade_override=[phase_ch],
+                )
+            except Exception as e:
+                log.warning(f"фаза {phase_ch}: сбой на {item.get('phone')}: {e}")
+                ok = False
 
         done += 1
+        if ok:
+            _run_accepted += 1
 
         # Rescue-строки должны получить терминальный статус, иначе они
         # останутся pending и уйдут в фазу MAX повторно.
@@ -1588,7 +1681,23 @@ def _run_phase(
                     log.debug(f"rescue_tried_channels недоступна: {_te}")
                     _tried = set()
                 _fallbacks = [c for c in _phase_order_channels() if c != "waba"]
-                if _fallbacks and set(_fallbacks).issubset(_tried):
+                # Потолок попыток: контакт, исчерпавший каналы N раз, больше
+                # НЕ крутится в очереди автоматически. Иначе «1 попытка в
+                # день вечно» — это просто расход квоты на заведомо
+                # недостижимые номера. Такой контакт уходит в exhausted и в
+                # ежедневную выгрузку для ручного разбора.
+                try:
+                    _why = db.should_exhaust(rid, _fallbacks)
+                except Exception as _se:
+                    log.debug(f"should_exhaust недоступна: {_se}")
+                    _why = None
+                if _why:
+                    db.mark_rescue_exhausted(rid, _why)
+                    log.info(
+                        f"  🛑 Rescue {rid} ({item.get('phone')}) исчерпан "
+                        f"({_why}) — стоп автоматики, в ежедневную выгрузку"
+                    )
+                elif _fallbacks and set(_fallbacks).issubset(_tried):
                     from datetime import timedelta as _td
                     _tomorrow = (
                         datetime.now(timezone.utc) + _td(days=1)
@@ -1615,19 +1724,36 @@ def _run_phase(
         remaining = total - i - 1
         if remaining > 0 and not stop_requested["v"]:
             d = _phase_delay(phase_ch, _phase_seconds_left(phase_ch), remaining)
+            if _pool is not None and _concurrency > 1:
+                # Пауза делится между воркерами: общая скорость фазы должна
+                # остаться прежней, просто запросы идут наложенно.
+                d = max(1.0, d / _concurrency)
             _sleep_phase(d, stop_requested)
 
-        total_sent = sum(cur.get("sent_today", {}).values())
+        # Анти-блок: длинный перерыв считаем по принятым ЗА ЭТОТ ПРОГОН, а не
+        # по кросс-канальной сумме sent_today за сутки. Раньше сумма копилась
+        # по всем каналам и попадала на круглое число «случайно»: 2026-10-06
+        # прогон встал на 15 минут после 6-го сообщения, потому что сумма
+        # суток (44 + 6) кратно совпала с BATCH_SIZE=50. Выглядело как зависание.
         if (
             config.BATCH_SIZE
-            and total_sent > 0
-            and total_sent % config.BATCH_SIZE == 0
+            and _run_accepted > 0
+            and _run_accepted % config.BATCH_SIZE == 0
             and config.BATCH_BREAK_MAX > 0
         ):
+            log.info(
+                f"{getattr(config, 'UNKNOWN_GRACE_MINUTES', 720)} мин, "
+                f"принято {_run_accepted} в этом прогоне"
+            )
             _sleep_phase(
                 random.uniform(config.BATCH_BREAK_MIN, config.BATCH_BREAK_MAX),
                 stop_requested,
             )
+    if _pool is not None:
+        try:
+            _pool.shutdown(wait=True)
+        except Exception:
+            pass
     return done
 
 
@@ -1663,34 +1789,59 @@ def _select_contacts_for_cycle(
         if state.is_phone_in_cooldown(cur, phone, "waba"):
             continue
         out.append(c)
+    # Антикоастинг по WABA: молчание по этому номеру почти всегда означает
+    # отказ Meta по маркетинговому лимиту («нельзя отправить шаблон
+    # „Маркетинг“»). Повтор на следующий день сожжёт ещё один слот квоты и
+    # даст тот же отказ. Номер исключается ТОЛЬКО из WABA — в откат по
+    # Telegram/MAX он остаётся доступен.
+    try:
+        _waba_cooling = db.get_active_cooldowns("waba")
+    except Exception:
+        _waba_cooling = set()
+    if _waba_cooling:
+        _before = len(out)
+        out = [c for c in out if c.get("phone") not in _waba_cooling]
+        if len(out) != _before:
+            log.info(
+                f"🧊 Антикоастинг WABA: {len(_waba_cooling)} номеров в "
+                f"молчании исключены из WABA-отбора "
+                f"({getattr(config, 'WABA_SILENT_COOLDOWN_DAYS', 14)} дней), "
+                f"но остаются доступны для отката"
+            )
     return out
 
 
-def _sweep_silence_into_rescue(minutes: int) -> int:
-    """Перед фазой отката: молчание вебхука = отказ Meta.
+def _sweep_silence_into_rescue(minutes: int, unknown_minutes: int | None = None) -> int:
+    """Перед фазой отката: молчание вебхука разбирается в две корзины.
 
-    Wazzup не присылает `failed` (замер 2026-10-06: 0 событий `failed` на
-    1321 событий, реальные статусы — delivered/read/sent/error). Отказ по
-    маркетинговому шаблону выглядит как тишина: HTTP 2xx есть, подтверждения
-    доставки нет и не будет. Поэтому перед откатом мы сами превращаем
-    молчание в явный провал и кладём контакты в rescue-очередь.
+    Раньше молчание и явный отказ считались одним и тем же, и уходили в откат
+    через 5 минут. Замер 2026-10-06 показал, что это ложь: из 16 принятых
+    сообщений подтверждение пришло для одного, а в UI Wazzup 4 из 6 были без
+    ошибок — то есть большинство «провалов» были просто доставками без события.
+    Такой откат лил дубли в личные аккаунты.
 
-    Без этого шага фазы Telegram/MAX уходили в пустоту: очередь наполнял
-    только `error` (2 события за всю историю), а откат на 100–250 сообщений
-    не срабатывал НИ РАЗУ.
+    Теперь:
+      * ЯВНЫЙ отказ → откат через `minutes` (REJECT_GRACE_MINUTES, 5 мин).
+      * Молчание → откат только через `unknown_minutes` (UNKNOWN_GRACE_MINUTES,
+        12 ч по умолчанию), а контакт получает антикоастинг на WABA.
     """
     try:
         from . import reconcile as _reconcile
         n = _reconcile.sweep_unconfirmed_deliveries(
-            limit=200, minutes=max(1, int(minutes))
+            limit=200,
+            minutes=max(1, int(minutes)),
+            unknown_minutes=(
+                int(unknown_minutes) if unknown_minutes is not None else None
+            ),
         )
     except Exception as e:
         log.warning(f"Сторож молчания перед откатом не отработал (non-fatal): {e}")
         return 0
     if n:
         log.warning(
-            f"🔇 Вебхук промолчал {n} контактов после паузы — они идут в откат "
-            f"(TG/MAX). Явных 'failed' от Wazzup не бывает."
+            f"🔇 Явных отказов не подтверждено в rescue: {n} — уходят в откат "
+            f"(TG/MAX). Молчание обрабатывается отдельно, горизонт "
+            f"{getattr(config, 'UNKNOWN_GRACE_MINUTES', 720)} мин."
         )
     return n
 
@@ -1727,6 +1878,47 @@ def _run_all_phases(
     log.info(f"ФАЗОВЫЙ РЕЖИМ: {' → '.join(phase_order)}"
              + (f"  (круг {cycle_no})" if cycle_no > 1 else ""))
     log.info("=" * 70)
+
+    # Стартовый дайджест в Telegram: один раз за прогон, только на первом
+    # круге. Дальше повторять его бессмысленно — это шум, а не прозрачность.
+    if cycle_no == 1:
+        try:
+            from . import notify as _notify
+            _cur = state.load_state()
+            _caps = {
+                ch: state.channel_effective_cap(_cur, ch)
+                for ch in phase_order
+            }
+            _planned = 0
+            try:
+                _planned = len(_collect_fresh_waba_targets(
+                    _select_contacts_for_cycle(), _cur))
+            except Exception:
+                pass
+            # Ежедневная выгрузка исчерпанных: контакт, на котором система
+            # остановилась, обязан быть виден владельцу, а не просто исчезнуть.
+            try:
+                _csv = db.export_exhausted_csv(getattr(config, "DATA_DIR", "data"))
+                if _csv:
+                    log.info(f"📤 Выгрузка исчерпанных: {_csv}")
+                    _notify.event(
+                        f"🛑 Исчерпано контактов: {db.count_exhausted_rescues()}. "
+                        f"Выгрузка: {_csv} — разбери вручную.",
+                        "WARNING",
+                    )
+            except Exception as e:
+                log.debug(f"выгрузка exhausted не удалась: {e}")
+            _notify.digest_start(
+                phase_order=list(phase_order),
+                caps=_caps,
+                contacts_planned=_planned,
+                rescue_pending=db.count_pending_rescues(),
+                exhausted_total=db.count_exhausted_rescues(),
+                waba_tier=state.get_waba_tier(_cur),
+                code_version=getattr(config, "CODE_VERSION", "unknown"),
+            )
+        except Exception as e:
+            log.debug(f"digest_start не отправился: {e}")
 
     for phase_no, phase_ch in enumerate(phase_order):
         if stop_requested["v"]:
@@ -1875,8 +2067,36 @@ def run() -> None:
     # дедлайн None (никогда не останавливался по времени).
     global _RUN_DEADLINE, _RUN_CYCLE
 
+    global _RUN_STARTED_AT
+    _RUN_STARTED_AT = time.time()
+
     config.configure_logging()
     db.init_db()
+
+    # Перенос счётчиков дня из state.json в SQLite — однократно и только
+    # если по текущей дате в daily_counters ещё ничего нет.
+    try:
+        _moved = db.migrate_counters_from_state(state.load_state())
+        if _moved:
+            log.info(
+                f"📊 Счётчики дня перенесены из state.json в SQLite: {_moved} значений"
+            )
+    except Exception as e:
+        log.warning(f"миграция счётчиков не удалась (non-fatal): {e}")
+
+    # Актуализируем tier WABA до расчёта квот: он приходит событием вебхука,
+    # а вебхук может быть мёртвым (баланс пополнен, а мы считаем tier 0).
+    try:
+        _tier_before = state.get_waba_tier(state.load_state())
+        _tier_now = wazzup.refresh_waba_tier()
+        if _tier_now and _tier_now != _tier_before:
+            log.info(
+                f"📈 WABA tier {_tier_before} → {_tier_now} "
+                f"(кап {config.WABA_TIER_LIMITS.get(_tier_now, '?')}) — "
+                f"источник: опрос Wazzup, не вебхук"
+            )
+    except Exception as e:
+        log.debug(f"refresh_waba_tier не отработал: {e}")
 
     # Подключаем Telegram-логгер (если задан токен в env)
     from . import tglog
@@ -2413,40 +2633,54 @@ def run() -> None:
     log.info(f"   Итог за сегодня: {final_state.get('sent_today', {})}")
     log.info(f"   Всего активных каналов было: {channels}")
 
-    # Честная воронка: принято ≠ доставлено. Доставка подтверждается вебхуком
-    # (или сторожем), поэтому на момент остановки она может быть неполной —
-    # это нормально и видно отдельной строкой.
+    # Честная воронка: принято ≠ доставлено. Источник истины — daily_counters
+    # в SQLite, а не state.json: два процесса (sender и webhook) писали
+    # счётчики в один JSON-файм методом read-modify-write и теряли обновления
+    # друг друга — из-за этого отчёт показывал «доставлено 60 (128%)» при
+    # принятых 47.
     try:
-        _acc = state.accepted_total_today(final_state)
-        _dlv = state.delivered_total_today(final_state)
-        _flt = sum(int(v) for v in (final_state.get("failed_today") or {}).values())
+        _counters = db.get_counters()
+        _acc = sum(c["accepted"] for c in _counters.values())
+        _dlv = sum(c["delivered"] for c in _counters.values())
+        _rjt = sum(c["rejected"] for c in _counters.values())
+        _unk = sum(c["unknown"] for c in _counters.values())
         _rate = (_dlv / _acc * 100.0) if _acc else 0.0
         _tgt = int(final_state.get("target_today", config.TARGET_SUCCESS_PER_DAY))
         log.info("─" * 70)
-        log.info("   📊 ВОРОНКА ДОСТАВКИ (честные цифры):")
+        log.info("   📊 ВОРОНКА ДОСТАВКИ (источник истины — SQLite):")
         log.info(f"      принято транспортом : {_acc}")
         log.info(f"      доставлено (webhook) : {_dlv}  ({_rate:.0f}%)")
-        log.info(f"      отказов              : {_flt}")
-        if _acc > _dlv + _flt:
-            log.info(
-                f"      без подтверждения    : {_acc - _dlv - _flt} "
-                f"(ждём вебхук / сторож через "
-                f"{config.CONFIRM_TIMEOUT_MINUTES} мин)"
-            )
+        log.info(f"      отказов (явных)     : {_rjt}")
+        log.info(f"      молчание (unknown)   : {_unk} → откат через "
+                 f"{config.UNKNOWN_GRACE_MINUTES} мин")
         log.info(f"      цель дня            : {_tgt}")
+        for _ch, _c in sorted(_counters.items()):
+            log.info(
+                f"        · {_ch}: принято {_c['accepted']}, "
+                f"доставлено {_c['delivered']}, отказ {_c['rejected']}, "
+                f"неизвестно {_c['unknown']}"
+            )
         log.info("   Полная воронка: `py main.py report`")
         log.info("─" * 70)
     except Exception as e:
         log.warning(f"delivery funnel summary failed: {e}")
+        _counters, _acc, _dlv, _rjt, _unk = {}, 0, 0, 0, 0
+
+    # Прозрачность: итог прогона в Telegram — по каналам, с откатом и
+    # исчерпанными. Раньше уходило две строки («итог за сегодня» и «каналов»),
+    # из которых нельзя было понять, что реально дошло.
+    try:
+        from . import notify as _notify
+        _notify.summary(
+            counters=_counters,
+            rescue_pending=db.count_pending_rescues(),
+            exhausted=db.count_exhausted_rescues(),
+            elapsed_sec=(time.time() - _RUN_STARTED_AT) if _RUN_STARTED_AT else 0.0,
+            extra=f"принято {_acc} / доставлено {_dlv} / отказ {_rjt}",
+        )
+    except Exception as e:
+        log.debug(f"notify.summary не отправился: {e}")
     log.info("=" * 70)
-    # TG: финальный отчёт
-    tglog.send(
-        f"✅ Sender ЗАВЕРШЁН.\n"
-        f"Итог за сегодня: {final_state.get('sent_today', {})}\n"
-        f"Каналов: {channels}\n"
-        f"Режим: {'DRY-RUN' if config.DRY_RUN else 'БОЕВОЙ'}",
-        "INFO",
-    )
 
 
 if __name__ == "__main__":

@@ -623,6 +623,87 @@ def active_channels() -> list[str]:
     return result
 
 
+def fetch_waba_tier() -> Optional[int]:
+    """Текущий tier WABA из GET /v3/channels. None — если данных нет.
+
+    Нужен как независимый источник: tier приходит событием
+    `channel.waba_tier_update`, то есть через вебхук. Если вебхук не поднят
+    или работает на устаревшем коде, система годами считает tier 0 и живёт
+    по капу 250/день, хотя баланс давно пополнен (реальный случай 2026-10-07).
+    """
+    cid = channel_id_for("waba")
+    if not cid:
+        return None
+    url = config.WAZZUP_BASE_URL + config.WAZZUP_CHANNELS_PATH
+    try:
+        r = requests.get(url, headers=_headers(), params={"channelId": cid},
+                         timeout=15)
+        if r.status_code >= 400:
+            return None
+        data = r.json()
+    except Exception:
+        return None
+    items = data.get("data") if isinstance(data, dict) else data
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return None
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("id") or it.get("channelId") or "") != cid:
+            continue
+        for key in ("wabaTier", "tier", "waTier"):
+            v = it.get(key)
+            if v is not None and str(v).isdigit():
+                return int(v)
+        # Иногда tier лежит во вложенном объекте лимитов.
+        for key in ("wabaLimits", "limits", "meta"):
+            sub = it.get(key)
+            if isinstance(sub, dict):
+                for k2 in ("tier", "wabaTier"):
+                    v = sub.get(k2)
+                    if v is not None and str(v).isdigit():
+                        return int(v)
+    return None
+
+
+def refresh_waba_tier(force: bool = False) -> Optional[int]:
+    """Обновляет tier в state (раз в WABA_TIER_REFRESH_HOURS). Возвращает tier.
+
+    Вебхук остаётся основным путём, но не единственным: он может быть
+    мёртв, и тогда мы не должны верить устаревшему tier.
+    """
+    from . import state as _state
+    try:
+        st = _state.load_state()
+    except Exception:
+        return None
+    cur = int(st.get("waba_tier", config.WAZZUP_TIER_DEFAULT))
+    updated_at = st.get("waba_tier_updated_at") or ""
+    if not force and updated_at:
+        try:
+            age_h = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(updated_at)
+            ).total_seconds() / 3600.0
+            if age_h < int(getattr(config, "WABA_TIER_REFRESH_HOURS", 12)):
+                return cur
+        except Exception:
+            pass
+    tier = fetch_waba_tier()
+    if tier is None:
+        return cur
+    if tier != cur:
+        _state.set_waba_tier(tier)
+    else:
+        # Даже без изменения освежаем метку времени: значит проверка прошла.
+        st["waba_tier"] = tier
+        st["waba_tier_updated_at"] = datetime.now(timezone.utc).isoformat()
+        _state.save_state(st)
+    return tier
+
+
 # Map bulkmessage channel name → Wazzup chatType для /v3/message
 CHANNEL_TO_CHAT_TYPE = {
     "telegram": "telegram",

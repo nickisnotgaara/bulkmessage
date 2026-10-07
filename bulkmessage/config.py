@@ -556,6 +556,56 @@ PHASE_STRETCH_FALLBACK_ONLY = bool(
 # rescue — иначе фазы TG/MAX уходят в пустоту и откат не работает никогда.
 PHASE_GRACE_MINUTES = int(os.environ.get("BULK_PHASE_GRACE_MINUTES", "5"))
 
+# Трёхзначная доставка (план «устойчивый каскад», 2026-10-07).
+#
+# Замер 2026-10-06: из 16 принятых WABA-сообщений `delivered`-подтверждение
+# пришло ровно для одного, при этом в UI Wazzup 4 из 6 были без ошибок.
+# То есть «✓ в интерфейсе» ≠ «доставлено», а молчание ≠ отказ. Старая логика
+# («нет подтверждения за RESCUE_SETTLE_MINUTES → провал → откат») давала
+# ложные провалы порядка 70-80% и лила дубли в личные каналы.
+#
+# Теперь молчание порождает отдельное состояние `unknown`, и в откат оно
+# попадает только спустя длинный горизонт. Явный отказ (`failed` с события
+# или от транспорта) — по короткому горизонту.
+REJECT_GRACE_MINUTES = int(
+    os.environ.get("BULK_REJECT_GRACE_MINUTES",
+                   os.environ.get("BULK_RESCUE_SETTLE_MINUTES", "5"))
+    or "5"
+)
+UNKNOWN_GRACE_MINUTES = int(os.environ.get("BULK_UNKNOWN_GRACE_MINUTES", "720"))
+
+# Потолок попыток для одного контакта: исчерпал → status='exhausted',
+# больше автоматических попыток нет, контакт уходит в ежедневную выгрузку.
+EXHAUST_MAX_ATTEMPTS = int(os.environ.get("BULK_EXHAUST_MAX_ATTEMPTS", "3"))
+EXHAUST_WINDOW_DAYS = int(os.environ.get("BULK_EXHAUST_WINDOW_DAYS", "7"))
+
+# Молчание по WABA почти всегда означает отказ Meta по маркетинговому лимиту
+# («Сейчас этому клиенту нельзя отправить шаблон „Маркетинг“»). Отказ не
+# приходит событием, но и повторно слать бессмысленно: контакт уходит в
+# антикоастинг на столько дней, но ОСТАЁТСЯ доступен для отката по другим
+# каналам.
+WABA_SILENT_COOLDOWN_DAYS = int(os.environ.get("BULK_WABA_SILENT_COOLDOWN_DAYS", "14"))
+
+# Параллелизм фазы WABA. После пополнения баланса tier 1 = 1000/день, при
+# последовательной паузе 10-30с это ~9 часов прогона. Личные каналы НИКОГДА
+# не распараллеливаются — их потолок не скорость, а лимит.
+WABA_CONCURRENCY = max(1, int(os.environ.get("BULK_WABA_CONCURRENCY", "5")))
+
+# Инвариант: не более одного сообщения на контакт в одном канале за окно.
+CONTACT_CHANNEL_COOLDOWN_HOURS = int(
+    os.environ.get("BULK_CONTACT_CHANNEL_COOLDOWN_HOURS", "24")
+)
+
+# Прозрачность в Telegram: успехи не летят построчно, только агрегат раз в N
+# и итог прогона.
+TG_DIGEST_EVERY = int(os.environ.get("BULK_TG_DIGEST_EVERY", "25"))
+TG_MAX_MESSAGES_PER_HOUR = int(os.environ.get("BULK_TG_MAX_PER_HOUR", "60"))
+
+# Как часто опрашивать Wazzup за реальным tier WABA. Через вебхук тир приходит
+# событием channel.waba_tier_update, но вебхук может быть не поднят/устарел —
+# тогда баланс пополнен, а система thinks tier 0 и живёт на 250/день.
+WABA_TIER_REFRESH_HOURS = int(os.environ.get("BULK_WABA_TIER_REFRESH_HOURS", "12"))
+
 # Такая же пауза между фазами отката (после TG — перед MAX), чтобы долетели
 # статусы по предыдущему каналу. По той же причине сопровождается сторожом.
 RESCUE_SETTLE_MINUTES = int(os.environ.get("BULK_RESCUE_SETTLE_MINUTES", "5"))

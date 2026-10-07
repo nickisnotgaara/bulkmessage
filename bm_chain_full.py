@@ -48,6 +48,16 @@ config.BULK_BYPASS_SAFE_HOURS = True
 config.PHASE_ORDER = ["waba", "telegram", "max"]
 config.PHASE_GRACE_MINUTES = 0
 config.RESCUE_SETTLE_MINUTES = 0
+# Трёхзначная доставка (2026-10-07): молчание уходит в откат не через 5 минут,
+# а через длинный горизонт. Стенд имитирует именно «горизонт выдержан» —
+# иначе каскад вообще не проверяется, потому что тишина WABA держится часами.
+config.UNKNOWN_GRACE_MINUTES = 0
+config.REJECT_GRACE_MINUTES = 0
+config.EXHAUST_MAX_ATTEMPTS = 3
+config.EXHAUST_WINDOW_DAYS = 7
+config.WABA_SILENT_COOLDOWN_DAYS = 14
+config.CONTACT_CHANNEL_COOLDOWN_HOURS = 24
+config.WABA_CONCURRENCY = 1        # стенд проверяет порядок, не гонку потоков
 config.WABA_RUN_LIMIT = 0
 config.CHANNEL_HEALTH_GUARD = False   # считаем канал живым: доставки есть
 config.CHANNEL_DAILY_LIMITS = {"whatsapp": 60, "telegram": 50, "max": 15,
@@ -207,8 +217,19 @@ check("Telegram: ошибки «сменил @никнейм» помечены 
       res.get(("telegram", "failed"), 0) == len(TG_ERROR), str(res))
 check("Telegram: молчащий остаётся 'sent' до своего сторожа",
       res.get(("telegram", "sent"), 0) == len(TG_SILENT), str(res))
-check("WABA: после сторожа не осталось 'sent' — тишина стала провалом",
-      res.get(("waba", "sent"), 0) == 0, str(res))
+# Правка 2026-10-07: молчание больше не переписывается в 'failed'. Оно
+# помечается delivery_state='unknown' и уходит в откат по длинному
+# горизонту. Проверяем именно состояние, а не прежний status.
+_con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+_unknown_cnt = _con.execute(
+    "SELECT COUNT(*) FROM messages WHERE delivery_state='unknown'").fetchone()[0]
+_swept_cnt = _con.execute(
+    "SELECT COUNT(*) FROM messages WHERE swept_at IS NOT NULL").fetchone()[0]
+_con.close()
+check("WABA: тишина помечена unknown, а не превращена в отказ",
+      _unknown_cnt >= 4, f"unknown={_unknown_cnt}")
+check("сторож отметил обработанные сообщения (повторный проход их не видит)",
+      _swept_cnt >= 4, f"swept={_swept_cnt}")
 check("никому не отправили дважды в Telegram",
       len(tg_sent) == len(set(tg_sent)))
 

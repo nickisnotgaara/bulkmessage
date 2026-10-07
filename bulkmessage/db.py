@@ -263,6 +263,8 @@ def init_db() -> None:
         c.execute("CREATE INDEX IF NOT EXISTS idx_sheets_ops_done ON sheets_ops(done)")
         # Phase 7: rescue queue (WABA → Personal cascade retry on async WABA failure)
         init_rescue_queue()
+        # Трёхзначная доставка + счётчики дня в SQLite (план «устойчивый каскад»)
+        init_delivery_tracking()
         # Phase 0.1: channel_reachability cache (pre-check results, TTL 24h)
         c.execute(
             """
@@ -618,6 +620,18 @@ def init_rescue_queue() -> None:
             c.execute(
                 "ALTER TABLE rescue_queue ADD COLUMN retry_after TEXT"
             )
+        # Потолок попыток (план «устойчивый каскад»): контакт, исчерпавший
+        # каналы, обязан получить ТЕРМИНАЛЬНЫЙ статус 'exhausted', а не крутиться
+        # в очереди вечно. Для этого считаем попытки по всем каналам, а не по
+        # одной строке, и помним исход последней попытки.
+        for _col, _ddl in (
+            ("attempts_total", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_outcome", "TEXT"),
+            ("next_eligible_at", "TEXT"),
+            ("first_seen", "TEXT"),
+        ):
+            if not _has_column(conn, "rescue_queue", _col):
+                c.execute(f"ALTER TABLE rescue_queue ADD COLUMN {_col} {_ddl}")
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_rescue_status "
             "ON rescue_queue(status, created_at)"
@@ -626,6 +640,330 @@ def init_rescue_queue() -> None:
             "CREATE INDEX IF NOT EXISTS idx_rescue_phone "
             "ON rescue_queue(phone)"
         )
+
+
+def init_delivery_tracking() -> None:
+    """Трёхзначная доставка + счётчики дня в SQLite.
+
+    Замер 2026-10-06 показал, что отправка (HTTP 200) и доставка — разные
+    вещи, а молчание Meta вообще не приходит событием. Поэтому:
+
+    * `messages.delivery_state` — трёхзначное состояние: delivered / unknown /
+      rejected. `status` остаётся для обратной совместимости и UI.
+    * `delivery_events` — аудит каждого события; UNIQUE(message_id,
+      event_status) делает обработку идемпотентной, поэтому повторный POST
+      или переигрывание лога не двигают счётчики.
+    * `daily_counters` — счётчики дня, которые раньше жили в state.json.
+      Два процесса (sender и webhook) делали read-modify-write одного файла,
+      из-за чего `delivered_today` переползал `accepted_today` и отчёт
+      показывал 128%. Здесь инкремент атомарен через UPSERT.
+    """
+    with db_conn() as conn:
+        c = conn.cursor()
+        if not _has_column(conn, "messages", "delivery_state"):
+            c.execute(
+                "ALTER TABLE messages ADD COLUMN delivery_state "
+                "TEXT NOT NULL DEFAULT 'unknown'"
+            )
+            # Бэкфилл: исторические строки переводятся из прежнего status.
+            c.execute(
+                "UPDATE messages SET delivery_state = CASE "
+                "  WHEN status IN ('delivered','read') THEN 'delivered' "
+                "  WHEN status = 'failed' THEN 'rejected' "
+                "  ELSE 'unknown' END "
+                "WHERE delivery_state = 'unknown'"
+            )
+        # swept_at — метка «сторож уже разбирал это сообщение».
+        #
+        # Без неё тихое сообщение пересобиралось сторожем в каждой фазе
+        # заново: контакт, которому Telegram только что ДОСТАВИЛ, снова
+        # попадал в очередь отката по своему же старому молчаливому
+        # сообщению в WABA и получал дубль в MAX. Раньше этого не
+        # случалось только потому, что сторож переписывал status на
+        # 'failed', и следующий проход его не видел.
+        if not _has_column(conn, "messages", "swept_at"):
+            c.execute("ALTER TABLE messages ADD COLUMN swept_at TEXT")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS delivery_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_pk INTEGER,
+                message_id TEXT NOT NULL,
+                channel TEXT,
+                event_status TEXT NOT NULL,
+                envelope TEXT,
+                received_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'webhook'
+            )
+            """
+        )
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_delivery_event "
+            "ON delivery_events(message_id, event_status)"
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_counters (
+                date TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                accepted INTEGER NOT NULL DEFAULT 0,
+                delivered INTEGER NOT NULL DEFAULT 0,
+                rejected INTEGER NOT NULL DEFAULT 0,
+                unknown INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT,
+                PRIMARY KEY (date, channel)
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contact_cooldowns (
+                phone TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                until TEXT NOT NULL,
+                reason TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (phone, channel)
+            )
+            """
+        )
+
+
+# ============================================================
+# Счётчики дня (источник истины — SQLite, не state.json)
+# ============================================================
+
+
+def today_str() -> str:
+    """'YYYY-MM-DD' в настроенной TZ проекта (BULK_TIMEZONE)."""
+    return config.now_tz().strftime("%Y-%m-%d")
+
+
+def upsert_counter(
+    date: str,
+    channel: str,
+    field: str = "accepted",
+    delta: int = 1,
+) -> int:
+    """Атомарный инкремент счётчика дня. Возвращает новое значение.
+
+    UPSERT, а не read-modify-write: sender и webhook пишут счётчики
+    одновременно, и при старой схеме один терял обновления другого.
+    """
+    if field not in ("accepted", "delivered", "rejected", "unknown"):
+        raise ValueError(f"unknown counter field: {field}")
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            f"""
+            INSERT INTO daily_counters (date, channel, {field}, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(date, channel) DO UPDATE SET
+                {field} = {field} + excluded.{field},
+                updated_at = excluded.updated_at
+            """,
+            (date, channel, delta, now),
+        )
+        row = c.execute(
+            f"SELECT {field} AS v FROM daily_counters "
+            "WHERE date = ? AND channel = ?",
+            (date, channel),
+        ).fetchone()
+        return int(row["v"]) if row else 0
+
+
+def get_counters(date: Optional[str] = None) -> dict:
+    """{channel: {accepted, delivered, rejected, unknown}} за дату."""
+    date = date or today_str()
+    out: dict = {}
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT channel, accepted, delivered, rejected, unknown "
+            "FROM daily_counters WHERE date = ?",
+            (date,),
+        ).fetchall()
+    for r in rows:
+        out[r["channel"]] = {
+            "accepted": int(r["accepted"]),
+            "delivered": int(r["delivered"]),
+            "rejected": int(r["rejected"]),
+            "unknown": int(r["unknown"]),
+        }
+    return out
+
+
+def migrate_counters_from_state(state_dict: dict) -> int:
+    """Переносит счётчики дня из state.json в daily_counters (однократно).
+
+    Возвращает число перенесённых значений. Идемпотентно: если на дату уже
+    есть непустая строка в daily_counters — перенос не делается.
+    """
+    date = str(state_dict.get("date") or today_str())
+    existing = get_counters(date)
+    if any(any(v for v in row.values()) for row in existing.values()):
+        return 0
+    moved = 0
+    for bucket, field in (
+        ("accepted_today", "accepted"),
+        ("delivered_today", "delivered"),
+        ("failed_today", "rejected"),
+    ):
+        for channel, value in (state_dict.get(bucket) or {}).items():
+            value = int(value or 0)
+            if value <= 0:
+                continue
+            upsert_counter(date, channel, field, delta=value)
+            moved += 1
+    return moved
+
+
+# ============================================================
+# События доставки (идемпотентные)
+# ============================================================
+
+
+def apply_delivery_event(
+    message_pk: int,
+    message_id: str,
+    channel: str,
+    event_status: str,
+    envelope: Optional[str] = None,
+    source: str = "webhook",
+) -> bool:
+    """Регистрирует событие доставки. True — если это НОВОЕ событие.
+
+    Идемпотентно: повтор по (message_id, event_status) игнорируется, поэтому
+    дубль POST от Wazzup или переигрывание лога не двигают ни состояние
+    сообщения, ни счётчики.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT OR IGNORE INTO delivery_events
+                (message_pk, message_id, channel, event_status, envelope,
+                 received_at, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (message_pk, message_id, channel, event_status,
+             (envelope or "")[:500], now, source),
+        )
+        if c.rowcount == 0:
+            return False
+        if event_status == "delivered":
+            c.execute(
+                "UPDATE messages SET delivery_state = 'delivered', "
+                "status = CASE WHEN status IN ('sent','queued') THEN 'delivered' "
+                "             ELSE status END, "
+                "updated_at = ? WHERE id = ?",
+                (now, message_pk),
+            )
+        elif event_status == "rejected":
+            c.execute(
+                "UPDATE messages SET delivery_state = 'rejected', "
+                "updated_at = ? WHERE id = ?",
+                (now, message_pk),
+            )
+        return True
+
+
+def set_delivery_state(message_pk: int, state: str) -> None:
+    """Проставляет трёхзначное состояние без события (sweeper/sender)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE messages SET delivery_state = ?, updated_at = ? WHERE id = ?",
+            (state, now, message_pk),
+        )
+
+
+def mark_swept(message_pk: int) -> None:
+    """Помечает сообщение как уже разобранное сторожем.
+
+    Повторный разбор одного и того же молчания в следующей фазе отката
+    создавал дубль: контакт, доставленный в Telegram, снова попадал в
+    очередь по своему старому молчаливому сообщению в WABA.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE messages SET swept_at = ? WHERE id = ? AND swept_at IS NULL",
+            (now, message_pk),
+        )
+
+
+def cancel_rescue_for_contact(phone: str) -> int:
+    """Снимает контакт из очереди отката: доставка подтверждена.
+
+    Позднее `delivered` после постановки в откат обязан отменять запись —
+    иначе контакт получает дубликат в личном канале.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE rescue_queue SET status = 'cancelled', next_eligible_at = NULL, "
+            "updated_at = ? WHERE phone = ? AND status IN ('pending', 'deferred')",
+            (now, phone),
+        )
+        return c.rowcount
+
+
+# ============================================================
+# Антикоастинг по WABA (молчание = отказ Meta по маркетинговому лимиту)
+# ============================================================
+
+
+def set_contact_cooldown(
+    phone: str, channel: str, until_iso: str, reason: Optional[str] = None
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO contact_cooldowns (phone, channel, until, reason, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(phone, channel) DO UPDATE SET "
+            "until = excluded.until, reason = excluded.reason, "
+            "updated_at = excluded.updated_at",
+            (phone, channel, until_iso, (reason or "")[:200], now),
+        )
+
+
+def get_active_cooldowns(channel: str, now_iso: Optional[str] = None) -> set:
+    """Номера с активным антикоастингом по каналу (для выборки контактов)."""
+    now_iso = now_iso or datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT phone FROM contact_cooldowns WHERE channel = ? AND until > ?",
+            (channel, now_iso),
+        ).fetchall()
+    return {r["phone"] for r in rows}
+
+
+def recent_channel_send(phone: str, channel: str, hours: int = 24) -> bool:
+    """True, если по этому контакту уже уходила отправка в канале за N часов.
+
+    Инвариант «не больше одного сообщения на контакт в канале за сутки».
+    Считаем именно отправки (status НЕ 'failed' — явный отказ канала не
+    считаем, после него повтор по другому каналу разрешён), а не доставки:
+    доставка неизвестна по определению, и ждать её нельзя.
+    """
+    cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+    with db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM messages m
+            JOIN contacts ct ON ct.id = m.contact_id
+            WHERE ct.phone = ? AND m.channel = ?
+              AND m.status != 'failed'
+              AND m.sent_at IS NOT NULL
+              AND CAST(strftime('%s', m.sent_at) AS INTEGER) >= ?
+            """,
+            (phone, channel, cutoff),
+        ).fetchone()
+    return bool(row and int(row[0]) > 0)
 
 
 def enqueue_rescue(
@@ -786,13 +1124,148 @@ def mark_rescue_attempt(rescue_id: int, error: Optional[str] = None) -> None:
             """
             UPDATE rescue_queue
             SET attempts = attempts + 1,
+                attempts_total = attempts_total + 1,
                 last_attempt_at = ?,
+                last_outcome = ?,
+                first_seen = COALESCE(first_seen, ?),
                 updated_at = ?,
                 status = CASE WHEN attempts + 1 >= 3 THEN 'failed' ELSE 'pending' END
             WHERE id = ?
             """,
-            (now, now, rescue_id),
+            (now, (error or "")[:200], now, now, rescue_id),
         )
+
+
+# ============================================================
+# Терминальный статус exhausted (план «устойчивый каскад»)
+# ============================================================
+
+
+def get_rescue_row(rescue_id: int) -> Optional[dict]:
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM rescue_queue WHERE id = ?", (rescue_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def mark_rescue_exhausted(rescue_id: int, reason: str = "all_channels_tried") -> None:
+    """Терминальный статус: контакт больше не трогается автоматически.
+
+    Бесконечный retry в очереди — это расход квоты на заведомо недостижимые
+    номера. Здесь контакт окончательно выходит из автоматики и попадает в
+    ежедневную выгрузку для ручного разбора.
+    """
+    if not rescue_id:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE rescue_queue SET status='exhausted', next_eligible_at=NULL, "
+            "last_outcome=?, updated_at=? WHERE id=?",
+            (reason[:200], now, rescue_id),
+        )
+
+
+def bump_attempts_total(rescue_id: int, outcome: Optional[str] = None) -> int:
+    """Считает попытку в канале отката (в т.ч. явный отказ транспорта)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE rescue_queue SET attempts_total = attempts_total + 1, "
+            "last_outcome = ?, first_seen = COALESCE(first_seen, ?), "
+            "updated_at = ? WHERE id = ?",
+            ((outcome or "")[:200], now, now, rescue_id),
+        )
+        row = c.execute(
+            "SELECT attempts_total FROM rescue_queue WHERE id = ?", (rescue_id,)
+        ).fetchone()
+        return int(row["attempts_total"]) if row else 0
+
+
+def should_exhaust(
+    rescue_id: int, all_channels: list, now_iso: Optional[str] = None
+) -> Optional[str]:
+    """Решает, исчерпан ли контакт. Возвращает причину или None.
+
+    Условия (из плана):
+      * attempts_total >= EXHAUST_MAX_ATTEMPTS, или
+      * испробованы ВСЕ каналы И первая попытка старше EXHAUST_WINDOW_DAYS.
+    """
+    row = get_rescue_row(rescue_id)
+    if row is None:
+        return None
+    if row.get("status") == "exhausted":
+        return None
+    if int(row.get("attempts_total") or 0) >= int(config.EXHAUST_MAX_ATTEMPTS):
+        return f"attempts>={config.EXHAUST_MAX_ATTEMPTS}"
+    tried = set(_split_tried(row.get("tried_channels")))
+    if all_channels and set(all_channels).issubset(tried):
+        first_seen = row.get("first_seen") or row.get("created_at")
+        try:
+            age_days = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(str(first_seen))
+            ).days
+        except Exception:
+            age_days = 0
+        if age_days >= int(config.EXHAUST_WINDOW_DAYS):
+            return f"all_channels_tried, age>={config.EXHAUST_WINDOW_DAYS}d"
+    return None
+
+
+def count_exhausted_rescues() -> int:
+    with db_conn() as conn:
+        return (conn.execute(
+            "SELECT COUNT(*) FROM rescue_queue WHERE status = 'exhausted'"
+        ).fetchone() or [0])[0]
+
+
+def exhausted_rows() -> list:
+    with db_conn() as conn:
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT phone, name, category, original_channel, reason, "
+                "tried_channels, attempts_total, last_outcome, last_attempt_at, "
+                "updated_at FROM rescue_queue WHERE status = 'exhausted' "
+                "ORDER BY updated_at DESC"
+            )
+        ]
+
+
+def export_exhausted_csv(data_dir) -> Optional[str]:
+    """Выгружает исчерпанных в CSV, но не чаще одного раза в сутки.
+
+    Терминальный статус без выгрузки = тихая потеря контакта: система
+    перестаёт его трогать, и владелец не узнает, что номер выбыл. Файл
+    `exhausted_YYYY-MM-DD.csv` служит маркером того, что выгрузка за день
+    уже была.
+    """
+    import csv
+    from pathlib import Path
+
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    date = today_str()
+    out = data_dir / f"exhausted_{date}.csv"
+    if out.exists():
+        return None
+    rows = exhausted_rows()
+    with out.open("w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["phone", "name", "category", "original_channel",
+                    "tried_channels", "attempts_total", "reason",
+                    "last_outcome", "last_attempt_at"])
+        for r in rows:
+            w.writerow([
+                r["phone"], r.get("name"), r.get("category"),
+                r.get("original_channel"), r.get("tried_channels"),
+                r.get("attempts_total"), r.get("reason"),
+                r.get("last_outcome"), r.get("last_attempt_at"),
+            ])
+    return str(out)
 
 
 def _split_tried(raw: Optional[str]) -> list[str]:
@@ -921,6 +1394,8 @@ def find_unconfirmed(
     limit: int = 200,
     channels: tuple = ("waba", "telegram", "max", "whatsapp"),
     max_age_hours: int = 24,
+    only_status: Optional[tuple] = ("sent",),
+    min_age_hours: int = 0,
 ) -> list[sqlite3.Row]:
     """Сообщения, ПРИНЯТЫЕ транспортом, но БЕЗ подтверждения доставки.
 
@@ -933,10 +1408,38 @@ def find_unconfirmed(
     поднял бы в rescue ВСЮ историю (в реальной базе — 150 сообщений от июля,
     2,5 месяца назад) и повторно отрекламировал бы старым контактам, выбив
     дневной бюджет. Сторож ловит только «свежее принятое, но не подтверждённое».
+
+    `only_status` позволяет сторожу разбирать ЯВНЫЕ отказы ('failed') и
+    МОЛЧАНИЕ ('sent') разными горизонтами: молчание не равно отказу, у него
+    свой (длинный) таймаут. `max_age_hours=0` снимает верхнюю границу —
+    так отбираются сообщения для перевода в exhausted, и там обязательно
+    задаётся `min_age_hours`, иначе в exhausted уедут СВЕЖИЕ сообщения,
+    которые просто ещё не дождались подтверждения.
     """
+    statuses = only_status or ("sent",)
+    s_marks = ",".join("?" * len(statuses))
     c_limit = minutes * 60
     age_limit = max_age_hours * 3600
+    min_limit = min_age_hours * 3600
     marks = ",".join("?" * len(channels))
+    age_clause = (
+        "" if max_age_hours <= 0 else
+        "AND CAST(strftime('%s','now') AS INTEGER) - "
+        "CAST(strftime('%s', COALESCE(m.sent_at, m.created_at)) AS INTEGER) < ?"
+    )
+    min_clause = (
+        "AND CAST(strftime('%s','now') AS INTEGER) - "
+        "CAST(strftime('%s', COALESCE(m.sent_at, m.created_at)) AS INTEGER) > ?"
+    ) if min_limit > 0 else ""
+    # Порядок параметров ДОЛЖЕН совпадать с порядком плейсхолдеров в SQL:
+    # сначала идёт `m.status IN (...)`, затем `m.channel IN (...)`.
+    params: list = [*statuses, *channels]
+    params.append(c_limit)
+    if max_age_hours > 0:
+        params.append(age_limit)
+    if min_limit > 0:
+        params.append(min_limit)
+    params.append(limit)
     with db_conn() as conn:
         c = conn.cursor()
         c.execute(
@@ -946,19 +1449,20 @@ def find_unconfirmed(
                    ct.category
             FROM messages m
             JOIN contacts ct ON ct.id = m.contact_id
-            WHERE m.status = 'sent'
+            WHERE m.status IN ({s_marks})
               AND m.delivered_at IS NULL
               AND m.read_at IS NULL
               AND m.answered_at IS NULL
+              AND m.swept_at IS NULL
               AND m.channel IN ({marks})
               AND CAST(strftime('%s','now') AS INTEGER) -
                   CAST(strftime('%s', COALESCE(m.sent_at, m.created_at)) AS INTEGER) > ?
-              AND CAST(strftime('%s','now') AS INTEGER) -
-                  CAST(strftime('%s', COALESCE(m.sent_at, m.created_at)) AS INTEGER) < ?
+              {age_clause}
+              {min_clause}
             ORDER BY m.id ASC
             LIMIT ?
             """,
-            (*channels, c_limit, age_limit, limit),
+            params,
         )
         return c.fetchall()
 

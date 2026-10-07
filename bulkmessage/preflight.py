@@ -14,7 +14,11 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
+import urllib.request
+from pathlib import Path
 from typing import Any
 
 from . import config, db, wazzup, waba_templates, state, sms_ru, templates
@@ -27,6 +31,85 @@ def _check(name: str, ok: bool, detail: str = "") -> bool:
         line += f" — {detail}"
     print(line)
     return ok
+
+
+def _note(name: str, detail: str = "") -> None:
+    """Неблокирующее предупреждение (⚠️): не влияет на exit code."""
+    line = f"  ⚠️ {name}"
+    if detail:
+        line += f" — {detail}"
+    print(line)
+
+
+# ── Версия кода ────────────────────────────────────────────────────────
+# Логика НАМЕРЕННО продублирована из bulkmessage/webhook_app.py: общая
+# зависимость ради пяти строк связала бы preflight с FastAPI-приложением.
+# Правило одно: сравнивать только префиксы (сервер отдаёт полный sha из
+# .git/HEAD на 40 символов, локально git rev-parse --short даёт 7).
+
+
+def _sha_from_git_dir(git_dir: Path) -> str:
+    try:
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not head.startswith("ref:"):
+        return head[:40]
+    ref = head.split(":", 1)[1].strip()
+    try:
+        return (git_dir / ref).read_text(encoding="utf-8").strip()[:40]
+    except OSError:
+        pass
+    try:
+        for line in (git_dir / "packed-refs").read_text(encoding="utf-8").splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            sha, _, name = line.partition(" ")
+            if name.strip() == ref:
+                return sha.strip()[:40]
+    except OSError:
+        pass
+    return ""
+
+
+def _detect_code_version() -> str:
+    """SHA кода на диске (та же цепочка источников, что и в /health)."""
+    root = Path(__file__).resolve().parent.parent
+    for git_dir in (Path("/opt/bulkmessage/.git"), root / ".git"):
+        sha = _sha_from_git_dir(git_dir)
+        if sha:
+            return sha
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(root), capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    try:
+        v = (root / ".code_version").read_text(encoding="utf-8").strip()
+        if v:
+            return v
+    except OSError:
+        pass
+    return os.environ.get("BULK_CODE_VERSION", "").strip() or "unknown"
+
+
+def _same_version(a: str, b: str) -> bool:
+    a, b = (a or "").strip(), (b or "").strip()
+    return bool(a) and bool(b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+def _fetch_health_version(base: str, timeout: float = 5.0) -> tuple[str, str]:
+    """GET https://<base>/health → (code_version, ошибка)."""
+    try:
+        with urllib.request.urlopen(f"https://{base}/health", timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return str(data.get("code_version") or "unknown"), ""
+    except Exception as e:
+        return "", f"{type(e).__name__}: {e}"[:80]
 
 def run_preflight() -> int:
     """Запускает preflight проверки. Возвращает 0 если всё OK, 1 если есть проблемы."""
@@ -51,6 +134,15 @@ def run_preflight() -> int:
     print("\n── 2. CHANNELS & LIMITS ──")
     for ch, cap in config.CHANNEL_DAILY_LIMITS.items():
         if ch == "waba":
+            # Tier приходит событием webхука, а вебхук может быть не поднят или
+            # работать на устаревшем коде. Реальный случай 2026-10-07: баланс
+            # пополнен, а система продолжала считать tier=0 и жить по 250/день.
+            # Поэтому preflight сам опрашивает Wazzup — источник независимый.
+            try:
+                from . import wazzup as _wz
+                _live_tier = _wz.refresh_waba_tier()
+            except Exception:
+                _live_tier = None
             tier = state.get_waba_tier(state.load_state())
             tier_cap = config.WABA_TIER_LIMITS.get(tier, "?")
             effective_waba = state.effective_waba_cap(state.load_state())
@@ -61,6 +153,8 @@ def run_preflight() -> int:
                 f"hard_cap={cap}, tier={tier} (cap={tier_cap}), "
                 f"effective_with_headroom={headroom_cap}",
             )
+            if _live_tier is not None and _live_tier != tier:
+                print(f"  ⚠️  Wazzup сообщает другой tier ({_live_tier})")
         else:
             headroom_cap = state.channel_effective_cap(state.load_state(), ch)
             # Потолок личных каналов ПЕР-КАНАЛЬНЫЙ (TG 50, MAX 15). Раньше здесь
@@ -292,6 +386,38 @@ def run_preflight() -> int:
             )
     except Exception as e:
         all_ok &= _check("spintax load", False, str(e)[:80])
+
+    # 9. Версия кода боевого вебхука.
+    # Главная защита от класса багов «процесс молча живёт на старом коде»:
+    # 2026-10-06 вебхук стартовал в 12:53 UTC, фикс разбора конверта
+    # {"statuses": [...]} приехал в 13:47 — 54 минуты события статусов
+    # ПРИХОДИЛИ и логировались, а подтверждений доставки не появилось ни одного.
+    print("\n── 9. WEBHOOK CODE VERSION ──")
+    local_ver = _detect_code_version()
+    _check("локальная версия кода", True, local_ver)
+    if not config.WAZZUP_WEBHOOK_URL:
+        _note("сверка с вебхуком пропущена",
+              "WAZZUP_WEBHOOK_URL не задан — локальный прогон может идти "
+              "вообще без вебхука")
+    else:
+        base = config.WAZZUP_WEBHOOK_URL.split("//", 1)[-1].split("/", 1)[0]
+        remote_ver, err = _fetch_health_version(base, timeout=5)
+        if not remote_ver:
+            _note(f"вебхук {base} недоступен",
+                  f"{err} — версию сверить не удалось")
+        elif remote_ver == "unknown" or local_ver == "unknown":
+            _note("версию кода определить не удалось",
+                  f"local={local_ver}, remote={remote_ver} — перезапусти "
+                  f"вебхук с BULK_CODE_VERSION или .code_version")
+        elif _same_version(local_ver, remote_ver):
+            all_ok &= _check("версия кода вебхука", True,
+                             f"local=remote={local_ver}")
+        else:
+            all_ok &= _check(
+                "версия кода вебхука", False,
+                f"вебхук на устаревшем коде: {local_ver} vs {remote_ver} — "
+                f"перезапусти боевой вебхук",
+            )
 
     print()
     print("═" * 60)

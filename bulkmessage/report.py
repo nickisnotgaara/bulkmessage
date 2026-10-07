@@ -107,9 +107,24 @@ def build_report() -> str:
     st = state.load_state()
     st = state.reset_daily_if_new_day(st)
 
-    acc = st.get("accepted_today", {}) or {}
-    dlv = st.get("delivered_today", {}) or {}
-    flt = st.get("failed_today", {}) or {}
+    # Источник истины — daily_counters в SQLite. Раньше счётчики жили в
+    # state.json, куда писали ДВА процесса (sender и webhook) методом
+    # read-modify-write. Из-за потери обновлений отчёт показывал невозможные
+    # цифры: «доставлено 60 (128%)» при принятых 47. state.json остаётся
+    # запасным источником, если таблицы ещё нет (миграция).
+    try:
+        _db = db.get_counters()
+    except Exception:
+        _db = {}
+    acc = {ch: c["accepted"] for ch, c in _db.items()}
+    dlv = {ch: c["delivered"] for ch, c in _db.items()}
+    flt = {ch: c["rejected"] for ch, c in _db.items()}
+    unk = {ch: c["unknown"] for ch, c in _db.items()}
+    if not _db:
+        acc = st.get("accepted_today", {}) or {}
+        dlv = st.get("delivered_today", {}) or {}
+        flt = st.get("failed_today", {}) or {}
+        unk = {}
 
     out: list[str] = []
     out.append("=" * 70)

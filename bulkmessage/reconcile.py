@@ -198,6 +198,25 @@ def process_delivery_status(channel: str, msg: dict) -> None:
         # в несуществующий канал. Строка в БД — единственный достоверный
         # источник: её туда положил sender в момент реальной отправки.
         channel = row["channel"] or channel
+        # Трёхзначное состояние доставки. Ключевая правка 2026-10-07:
+        # событие пишется ИДЕМПОТЕНТНО (delivery_events UNIQUE по
+        # message_id+event_status), а `delivered` не только помечает
+        # сообщение, но и СНИМАЕТ контакт из очереди отката. Без этого
+        # позднее подтверждение приходило уже после постановки в rescue —
+        # и контакт получал дубликат в личном канале.
+        applied = db.apply_delivery_event(
+            message_pk=row["id"],
+            message_id=message_id,
+            channel=channel,
+            event_status=(
+                "delivered" if status in ("delivered", "read") else
+                "rejected" if status == "failed" else status
+            ),
+            envelope=json.dumps(msg, ensure_ascii=False)[:500],
+            source="webhook",
+        )
+        if not applied:
+            log.info(f"   ↺ дубль события {message_id}/{status} — игнорирую")
         kwargs: dict = {"message_pk": row["id"]}
         if status == "delivered":
             kwargs.update({"status": "delivered", "delivered_at": True})
@@ -229,6 +248,25 @@ def process_delivery_status(channel: str, msg: dict) -> None:
         contact_id=contact_id, channel=channel, status=status, message_pk=message_pk
     )
 
+    # Позднее подтверждение доставки снимает контакт из отката: он не должен
+    # получить второе сообщение в личном канале только потому, что очередь
+    # была поставлена до прихода статуса.
+    if applied and status in ("delivered", "read"):
+        try:
+            with db.db_conn() as conn5:
+                row5 = conn5.execute(
+                    "SELECT phone FROM contacts WHERE id = ?", (contact_id,)
+                ).fetchone()
+            if row5 and row5["phone"]:
+                cancelled = db.cancel_rescue_for_contact(row5["phone"])
+                if cancelled:
+                    log.info(
+                        f"   ✅ поздняя доставка {row5['phone']}: снято из "
+                        f"rescue {cancelled} записей"
+                    )
+        except Exception as e:
+            log.warning(f"late-delivered cancel rescue failed: {e}")
+
     # Phase 8: доставка подтверждена вебхуком — только теперь это «доставлено».
     # accepted_today уже был увеличен в момент HTTP 2xx; здесь мы доводим
     # счётчик доставки. Именно эта пара счётчиков делает fallback возможным:
@@ -240,6 +278,11 @@ def process_delivery_status(channel: str, msg: dict) -> None:
         if status in ("delivered", "read"):
             state_mod.record_delivered(cur_state, channel)
             state_mod.record_delivery_outcome(cur_state, channel, ok=True)
+            if applied:
+                # Счётчик дня живёт в SQLite: sender и webhook пишут его
+                # одновременно, и read-modify-write одного JSON-файла терял
+                # обновления (отчёт показывал «доставлено 128% от принятого»).
+                db.upsert_counter(db.today_str(), channel, "delivered")
             # Cooldown по паре (номер, канал): только подтверждённая доставка
             # включает откат на 96ч. Неподтверждённая отправка (свип уведёт её
             # в rescue) контакт не должна запирать.
@@ -261,6 +304,8 @@ def process_delivery_status(channel: str, msg: dict) -> None:
             )
         elif status == "failed":
             state_mod.record_failed_delivery(cur_state, channel)
+            if applied:
+                db.upsert_counter(db.today_str(), channel, "rejected")
             # WABA: явный failed от вебхука — единственный сигнал, по которому
             # номер выводится из WABA-пула. reachability_cache ниже протухает
             # за 24ч, а нам номер нужно исключать надолго (по умолчанию 30
@@ -755,107 +800,174 @@ def reconcile_pending_webhooks() -> None:
 
 
 def sweep_unconfirmed_deliveries(limit: int = 50,
-                                 minutes: int | None = None) -> int:
+                                 minutes: int | None = None,
+                                 unknown_minutes: int | None = None) -> int:
     """Сторож подтверждений: принято, но не подтверждено доставкой.
 
-    ВЕБХУК — единственный источник, который запускает fallback. Если он
-    потерян или подписка молчит, сообщение навсегда остаётся в статусе
-    `sent`: rescue-очередь его не видит, и контакт тихо исчезает из воронки.
-    Именно это и приводило к «100 отправлено → 28 дошло»: недоставки были,
-    а узнать о них было негде.
+    КЛЮЧЕВАЯ ПРАВКА 2026-10-07: молчание больше не равно провалу.
 
-    Здесь мы делаем «молчание» явным: помечаем сообщение как `failed`
-    с причиной `no_delivery_confirmation` и ставим контакт в rescue-очередь,
-    откуда sender отправит его следующим каналом.
+    Замер боевого прогона: 16 принятых сообщений, `delivered`-подтверждение
+    пришло ровно для одного, при этом в UI Wazzup 4 из 6 были без ошибок.
+    То есть `✓` в интерфейсе ≠ «доставлено», а молчание неоднозначно:
+    это может быть и доставка без события, и отказ Meta по маркетинговому
+    лимиту, и потерянное событие. Прежняя логика («нет подтверждения за
+    5 минут → провал → откат») давала ложные провалы порядка 70–80%
+    и лила дубликаты в личные аккаунты — прямой путь к бану.
 
-    ПОЧЕМУ ЭТО КРИТИЧНО: замер боевого прогона 2026-10-06 показал, что
-    Wazzup НЕ присылает статус `failed` вообще — ни разу за 1321 событие.
-    Реальный набор статусов: delivered / read / sent / error(BAD_CONTACT).
-    То есть отказ Meta по маркетинговому шаблону выглядит как ТИШИНА:
-    сообщение принято (HTTP 2xx), и про него больше никто не пишет.
-    Поэтому запускать откат только по явному `failed` бессмысленно —
-    очередь всегда пуста, и фазы Telegram/MAX не отрабатывают никогда.
-    Молчание и есть отказ.
+    Теперь:
+      * ЯВНЫЙ отказ (`status='failed'` в БД — событие вебхука или отказ
+        транспорта) → rescue через REJECT_GRACE_MINUTES (5 мин).
+      * Молчание (`status='sent'`) → состояние `unknown`, и в rescue оно
+        попадает только через UNKNOWN_GRACE_MINUTES (12 ч по умолчанию).
+      * Молчание старше CONFIRM_MAX_AGE_HOURS → сразу `exhausted`, не откат.
 
-    `minutes` — переопределение таймаута ожидания подтверждения. Фазы
-    отката ждут PHASE_GRACE_MINUTES (минуты), а не дефолтные 60: иначе
-    откат начнётся через час, когда человек уже не в окне 11–19 МСК.
+    `minutes` — старый параметр; он теперь значит горизонт для явного отказа
+    и по умолчанию равен REJECT_GRACE_MINUTES. Для обратной совместимости с
+    тестами, которые патчили RESCUE_SETTLE_MINUTES, явный `minutes` перекрывает
+    оба горизонта только если `unknown_minutes` не задан явно.
 
     Возвращает количество контактов, отправленных в rescue.
     """
-    if minutes is None:
-        minutes = getattr(config, "CONFIRM_TIMEOUT_MINUTES", 60)
+    reject_minutes = (
+        minutes if minutes is not None
+        else int(getattr(config, "REJECT_GRACE_MINUTES", 5))
+    )
+    if unknown_minutes is None:
+        # Явный `minutes` от тестов/вызывающего кода трактуем как «хочу увидеть
+        # откат сейчас»; иначе берём длинный консервативный горизонт.
+        unknown_minutes = (
+            reject_minutes if minutes is not None
+            else int(getattr(config, "UNKNOWN_GRACE_MINUTES", 720))
+        )
     max_age = getattr(config, "CONFIRM_MAX_AGE_HOURS", 24)
+    swept = 0
+    rejected_swept = 0
+    unknown_count = 0
+    unknown_swept = 0
+    exhausted_count = 0
+
+    # 1) Явные отказы — короткий горизонт.
     try:
         rows = db.find_unconfirmed(
-            minutes=minutes, limit=limit, max_age_hours=max_age
+            minutes=reject_minutes, limit=limit, max_age_hours=max_age,
+            only_status=("failed",),
         )
     except Exception as e:
-        log.warning(f"sweep_unconfirmed: выборка не удалась: {e}")
-        return 0
+        log.warning(f"sweep_unconfirmed(rejected): выборка не удалась: {e}")
+        rows = []
+    rejected_swept = _sweep_rows(rows, kind="rejected", reason="delivery_rejected")
+    swept += rejected_swept
 
+    # 2) Молчание — длинный горизонт, и оно НЕ равно отказу сразу.
+    try:
+        rows = db.find_unconfirmed(
+            minutes=unknown_minutes, limit=limit, max_age_hours=max_age,
+            only_status=("sent", "queued"),
+        )
+    except Exception as e:
+        log.warning(f"sweep_unconfirmed(unknown): выборка не удалась: {e}")
+        rows = []
+    unknown_count = len(rows)
+    # Молчание, дождавшееся длинного горизонта, ТОЖЕ уходит в откат —
+    # значит возвращаемое число должно включать и его, иначе вызывающий код
+    # (sender) считает, что откат пуст, и фазы личного канала идут вхолостую.
+    unknown_swept = _sweep_rows(rows, kind="unknown", reason="no_delivery_confirmation")
+    swept += unknown_swept
+
+    # 3) Молчание дольше суток — контакт уходит не в откат, а в exhausted.
+    #    Нижняя граница обязательна: без неё в exhausted уехало бы всё
+    #    свежее, что просто ещё не дождалось подтверждения.
+    try:
+        rows = db.find_unconfirmed(
+            minutes=0, limit=limit, max_age_hours=0,
+            only_status=("sent", "queued"),
+            min_age_hours=int(max_age),
+        )
+    except Exception as e:
+        log.warning(f"sweep_unconfirmed(exhausted): выборка не удалась: {e}")
+        rows = []
+    for r in rows:
+        try:
+            db.mark_swept(r["message_pk"])
+            db.set_delivery_state(r["message_pk"], "exhausted")
+        except Exception as e:
+            log.warning(f"sweep: exhausted не пометить {r['message_id']}: {e}")
+            continue
+        exhausted_count += 1
+
+    if swept or unknown_count or exhausted_count:
+        log.info(
+            f"🔍 Сторож: в rescue={swept} "
+            f"(явных отказов {rejected_swept} за горизонт {reject_minutes} мин + "
+            f"молчаний {unknown_swept} за горизонт {unknown_minutes} мин), "
+            f"всего молчаний под рассмотрением {unknown_count}, "
+            f"exhausted={exhausted_count}"
+        )
+    return swept
+
+
+def _sweep_rows(rows, kind: str, reason: str) -> int:
+    """Общая часть сторожа: помечает состояние и ставит контакт в rescue."""
     if not rows:
         return 0
-
-    log.warning(
-        f"🔍 Сторож подтверждений: {len(rows)} сообщений приняты, но доставка "
-        f"не подтверждена за {minutes} мин (webhook молчит?) — отправляю в rescue"
-    )
-
     swept = 0
-    try:
-        from . import state as state_mod
-        cur_state = state_mod.load_state()
-        cur_state = state_mod.reset_daily_if_new_day(cur_state)
-    except Exception:
-        cur_state = {}
-
-    with db.db_conn() as conn:
-        for r in rows:
-            channel = r["channel"]
-            try:
-                db.update_message_status(
-                    conn,
-                    message_pk=r["message_pk"],
-                    status="failed",
-                    last_error="no_delivery_confirmation",
-                )
-            except Exception as e:
-                log.warning(f"sweep: не пометить {r['message_id']}: {e}")
-                continue
-
-            # SMS — последний в каскаде, откатываться некуда
-            if channel == "sms":
-                continue
-
-            try:
-                db.enqueue_rescue(
-                    phone=r["phone"],
-                    name=r["name"],
-                    category=r["category"],
-                    original_channel=channel,
-                    reason="no_delivery_confirmation",
-                )
-                swept += 1
-            except Exception as e:
-                log.warning(f"sweep: rescue не поставить {r['phone']}: {e}")
-
-            try:
-                if cur_state:
-                    state_mod.record_failed_delivery(cur_state, channel)
-                    state_mod.record_delivery_outcome(
-                        cur_state, channel, ok=False,
-                        error_text="no_delivery_confirmation",
-                    )
-            except Exception:
-                pass
-
-    if cur_state:
+    for r in rows:
+        channel = r["channel"]
         try:
-            state_mod.save_state(cur_state)
+            db.mark_swept(r["message_pk"])
+            db.set_delivery_state(r["message_pk"], "rejected" if kind == "rejected"
+                                  else "unknown")
+        except Exception as e:
+            log.warning(f"sweep: не пометить {r['message_id']}: {e}")
+            continue
+        try:
+            db.upsert_counter(db.today_str(), channel,
+                              "rejected" if kind == "rejected" else "unknown")
         except Exception:
             pass
-    log.info(f"🔍 Сторож: {swept} контактов отправлены в rescue")
+        # SMS — последний в каскаде, откатываться некуда
+        if channel == "sms":
+            continue
+        try:
+            db.enqueue_rescue(
+                phone=r["phone"],
+                name=r["name"],
+                category=r["category"],
+                original_channel=channel,
+                reason=reason,
+            )
+            swept += 1
+            # Прозрачность: владелец видит, ЧТО и ПОЧЕМУ ушло в другой канал.
+            # Раньше в личку прилетал только «канал умер», и по нему нельзя было
+            # понять, сколько контактов реально переключилось и почему.
+            try:
+                from . import notify as _notify
+                _nxt = " → ".join(
+                    c for c in config.PHASE_ORDER if c != channel
+                ) or "нет каналов"
+                _notify.channel_switch(
+                    r["phone"], channel, _nxt,
+                    ("явный отказ: " if kind == "rejected" else "молчание: ")
+                    + reason,
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning(f"sweep: rescue не поставить {r['phone']}: {e}")
+        if kind == "unknown" and channel == "waba":
+            # Молчание по WABA — почти всегда отказ Meta по маркетинговому
+            # лимиту. Отправить ещё раз завтра бессмысленно: тот же отказ и
+            # тот же сгоревший слот. Но для других каналов контакт остаётся
+            # доступен — антикоастинг только на WABA.
+            try:
+                from datetime import timedelta
+                until = (datetime.now(timezone.utc)
+                         + timedelta(days=int(config.WABA_SILENT_COOLDOWN_DAYS))
+                         ).isoformat()
+                db.set_contact_cooldown(r["phone"], "waba", until,
+                                        "silent_no_confirmation")
+            except Exception:
+                pass
     return swept
 
 

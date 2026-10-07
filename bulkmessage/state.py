@@ -113,6 +113,25 @@ def channel_has_quota(state: dict, channel: str) -> bool:
     return channel_sent_today(state, channel) < config.CHANNEL_DAILY_LIMITS.get(channel, 0)
 
 
+def reconcile_sent_from_db(state: dict, channel: str) -> dict:
+    """Сверяет sent_today с атомарным счётчиком принятого в SQLite.
+
+    При параллельной отправке WABA несколько потоков пишут state.json, и
+    часть обновлений теряется — квота занижается. Источник истины теперь
+    daily_counters (инкремент через UPSERT, гонки нет), поэтому после
+    каждой отправки берём максимум из файла и БД.
+    """
+    try:
+        from . import db as _db
+        counters = _db.get_counters()
+        accepted = int((counters.get(channel) or {}).get("accepted", 0))
+    except Exception:
+        return state
+    if accepted > channel_sent_today(state, channel):
+        state.setdefault("sent_today", {})[channel] = accepted
+    return state
+
+
 def all_quotas_exhausted(state: dict, channels: list[str]) -> bool:
     return not any(channel_has_quota(state, ch) for ch in channels)
 
