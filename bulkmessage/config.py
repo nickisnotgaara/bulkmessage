@@ -574,6 +574,15 @@ REJECT_GRACE_MINUTES = int(
 )
 UNKNOWN_GRACE_MINUTES = int(os.environ.get("BULK_UNKNOWN_GRACE_MINUTES", "720"))
 
+# Боевой прогон без работающего вебхука: подтверждений доставки не будет, и
+# каскад откатов превратится в таймер — через UNKNOWN_GRACE_MINUTES принятые
+# сообщения уйдут в Telegram/MAX, то есть в ЛИЧНЫЕ аккаунты. Дефолт — отказ
+# со старта (sender.delivery_signal_available / _guard_delivery_signal).
+# Обход — только осознанно, цифрой 1.
+ALLOW_NO_DELIVERY_SIGNAL = bool(int(os.environ.get(
+    "BULK_ALLOW_NO_DELIVERY_SIGNAL", "0") or "0"
+))
+
 # Потолок попыток для одного контакта: исчерпал → status='exhausted',
 # больше автоматических попыток нет, контакт уходит в ежедневную выгрузку.
 EXHAUST_MAX_ATTEMPTS = int(os.environ.get("BULK_EXHAUST_MAX_ATTEMPTS", "3"))
@@ -600,10 +609,24 @@ CONTACT_CHANNEL_COOLDOWN_HOURS = int(
     os.environ.get("BULK_CONTACT_CHANNEL_COOLDOWN_HOURS", "24")
 )
 
-# Прозрачность в Telegram: успехи не летят построчно, только агрегат раз в N
-# и итог прогона.
+# Прозрачность в Telegram: по умолчанию успехи не летят построчно, только
+# агрегат раз в N. Но владельцу нужен СТАТУС ПО КАЖДОМУ контакту — по имени и
+# номеру, поэтому построчный режим включается отдельно и ограничен бюджетом на
+# прогон: иначе на 250 контактах бот сам станет источником спама.
 TG_DIGEST_EVERY = int(os.environ.get("BULK_TG_DIGEST_EVERY", "25"))
 TG_MAX_MESSAGES_PER_HOUR = int(os.environ.get("BULK_TG_MAX_PER_HOUR", "60"))
+# 1 = писать в личку каждый контакт (имя, номер, канал, исход).
+# 0 = только агрегаты и значимые события (прежнее поведение).
+TG_PER_CONTACT = int(os.environ.get("BULK_TG_PER_CONTACT", "1"))
+# Потолок построчных сообщений за ОДИН прогон. После него — агрегат.
+TG_PER_CONTACT_MAX = int(os.environ.get("BULK_TG_PER_CONTACT_MAX", "120"))
+# Каналы, которых НЕТ в этой рассылке, не упоминаются в уведомлениях владельцу.
+# WhatsApp Personal давно выключен (BULK_USE_WABA=1 → каскад WABA→TG→MAX),
+# но в дайджест он попадал из общего словаря лимитов и путал при разборе.
+TG_HIDE_CHANNELS = tuple(
+    c.strip() for c in os.environ.get(
+        "BULK_TG_HIDE_CHANNELS", "whatsapp,sms").split(",") if c.strip()
+)
 
 # Как часто опрашивать Wazzup за реальным tier WABA. Через вебхук тир приходит
 # событием channel.waba_tier_update, но вебхук может быть не поднят/устарел —

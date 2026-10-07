@@ -311,6 +311,14 @@ def _persist_success(phone: str, name: str, category: str, channel: str,
                 log.info(f"      📊 Google Sheets синхронизирован (pk={message_pk})")
             except Exception as e:
                 log.error(f"      ⚠️ sync_message_to_sheet error: {e}")
+        # Владельцу нужен статус ПО КАЖДОМУ контакту: кто, какой номер, какой
+        # канал. Раньше в личку улетал только агрегат «принято 15», и по нему
+        # невозможно было понять, кому именно ушло.
+        try:
+            from . import notify as _notify
+            _notify.contact_sent(phone, name, channel, detail=message_id or "")
+        except Exception as e:
+            log.debug(f"tg-уведомление об отправке не отправилось: {e}")
         return message_pk
     except Exception as e:
         # DB write упал, но state уже сохранён — квота списана, дубля не будет.
@@ -372,6 +380,21 @@ def _persist_failure(phone: str, name: str, category: str, channel: str,
                         f"      🚑 {channel} fail → rescue (id={rid}, "
                         f"phone={phone}) — контакт уйдёт в откат"
                     )
+                    # Владелец должен видеть отказ поимённо: «WABA не
+                    # доставил этому контакту → ставлю в очередь отката».
+                    # Раньше это приходило только в файл лога, а в личку уходил
+                    # обезличенный код, из-за чего выглядело, что MAX «не
+                    # отправился», хотя он просто ещё не наступил.
+                    try:
+                        from . import notify as _notify
+                        _nxt = [c for c in _phase_order_channels()
+                                if c != channel] or ["нет каналов"]
+                        _notify.contact_failed(
+                            phone, name, channel, detail or error_kind,
+                            next_channels=" → ".join(_nxt),
+                        )
+                    except Exception as _ne:
+                        log.debug(f"tg-уведомление об отказе не отправилось: {_ne}")
                 except Exception as e:
                     log.warning(f"      ⚠️ Не удалось поставить в rescue: {e}")
     except Exception as e:
@@ -1456,6 +1479,27 @@ def _collect_fresh_waba_targets(
         fresh.append(c)
 
     log.info("─" * 70)
+    # Порядок отбора: сначала тем, кому мы НИКОГДА не отправляли, потом тем, кому
+    # писали давно. Раньше шёл порядок Excel, и прогон мог целиком уйти в тех,
+    # кому уже писали, а свежие контакты так и не получали сообщение.
+    try:
+        _last_seen = db.last_sent_by_phone()
+    except Exception as e:
+        log.warning(f"история отправок недоступна, порядок как в Excel: {e}")
+        _last_seen = {}
+
+    def _never_sent_first(c: dict):
+        ts = _last_seen.get(c.get("phone"))
+        # (0, пусто) — никогда не отправляли; (1, метка) — отправляли.
+        return (1, ts) if ts else (0, "")
+
+    fresh.sort(key=_never_sent_first)
+    _never = sum(1 for c in fresh if not _last_seen.get(c.get("phone")))
+    if _never or _last_seen:
+        log.info(
+            f"   🆕 Приоритет отбора: {_never} из {len(fresh)} — тем, кому ещё "
+            f"никогда не отправляли; остальным — у кого отправка была раньше"
+        )
     log.info(f"   🧺 Отбор свежих для WABA: {len(fresh)} из {len(contacts)}")
     log.info(
         f"      исключено: в очереди {skipped_queued}, "
@@ -1506,6 +1550,224 @@ def _phase_order_channels() -> list[str]:
     return [c.strip() for c in
             (getattr(config, "PHASE_ORDER", []) or [])
             if c.strip()]
+
+
+def _owner_channels(channels) -> list[str]:
+    """Каналы в порядке КАСКАДА и без выключенных транспортов.
+
+    `wazzup.active_channels()` возвращает набор каналов без порядка, поэтому в
+    личку уходило «Каналы: telegram, max, waba» — порядок отката по такой
+    строке восстановить нельзя. WhatsApp Personal и SMS в этой рассылке не
+    используются, но попадали в «Лимиты:» общим словарём и выглядели как
+    рабочие каналы.
+    """
+    order = _phase_order_channels()
+    hidden = set(getattr(config, "TG_HIDE_CHANNELS", ()) or ())
+    present = [c for c in channels if c not in hidden]
+    ordered = [c for c in order if c in present]
+    ordered += [c for c in present if c not in ordered]
+    return ordered
+
+
+def report_delivery_by_contact(channel: str, to_tg: bool = True) -> dict:
+    """Кому доставилось, кому нет — поимённо, после фазы.
+
+    Владелец смотрит интерфейс Wazzup и видит там по каждому контакту红 «не
+    доставлено», а в логах был только агрегат. Отчёт отвечает на два вопроса
+    сразу: кому дошло, и что будет с теми, кому не дошло.
+
+    Честность важнее удобства: без вебхука доставка НЕИЗВЕСТНА, и такая строка
+    помечается «не подтверждено», а не «не доставлено». Разница принципиальна:
+    «не доставлено» — это отказ и решение об откате, «не подтверждено» —
+    отсутствие данных.
+    """
+    stats = {"delivered": [], "rejected": [], "unknown": [], "failed": []}
+    try:
+        with db.db_conn() as conn:
+            sql = (
+                """
+                SELECT ct.name, ct.phone, m.status, m.delivery_state,
+                       m.delivered_at
+                FROM messages m JOIN contacts ct ON ct.id = m.contact_id
+                WHERE m.channel = ? AND date(m.sent_at) = date('now')
+                  AND m.message_id IS NOT NULL
+                ORDER BY m.id DESC LIMIT 500
+                """
+            )
+            rows = conn.execute(sql, [channel]).fetchall()
+    except Exception as e:
+        log.warning(f"отчёт по контактам не собрался: {e}")
+        return stats
+
+    seen = set()
+    for r in rows:
+        phone = r["phone"]
+        if phone in seen:
+            continue
+        seen.add(phone)
+        if r["delivered_at"] or str(r["status"] or "").lower() == "delivered" \
+                or str(r["delivery_state"] or "") == "delivered":
+            stats["delivered"].append((r["name"], phone))
+        elif str(r["status"] or "").lower() == "failed" \
+                or str(r["delivery_state"] or "") == "rejected":
+            stats["rejected"].append((r["name"], phone))
+        else:
+            stats["unknown"].append((r["name"], phone))
+
+    n_del = len(stats["delivered"])
+    n_rej = len(stats["rejected"])
+    n_unk = len(stats["unknown"])
+    horizon = int(getattr(config, "UNKNOWN_GRACE_MINUTES", 720))
+    fallbacks = [c for c in _phase_order_channels() if c != channel]
+
+    log.info("─" * 70)
+    log.info(f"   📋 ДОСТАВКА ПО КОНТАКТАМ · {channel.upper()}")
+    for _name, _phone in stats["delivered"]:
+        log.info(f"      ✅ {_phone} {_name or ''} — доставлено")
+    for _name, _phone in stats["rejected"]:
+        log.info(f"      ❌ {_phone} {_name or ''} — отказ канала → откат")
+    if n_unk:
+        log.info(
+            f"      ⏳ {n_unk} контактов — доставка НЕ ПОДТВЕРЖДЕНА "
+            f"(вебхук молчит). Это не отказ: через {horizon} мин молчание "
+            f"уйдёт в откат {' → '.join(fallbacks) or 'нет каналов'}"
+        )
+    log.info("─" * 70)
+
+    if to_tg:
+        try:
+            from . import notify as _notify
+            lines = [
+                f"📋 Доставка по контактам · {channel.upper()}",
+                f"   ✅ доставлено: {n_del}",
+                f"   ❌ отказ канала (в откат): {n_rej}",
+                f"   ⏳ не подтверждено (не отказ!): {n_unk} → откат через "
+                f"{horizon} мин через {' → '.join(fallbacks) or 'нет каналов'}",
+            ]
+            for _n, _p in stats["delivered"][:20]:
+                lines.append(f"      ✅ {_p} {_n or ''}")
+            for _n, _p in stats["rejected"][:20]:
+                lines.append(f"      ❌ {_p} {_n or ''} — уходит в откат")
+            _notify.event("\n".join(lines), "INFO")
+        except Exception as e:
+            log.debug(f"tg-отчёт по контактам не отправился: {e}")
+    return stats
+
+
+def _report_all_channels_delivery() -> None:
+    for _ch in _phase_order_channels():
+        try:
+            report_delivery_by_contact(_ch)
+        except Exception:
+            pass
+
+
+def _limits_for_owner(channels) -> str:
+    """Лимиты только по используемым каналам, в порядке каскада."""
+    parts = []
+    for ch in _owner_channels(channels):
+        cap = (getattr(config, "CHANNEL_DAILY_LIMITS", {}) or {}).get(ch, "?")
+        parts.append(f"{ch} {cap}")
+    return ", ".join(parts) if parts else "—"
+
+
+def delivery_signal_available() -> tuple[bool, str]:
+    """Есть ли в принципе путь, по которому придёт подтверждение доставки.
+
+    Живой случай 2026-10-07, из-за которого весь каскад выглядел сломанным:
+    sender запускали ЛОКАЛЬНО на Windows, а вебхук крутился на сервере
+    217.149.23.102 и писал статусы в ДРУГУЮ базу (`/opt/bulkmessage/data/crm.db`).
+    Wazzup отдавал 30 принятых сообщений, ни одного события статуса в локальную
+    базу не приходило — и витрина честно показывала «доставка не подтверждена».
+    Но владелец видел в интерфейсе Wazzup красные отказы Meta и справедливо
+    спрашивал: «почему хук не ловит ошибки и не перенаправляет на другой канал».
+
+    Ответ: ловить было нечего. Хук исправен, он просто смотрит в другую БД.
+    Раз два процесса не делят одну базу, подтверждений не будет НИКОГДА, и
+    молчание через 12 ч уведёт все принятые сообщения в откат — то есть в
+    личные аккаунты. Поэтому проверка обязана быть ДО отправки и громкой.
+
+    Возвращает (доступен ли сигнал, объяснение для владельца).
+    """
+    if config.DRY_RUN:
+        return True, "DRY-RUN — реальных отправок нет, подтверждения не нужны"
+
+    # 1. Локальный вебхук: если поднят здесь же — события попадут в эту базу.
+    port = int(getattr(config, "WEBHOOK_PORT", 8000) or 8000)
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.4)
+            local_listening = s.connect_ex(("127.0.0.1", port)) == 0
+    except Exception:
+        local_listening = False
+    if local_listening:
+        return True, f"вебхук слушает 127.0.0.1:{port} — статусы придут в эту базу"
+
+    # 2. Удалённый вебхук: тогда он пишет в СВОЮ базу, а не в нашу.
+    url = (getattr(config, "WAZZUP_WEBHOOK_URL", "") or "").strip()
+    if url:
+        return False, (
+            f"WAZZUP_WEBHOOK_URL={url} — это вебхук на ДРУГОЙ машине. "
+            f"Он пишет статусы в свою базу, в локальную они не придут никогда."
+        )
+
+    return False, (
+        f"локальный вебхук не поднят (127.0.0.1:{port} молчит) и "
+        f"WAZZUP_WEBHOOK_URL пуст — подтверждений доставки не будет"
+    )
+
+
+def _guard_delivery_signal(channels) -> None:
+    """Боевой прогон без пути подтверждений — отказ, а не предупреждение.
+
+    Молчание в этой системе опаснее отказа: оно через UNKNOWN_GRACE_MINUTES
+    уводит ПРИНЯТЫЕ сообщения в откат, а откат — это личные аккаунты
+    (Telegram/MAX), где бан стоит личного номера. Поэтому дефолт — остановиться
+    и объяснить, а не слать вслепую.
+    """
+    ok, why = delivery_signal_available()
+    order = [c for c in _phase_order_channels() if c in channels]
+    # Каскад без WABA (только Personal) подтверждений не требует вовсе.
+    if ok or "waba" not in order:
+        if ok:
+            log.info(f"   • Путь подтверждений: {why}")
+        return
+
+    allow = bool(getattr(config, "ALLOW_NO_DELIVERY_SIGNAL", False))
+    log.error("=" * 70)
+    log.error("🛑 ОСТАНОВКА: подтверждения доставки недоступны.")
+    log.error(f"   Причина: {why}")
+    log.error(
+        "   Без подтверждений каскад WABA → TG → MAX не сработает: провалы "
+        "не видны, контакты не попадут в rescue, и через "
+        f"{getattr(config, 'UNKNOWN_GRACE_MINUTES', 720)} мин молчания ПРИНЯТЫЕ "
+        "сообщения уйдут в откат — то есть в личные аккаунты."
+    )
+    log.error(
+        "   Что сделать: запускать sender ТАМ ЖЕ, где работает вебхук "
+        "(сервер 217.149.23.102, /opt/bulkmessage), либо поднять вебхук "
+        "локально и подписать Wazzup на его URL."
+    )
+    if not allow:
+        log.error(
+            "   Обход: BULK_ALLOW_NO_DELIVERY_SIGNAL=1 — только если вы понимаете, "
+            "что принимаете слепые отказы в личные аккаунты."
+        )
+        raise SystemExit(3)
+    log.warning(
+        "   ⚠️ ALLOW_NO_DELIVERY_SIGNAL=1 — идём вслепую по решению владельца."
+    )
+    try:
+        tglog.send(
+            "🛑 Боевой прогон запущен БЕЗ подтверждений доставки\n"
+            f"Причина: {why}\n"
+            "Каскад откатов работать не будет: провалы не видны, а принятые "
+            "сообщения уйдут в резервные каналы по таймауту молчания.",
+            "ERROR",
+        )
+    except Exception:
+        pass
 
 
 def channel_delivery_health(channel: str, min_sample: int = 5,
@@ -1885,9 +2147,11 @@ def _sweep_silence_into_rescue(minutes: int, unknown_minutes: int | None = None)
         return 0
     if n:
         log.warning(
-            f"🔇 Явных отказов не подтверждено в rescue: {n} — уходят в откат "
-            f"(TG/MAX). Молчание обрабатывается отдельно, горизонт "
-            f"{getattr(config, 'UNKNOWN_GRACE_MINUTES', 720)} мин."
+            f"🔇 В rescue отправлено {n}: явные отказы (горизонт {int(minutes)} мин) "
+            f"+ молчания (горизонт "
+            f"{getattr(config, 'UNKNOWN_GRACE_MINUTES', 720)} мин). "
+            f"Молчание НЕ равно отказу: в откат оно уходит только по своему "
+            f"горизонту, иначе личные аккаунты получали бы дубли."
         )
     return n
 
@@ -2320,6 +2584,15 @@ def run() -> None:
     if _skipped:
         log.info(f"   • Не используются (нет канала/выключены): {_skipped}")
     log.info(f"   • Google Sheets: {'включены' if sheets.SHEETS.enabled else 'ОТКЛЮЧЕНЫ'}")
+    # Проверка пути подтверждений ДО любой отправки. Живой случай 2026-10-07:
+    # sender считали локально на Windows, вебхук писал на сервере в другую БД —
+    # 30 принятых сообщений и НОЛЬ подтверждений, при этом в интерфейсе Wazzup
+    # были видны отказы Meta. Каскад молчал, потому что ловить ему было нечего.
+    try:
+        _sig_ok, _sig_why = delivery_signal_available()
+        log.info(f"   • Путь подтверждений: {_sig_why}")
+    except Exception as _se:
+        log.debug(f"проверка пути подтверждений не отработала: {_se}")
     log.info(f"   • Анти-блок: батч={config.BATCH_SIZE}, "
              f"задержка={config.DELAY_MIN}-{config.DELAY_MAX}с")
     # Согласие — ключевой показатель риска бана и штрафа по ФЗ-38.
@@ -2360,8 +2633,8 @@ def run() -> None:
     if config.DRY_RUN:
         tglog.send(
             f"🧪 Sender ЗАПУЩЕН (DRY-RUN).\n"
-            f"Каналы: {', '.join(channels)}\n"
-            f"Лимиты: {config.CHANNEL_DAILY_LIMITS}\n"
+            f"Каналы: {' → '.join(_owner_channels(channels))}\n"
+            f"Лимиты: {_limits_for_owner(channels)}\n"
             f"Уже отправлено сегодня: {_sent_today}\n"
             f"Окно: {config.ACTIVE_HOURS_START:02d}:00-"
             f"{config.ACTIVE_HOURS_END:02d}:00 {config.TIMEZONE_NAME}\n"
@@ -2371,8 +2644,8 @@ def run() -> None:
     else:
         tglog.send(
             f"🚀 Sender ЗАПУЩЕН (БОЕВОЙ РЕЖИМ).\n"
-            f"Каналы: {', '.join(channels)}\n"
-            f"Лимиты: {config.CHANNEL_DAILY_LIMITS}\n"
+            f"Каналы: {' → '.join(_owner_channels(channels))}\n"
+            f"Лимиты: {_limits_for_owner(channels)}\n"
             f"Уже отправлено сегодня: {_sent_today}\n"
             f"Окно: {config.ACTIVE_HOURS_START:02d}:00-"
             f"{config.ACTIVE_HOURS_END:02d}:00 {config.TIMEZONE_NAME}",
@@ -2553,6 +2826,12 @@ def run() -> None:
             log.info(f"   … и ещё {len(filtered) - 5}")
     log.info("─" * 70)
 
+    # Стоп-касса ДО первой отправки. Живой случай 2026-10-07: боевой прогон
+    # шёл с Windows, вебхук — с сервера, в другую базу. 30 сообщений принято,
+    # 0 подтверждений, каскад молчал — и через 12 ч молчания принятые сообщения
+    # ушли бы в откат, то есть в личные аккаунты.
+    _guard_delivery_signal(channels)
+
     try:
         # Phase 8: сторож подтверждений ПЕРЕД сливом rescue.
         # Он находит сообщения, которые транспорт принял, но доставка не
@@ -2658,6 +2937,11 @@ def run() -> None:
         log.info("─" * 70)
         log.info(f"📦 Фазы отработаны (кругов: {_RUN_CYCLE}): "
                  f"{phase_stats or '—'}")
+        # Поимённый отчёт по доставке — то, чего в логах раньше не было.
+        try:
+            _report_all_channels_delivery()
+        except Exception as _re:
+            log.debug(f"отчёт по контактам не отработал: {_re}")
         try:
             log.info(
                 f"📋 Очередь на SMS (осталось pending): "
@@ -2706,6 +2990,40 @@ def run() -> None:
                 f"доставлено {_c['delivered']}, отказ {_c['rejected']}, "
                 f"неизвестно {_c['unknown']}"
             )
+        # Сверка счётчика с фактом. Живой случай 2026-10-07: в воронке было
+        # «telegram: принято 5», хотя строк channel='telegram' в messages за
+        # день не было ни одной — квота личного канала списывается, отправок
+        # нет. Молча такое расхождение выглядит как правда, а владелец на
+        # этих цифрах решает, запускать ли откат.
+        try:
+            with db.db_conn() as _conn:
+                _facts = {
+                    r["channel"]: int(r["n"])
+                    for r in _conn.execute(
+                        """
+                        SELECT channel, COUNT(*) n FROM messages
+                        WHERE date(sent_at) = date('now')
+                          AND status != 'failed'
+                          AND sent_at IS NOT NULL
+                        GROUP BY 1
+                        """
+                    )
+                }
+            _drift = []
+            for _ch, _c in sorted(_counters.items()):
+                if _ch in (getattr(config, "TG_HIDE_CHANNELS", ()) or ()):
+                    continue
+                _fact = _facts.get(_ch, 0)
+                if int(_c["accepted"]) != _fact:
+                    _drift.append(
+                        f"{_ch}: счётчик {_c['accepted']} ≠ строк в БД {_fact}")
+            if _drift:
+                log.warning(
+                    "⚠️ Расхождение счётчика с фактом (квота может списываться "
+                    "за несуществующие отправки): " + "; ".join(_drift)
+                )
+        except Exception as _de:
+            log.debug(f"сверка счётчика с фактом не отработала: {_de}")
         log.info("   Полная воронка: `py main.py report`")
         log.info("─" * 70)
     except Exception as e:

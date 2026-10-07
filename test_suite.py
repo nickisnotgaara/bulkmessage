@@ -3985,11 +3985,212 @@ try:
               bool(_why5), f"причина={_why5!r}")
         check("неисчерпанный канал продления не делает контакт исчерпанным",
               _not5 is None, f"причина={_not5!r}")
+
+        # 6) Горизонты не должны слипаться. Живой баг 2026-10-07: sender всегда
+        #    передаёт minutes=PHASE_GRACE_MINUTES, и прежнее правило «явный
+        #    minutes перекрывает оба горизонта» делало UNKNOWN_GRACE_MINUTES
+        #    мёртвой настройкой — молчание через 5 минут уходило в откат, то
+        #    есть в личные аккаунты. Проверяем ровно этот вызов.
+        _h_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        _h_db.close()
+        try:
+            with patch.object(config, "DB_PATH", _h_db.name), \
+                 patch.object(config, "REJECT_GRACE_MINUTES", 5), \
+                 patch.object(config, "UNKNOWN_GRACE_MINUTES", 10080):
+                db.init_db()
+                with db.db_conn() as c:
+                    cid = db.upsert_contact(c, phone="+79990006666",
+                                            name="Е", category="Покупатели")
+                    pk = db.insert_message(c, contact_id=cid, channel="waba",
+                                           message_text="t", message_id="mid-h-1",
+                                           status="sent")
+                    old = (datetime.now(timezone.utc)
+                           - timedelta(minutes=10)).isoformat()
+                    c.execute("UPDATE messages SET sent_at=? WHERE id=?",
+                              (old, pk))
+                # Ровно тот вызов, который делает sender между фазами.
+                _n = reconcile.sweep_unconfirmed_deliveries(limit=50, minutes=5)
+                _rows = db.count_pending_rescues()
+            check("молчание НЕ уходит в откат по горизонту явного отказа",
+                  _n == 0 and _rows == 0,
+                  f"в rescue={_n}, строк={_rows} (ожидаем 0 при "
+                  f"UNKNOWN_GRACE_MINUTES=10080)")
+            # Явный unknown_minutes по-прежнему перекрывает конфиг (стенды).
+            _h2 = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            _h2.close()
+            try:
+                with patch.object(config, "DB_PATH", _h2.name), \
+                     patch.object(config, "UNKNOWN_GRACE_MINUTES", 10080):
+                    db.init_db()
+                    with db.db_conn() as c:
+                        cid = db.upsert_contact(c, phone="+79990007777",
+                                                name="Ж", category="Покупатели")
+                        pk = db.insert_message(c, contact_id=cid, channel="waba",
+                                               message_text="t",
+                                               message_id="mid-h-2", status="sent")
+                        old = (datetime.now(timezone.utc)
+                               - timedelta(minutes=10)).isoformat()
+                        c.execute("UPDATE messages SET sent_at=? WHERE id=?",
+                                  (old, pk))
+                    _n2 = reconcile.sweep_unconfirmed_deliveries(
+                        limit=50, minutes=5, unknown_minutes=0)
+                check("явный unknown_minutes перекрывает конфиг (стенды)",
+                      _n2 == 1, f"в rescue={_n2}, ожидаем 1")
+            finally:
+                try:
+                    os.unlink(_h2.name)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.unlink(_h_db.name)
+            except OSError:
+                pass
 finally:
     try:
         os.unlink(_d_db.name)
     except OSError:
         pass
+
+# --- Уведомления владельцу: по контакту и человеческим языком -------------
+# Владелец попросил видеть в личке статус ПО КАЖДОМУ контакту (имя + номер)
+# и не выключенные каналы в списке. Проверяем обе стороны.
+from bulkmessage import notify as _notify  # noqa: E402
+
+check("причины отказов переводятся на человеческий язык",
+      _notify._human_reason("no_delivery_confirmation") != "no_delivery_confirmation"
+      and "max" in _notify._human_reason("CHANNEL_MAX_PHONE_NOT_OCCUPIED").lower(),
+      f"{_notify._human_reason('no_delivery_confirmation')!r} / "
+      f"{_notify._human_reason('CHANNEL_MAX_PHONE_NOT_OCCUPIED')!r}")
+check("неизвестная причина не теряется, а показывается как есть",
+      _notify._human_reason("что-то новое") == "что-то новое",
+      _notify._human_reason("что-то новое"))
+
+with patch.object(config, "PHASE_ORDER", ["waba", "telegram", "max"]), \
+     patch.object(config, "TG_HIDE_CHANNELS", ("whatsapp", "sms")), \
+     patch.object(config, "CHANNEL_DAILY_LIMITS",
+                  {"whatsapp": 60, "telegram": 50, "max": 15, "waba": 250,
+                   "sms": 50}):
+    _own = sender._owner_channels({"telegram", "max", "whatsapp", "sms", "waba"})
+    _lim = sender._limits_for_owner({"telegram", "max", "whatsapp", "sms", "waba"})
+check("каналы в уведомлении идут в порядке каскада",
+      _own == ["waba", "telegram", "max"], f"{_own}")
+check("выключенные WhatsApp/SMS не попадают в уведомления",
+      "whatsapp" not in _lim and "sms" not in _lim and "waba 250" in _lim,
+      f"{_lim}")
+
+# --- Отбор: сначала тем, кому НИКОГДА не отправляли ------------------------
+_p_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_p_db.close()
+try:
+    with patch.object(config, "DB_PATH", _p_db.name):
+        db.init_db()
+        _st = {"date": "2026-10-07", "sent_today": {}, "delivered_today": {},
+               "failed_today": {}, "waba_exhausted": {}}
+        _sel_contacts = [
+            {"phone": "+79991000001", "name": "Старый1", "category": "Покупатели"},
+            {"phone": "+79991000002", "name": "Новый1", "category": "Покупатели"},
+            {"phone": "+79991000003", "name": "Новый2", "category": "Покупатели"},
+        ]
+        with db.db_conn() as c:
+            cid = db.upsert_contact(c, phone="+79991000001", name="Старый1",
+                                    category="Покупатели")
+            pk = db.insert_message(c, contact_id=cid, channel="waba",
+                                   message_text="t", message_id="mid-sel-1",
+                                   status="delivered")
+            _old_sel = (datetime.now(timezone.utc) - timedelta(days=9)).isoformat()
+            c.execute("UPDATE messages SET sent_at=? WHERE id=?",
+                      (_old_sel, pk))
+        _picked = sender._collect_fresh_waba_targets(_sel_contacts, _st)
+    _phones = [c["phone"] for c in _picked]
+    check("первыми идут те, кому ещё никогда не отправляли",
+          _phones[:2] == ["+79991000002", "+79991000003"], f"{_phones}")
+finally:
+    try:
+        os.unlink(_p_db.name)
+    except OSError:
+        pass
+
+# ── Стоп-касса боевого прогона без пути подтверждений ────────────────────
+# Живой случай 2026-10-07: sender считали локально, вебхук крутился на сервере
+# и писал в другую БД. 30 сообщений принято, 0 подтверждений, в интерфейсе
+# Wazzup видны отказы Meta — а каскад молчал. Ловить было нечего: два процесса
+# не делят одну базу. Молчание через 12 ч уводит ПРИНЯТЫЕ сообщения в откат,
+# то есть в личные аккаунты — поэтому дефолт здесь отказ, а не предупреждение.
+print()
+section("K. ПУТЬ ПОДТВЕРЖДЕНИЙ ДОСТАВКИ")
+
+import socket  # noqa: E402  — нужен для проверки «вебхук поднят локально»
+
+_saved = (config.DRY_RUN, config.WEBHOOK_PORT,
+          config.WAZZUP_WEBHOOK_URL, config.ALLOW_NO_DELIVERY_SIGNAL)
+try:
+    config.DRY_RUN = False
+    config.WEBHOOK_PORT = 8000
+
+    # 1. Ни вебхука локально, ни WAZZUP_WEBHOOK_URL → сигнала не будет.
+    config.WAZZUP_WEBHOOK_URL = ""
+    _ok, _why = sender.delivery_signal_available()
+    check("без вебхука сигнал доставки недоступен", _ok is False, f"{_ok} {_why}")
+    check("причина объясняет про вебхук и WAZZUP_WEBHOOK_URL",
+          "127.0.0.1:8000" in _why and "WAZZUP_WEBHOOK_URL" in _why, _why)
+
+    # 2. WAZZUP_WEBHOOK_URL указывает на ДРУГУЮ машину — это тоже не наша база.
+    # Случай боевого прогона: туннель cloudflared на сервере 217.149.23.102.
+    config.WAZZUP_WEBHOOK_URL = "https://omaha-priority-mileage-oct.trycloudflare.com/webhook"
+    _ok2, _why2 = sender.delivery_signal_available()
+    check("вебхук на другой машине не считается своим", _ok2 is False, f"{_ok2}")
+    check("причина называет другую машину/базу",
+          "ДРУГОЙ машине" in _why2, _why2)
+
+    # 3. Локальный вебхук поднят → статусы придут в эту же базу.
+    config.WAZZUP_WEBHOOK_URL = ""
+    _srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        _srv.bind(("127.0.0.1", config.WEBHOOK_PORT))
+        _srv.listen(1)
+        _ok3, _why3 = sender.delivery_signal_available()
+        check("поднятый вебхук = доступный сигнал", _ok3 is True, f"{_ok3} {_why3}")
+    finally:
+        _srv.close()
+
+    # 4. DRY_RUN не блокируется: реальных отправок нет, подтверждения не нужны.
+    config.DRY_RUN = True
+    _ok4, _why4 = sender.delivery_signal_available()
+    check("DRY_RUN не требует подтверждений", _ok4 is True, f"{_ok4} {_why4}")
+    config.DRY_RUN = False
+
+    # 5. Боевой прогон без сигнала и без обхода → отказ (SystemExit 3).
+    config.ALLOW_NO_DELIVERY_SIGNAL = False
+    _raised = 0
+    try:
+        sender._guard_delivery_signal(["waba", "telegram", "max"])
+    except SystemExit as _e:
+        _raised = _e.code
+    check("боевой прогон без подтверждений останавливается",
+          _raised == 3, f"код выхода {_raised}")
+
+    # 6. Явный обход владельца — прогон идёт (знает, на что идёт).
+    config.ALLOW_NO_DELIVERY_SIGNAL = True
+    _passed = True
+    try:
+        sender._guard_delivery_signal(["waba", "telegram", "max"])
+    except SystemExit:
+        _passed = False
+    check("BULK_ALLOW_NO_DELIVERY_SIGNAL=1 снимает отказ", _passed, "остановился")
+
+    # 7. Каскад без WABA (только Personal) подтверждений не требует.
+    config.ALLOW_NO_DELIVERY_SIGNAL = False
+    _passed2 = True
+    try:
+        sender._guard_delivery_signal(["telegram", "max"])
+    except SystemExit:
+        _passed2 = False
+    check("каскад без WABA не блокируется", _passed2, "остановился")
+finally:
+    (config.DRY_RUN, config.WEBHOOK_PORT,
+     config.WAZZUP_WEBHOOK_URL, config.ALLOW_NO_DELIVERY_SIGNAL) = _saved
 
 print()
 print("=" * 70)
