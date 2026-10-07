@@ -1671,7 +1671,13 @@ def _limits_for_owner(channels) -> str:
     return ", ".join(parts) if parts else "—"
 
 
-def delivery_signal_available() -> tuple[bool, str]:
+# Результат проверки кэшируется на время процесса: она ходит в Wazzup
+# (GET /v3/webhooks) и слушает порт, а зовётся дважды за прогон — из сводки
+# запуска и из стоп-кассы. Второй сетевой вызов только добавляет задержку.
+_DELIVERY_SIGNAL_CACHE: Optional[tuple] = None
+
+
+def delivery_signal_available(refresh: bool = False) -> tuple[bool, str]:
     """Есть ли в принципе путь, по которому придёт подтверждение доставки.
 
     Живой случай 2026-10-07, из-за которого весь каскад выглядел сломанным:
@@ -1689,10 +1695,22 @@ def delivery_signal_available() -> tuple[bool, str]:
 
     Возвращает (доступен ли сигнал, объяснение для владельца).
     """
+    global _DELIVERY_SIGNAL_CACHE
+    if _DELIVERY_SIGNAL_CACHE is not None and not refresh:
+        return _DELIVERY_SIGNAL_CACHE
+    _r = _delivery_signal_available_uncached()
+    _DELIVERY_SIGNAL_CACHE = _r
+    return _r
+
+
+def _delivery_signal_available_uncached() -> tuple[bool, str]:
     if config.DRY_RUN:
         return True, "DRY-RUN — реальных отправок нет, подтверждения не нужны"
 
     # 1. Локальный вебхук: если поднят здесь же — события попадут в эту базу.
+    #    НО «слушает порт» ≠ «события приходят сюда»: Wazzup может быть
+    #    подписан на туннель СЕРВЕРА, пока локальный вебхук просто включён.
+    #    Поэтому п.1 проверяем вместе с п.2 — сверяем, куда Wazzup шлёт СЕЙЧАС.
     port = int(getattr(config, "WEBHOOK_PORT", 8000) or 8000)
     try:
         import socket
@@ -1701,20 +1719,45 @@ def delivery_signal_available() -> tuple[bool, str]:
             local_listening = s.connect_ex(("127.0.0.1", port)) == 0
     except Exception:
         local_listening = False
-    if local_listening:
-        return True, f"вебхук слушает 127.0.0.1:{port} — статусы придут в эту базу"
 
-    # 2. Удалённый вебхук: тогда он пишет в СВОЮ базу, а не в нашу.
     url = (getattr(config, "WAZZUP_WEBHOOK_URL", "") or "").strip()
-    if url:
-        return False, (
-            f"WAZZUP_WEBHOOK_URL={url} — это вебхук на ДРУГОЙ машине. "
-            f"Он пишет статусы в свою базу, в локальную они не придут никогда."
-        )
 
+    # 2. Куда Wazzup реально шлёт события. Это единственный честный источник
+    #    истины: конфиг может быть пустым, а подписка — жить на другой машине.
+    registered, reg_err = wazzup.get_registered_webhook_url()
+    if registered and local_listening:
+        if not url:
+            return False, (
+                f"локальный вебхук слушает 127.0.0.1:{port}, но Wazzup шлёт "
+                f"события на {registered} — это ДРУГАЯ машина и другая база. "
+                f"Укажи WAZZUP_WEBHOOK_URL={registered} и подними вебхук "
+                f"здесь, либо верни боевой прогон туда."
+            )
+        if url.rstrip("/") != registered.rstrip("/"):
+            return False, (
+                f"Wazzup подписан на {registered}, а в конфиге WAZZUP_WEBHOOK_URL="
+                f"{url} — статусы придут туда, а не в нашу базу."
+            )
+        return True, (
+            f"вебхук слушает 127.0.0.1:{port}, Wazzup подписан на {registered} "
+            f"— статусы придут в эту базу"
+        )
+    if registered and not local_listening:
+        return False, (
+            f"локальный вебхук не поднят (127.0.0.1:{port} молчит), Wazzup "
+            f"подписан на {registered} — статусы уйдут туда, в нашу базу не "
+            f"придут"
+        )
+    if local_listening and not registered:
+        return True, (
+            f"вебхук слушает 127.0.0.1:{port}; подписка Wazzup не читается "
+            f"({reg_err}) — подтверждения возможны только если ты подписан на "
+            f"этот же endpoint"
+        )
     return False, (
-        f"локальный вебхук не поднят (127.0.0.1:{port} молчит) и "
-        f"WAZZUP_WEBHOOK_URL пуст — подтверждений доставки не будет"
+        f"локальный вебхук не поднят (127.0.0.1:{port} молчит), "
+        f"WAZZUP_WEBHOOK_URL={url or 'пусто'}, а читать подписку Wazzup не "
+        f"удалось ({reg_err}) — подтверждений доставки не будет"
     )
 
 

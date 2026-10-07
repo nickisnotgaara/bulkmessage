@@ -4122,46 +4122,82 @@ section("K. ПУТЬ ПОДТВЕРЖДЕНИЙ ДОСТАВКИ")
 
 import socket  # noqa: E402  — нужен для проверки «вебхук поднят локально»
 
+# Тесты НЕ ходят в сеть и не зависят от того, слушает ли кто-то порт 8000
+# (боевой вебхук может быть поднят прямо во время прогона). Подписку Wazzup
+# подменяем заглушкой, слушатель поднимаем на незанятом порту.
+_FREE_PORT = 18099
 _saved = (config.DRY_RUN, config.WEBHOOK_PORT,
           config.WAZZUP_WEBHOOK_URL, config.ALLOW_NO_DELIVERY_SIGNAL)
-try:
+_real_get_reg = sender.wazzup.get_registered_webhook_url
+
+
+def _sig(registered, port=_FREE_PORT, cfg_url=""):
+    """Прогнать проверку сигнала на подставных данных, сбросив кэш."""
     config.DRY_RUN = False
-    config.WEBHOOK_PORT = 8000
+    config.WEBHOOK_PORT = port
+    config.WAZZUP_WEBHOOK_URL = cfg_url
+    sender.wazzup.get_registered_webhook_url = (
+        lambda: (registered, "ok" if registered else "http 500: stub"))
+    sender._DELIVERY_SIGNAL_CACHE = None
+    return sender.delivery_signal_available()
 
-    # 1. Ни вебхука локально, ни WAZZUP_WEBHOOK_URL → сигнала не будет.
-    config.WAZZUP_WEBHOOK_URL = ""
-    _ok, _why = sender.delivery_signal_available()
+
+try:
+    # 1. Ни вебхука локально, ни подписки → сигнала не будет.
+    _ok, _why = _sig(registered="https://tunnel.trycloudflare.com/webhook")
     check("без вебхука сигнал доставки недоступен", _ok is False, f"{_ok} {_why}")
-    check("причина объясняет про вебхук и WAZZUP_WEBHOOK_URL",
-          "127.0.0.1:8000" in _why and "WAZZUP_WEBHOOK_URL" in _why, _why)
+    check("причина говорит, что вебхук не поднят", "не поднят" in _why, _why)
 
-    # 2. WAZZUP_WEBHOOK_URL указывает на ДРУГУЮ машину — это тоже не наша база.
-    # Случай боевого прогона: туннель cloudflared на сервере 217.149.23.102.
-    config.WAZZUP_WEBHOOK_URL = "https://omaha-priority-mileage-oct.trycloudflare.com/webhook"
-    _ok2, _why2 = sender.delivery_signal_available()
-    check("вебхук на другой машине не считается своим", _ok2 is False, f"{_ok2}")
-    check("причина называет другую машину/базу",
-          "ДРУГОЙ машине" in _why2, _why2)
+    # 2. Живой случай 2026-10-07: локально ничего не слушает, а Wazzup шлёт
+    #    события в туннель СЕРВЕРА — статусы уйдут в чужую базу.
+    _ok2, _why2 = _sig(
+        registered="https://omaha-priority-mileage-oct.trycloudflare.com/webhook",
+        cfg_url="https://omaha-priority-mileage-oct.trycloudflare.com/webhook")
+    check("подписка на чужой туннель = нет своего сигнала", _ok2 is False, f"{_ok2}")
+    check("причина называет чужую машину/базу",
+          "не поднят" in _why2 and "не придут" in _why2, _why2)
 
-    # 3. Локальный вебхук поднят → статусы придут в эту же базу.
-    config.WAZZUP_WEBHOOK_URL = ""
     _srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     _srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        _srv.bind(("127.0.0.1", config.WEBHOOK_PORT))
-        _srv.listen(1)
-        _ok3, _why3 = sender.delivery_signal_available()
-        check("поднятый вебхук = доступный сигнал", _ok3 is True, f"{_ok3} {_why3}")
+        _srv.bind(("127.0.0.1", _FREE_PORT))
+        # backlog 16, а не 1: каждая проверка делает connect_ex, а некому
+        # принимать соединения, поэтому с listen(1) вторая проверка уже
+        # получала «порт молчит» — ложный отказ при живом вебхуке.
+        _srv.listen(16)
+        # 3. Локальный вебхук поднят, но Wazzup подписан на СЕРВЕР — дыра,
+        #    которую легко не заметить: порт слушает, а события идут в другую БД.
+        _ok3, _why3 = _sig(
+            registered="https://omaha-priority-mileage-oct.trycloudflare.com/webhook")
+        check("слушающий порт при подписке на сервер = сигнала нет",
+              _ok3 is False, f"{_ok3} {_why3}")
+        check("причина говорит про ДРУГУЮ машину", "ДРУГАЯ машина" in _why3, _why3)
+
+        # 4. Порт слушает и подписка совпадает с конфигом → сигнал есть.
+        _ok4, _why4 = _sig(
+            registered="https://my-local.trycloudflare.com/webhook",
+            cfg_url="https://my-local.trycloudflare.com/webhook")
+        check("порт + подписка совпадают = сигнал доступен",
+              _ok4 is True, f"{_ok4} {_why4}")
+
+        # 5. Порт слушает, но конфиг пуст — сверять нечем, предупреждаем честно.
+        _ok5, _why5 = _sig(registered="https://my-local.trycloudflare.com/webhook",
+                           cfg_url="")
+        check("пустой WAZZUP_WEBHOOK_URL = не подтверждено, но не провал",
+              isinstance(_ok5, bool) and "WAZZUP_WEBHOOK_URL" in _why5,
+              f"{_ok5} {_why5}")
     finally:
         _srv.close()
 
-    # 4. DRY_RUN не блокируется: реальных отправок нет, подтверждения не нужны.
+    # 6. DRY_RUN не блокируется: реальных отправок нет, подтверждения не нужны.
     config.DRY_RUN = True
-    _ok4, _why4 = sender.delivery_signal_available()
-    check("DRY_RUN не требует подтверждений", _ok4 is True, f"{_ok4} {_why4}")
+    sender._DELIVERY_SIGNAL_CACHE = None
+    _ok6, _why6 = sender.delivery_signal_available()
+    check("DRY_RUN не требует подтверждений", _ok6 is True, f"{_ok6} {_why6}")
     config.DRY_RUN = False
 
-    # 5. Боевой прогон без сигнала и без обхода → отказ (SystemExit 3).
+    # 7. Боевой прогон без сигнала и без обхода → отказ (SystemExit 3).
+    _sig(registered="https://tunnel.trycloudflare.com/webhook")
     config.ALLOW_NO_DELIVERY_SIGNAL = False
     _raised = 0
     try:
@@ -4171,7 +4207,7 @@ try:
     check("боевой прогон без подтверждений останавливается",
           _raised == 3, f"код выхода {_raised}")
 
-    # 6. Явный обход владельца — прогон идёт (знает, на что идёт).
+    # 8. Явный обход владельца — прогон идёт (знает, на что идёт).
     config.ALLOW_NO_DELIVERY_SIGNAL = True
     _passed = True
     try:
@@ -4180,7 +4216,7 @@ try:
         _passed = False
     check("BULK_ALLOW_NO_DELIVERY_SIGNAL=1 снимает отказ", _passed, "остановился")
 
-    # 7. Каскад без WABA (только Personal) подтверждений не требует.
+    # 9. Каскад без WABA (только Personal) подтверждений не требует.
     config.ALLOW_NO_DELIVERY_SIGNAL = False
     _passed2 = True
     try:
@@ -4189,6 +4225,8 @@ try:
         _passed2 = False
     check("каскад без WABA не блокируется", _passed2, "остановился")
 finally:
+    sender.wazzup.get_registered_webhook_url = _real_get_reg
+    sender._DELIVERY_SIGNAL_CACHE = None
     (config.DRY_RUN, config.WEBHOOK_PORT,
      config.WAZZUP_WEBHOOK_URL, config.ALLOW_NO_DELIVERY_SIGNAL) = _saved
 

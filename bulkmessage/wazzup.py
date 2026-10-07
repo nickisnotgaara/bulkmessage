@@ -366,6 +366,32 @@ def subscribe_wazzup_webhook(url: str, subscriptions: dict) -> tuple[bool, str]:
     return False, f"http {r.status_code}: {r.text[:300]}"
 
 
+def get_registered_webhook_url() -> tuple[Optional[str], str]:
+    """URL, на который Wazzup шлёт события СЕЙЧАС. (url, ошибка).
+
+    Нужно sender'у, чтобы отличить «вебхук есть» от «вебхук наш». Проверки
+    «слушает ли что-то 127.0.0.1» недостаточно: можно держать локальный
+    вебхук включённым, пока Wazzup смотрит в туннель СЕРВЕРА. Тогда события
+    уходят в чужую базу, локальный sender их не увидит — и каскад снова
+    «молчит», только теперь уже с локальным вебхуком в руках.
+    """
+    if not is_configured():
+        return None, "WAZZUP_API_KEY not configured"
+    api_url = f"{config.WAZZUP_BASE_URL}{config.WAZZUP_WEBHOOKS_PATH}"
+    try:
+        r = requests.get(api_url, headers=_headers(), timeout=20)
+    except requests.exceptions.RequestException as e:
+        return None, f"network error: {e}"
+    if not (200 <= r.status_code < 300):
+        return None, f"http {r.status_code}: {r.text[:200]}"
+    try:
+        body = r.json()
+    except ValueError:
+        return None, "non-JSON response"
+    uri = body.get("webhooksUri") if isinstance(body, dict) else None
+    return (uri or None), "ok"
+
+
 def verify_webhook_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
     """Проверка HMAC-SHA256 подписи webhook.
 
