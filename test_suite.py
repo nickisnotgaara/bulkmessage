@@ -3659,11 +3659,16 @@ try:
           f"записей {_p_events}")
     check("сообщение помечено delivered", _p_row["delivery_state"] == "delivered",
           f"state={_p_row['delivery_state']}")
+    # Остаток очереди считаем ВНУТРИ блока с подменой DB_PATH. Раньше вызов
+    # стоял снаружи и читал общую тестовую базу, где есть pending-строки от
+    # других блоков: проверка падала по чужому состоянию и врала про откат.
+    with patch.object(config, "DB_PATH", _p_db.name):
+        _p_pending_after = db.count_pending_rescues()
     check("поздний delivered СНЯЛ контакт из очереди отката",
           _p_pending_before == 1 and _p_cancelled == 1 and
-          db.count_pending_rescues() == 0,
+          _p_pending_after == 0,
           f"было {_p_pending_before}, снято {_p_cancelled}, осталось "
-          f"{db.count_pending_rescues()}")
+          f"{_p_pending_after}")
 finally:
     try:
         os.unlink(_p_db.name)
@@ -4236,6 +4241,177 @@ finally:
     sender._DELIVERY_SIGNAL_CACHE = None
     (config.DRY_RUN, config.WEBHOOK_PORT,
      config.WAZZUP_WEBHOOK_URL, config.ALLOW_NO_DELIVERY_SIGNAL) = _saved
+
+# --- Эхо Wazzup не должно попадать в replies ---------------------------------
+# Живой случай 2026-10-07: конверт {"messages": [...]} у Wazzup содержит
+# ОБЕ стороны. В свежих 17 событиях 15 были нашими же исходящими эхами
+# (isEcho=true) — и все они писались в replies как «ответ клиента», открывая
+# 24ч-окно WABA. Следствие: следующая отправка пошла бы free text вместо
+# одобренного Meta шаблона. Одно эхо было status="error" — реальный отказ,
+# который тоже ушёл в «ответы».
+section("L. ЭХО WAZZUP ≠ ОТВЕТ КЛИЕНТА")
+
+_ECHOS = [
+    {"type": "wapi_template", "isEcho": True, "status": "sent"},
+    {"type": "wapi_template", "isEcho": True, "status": "error"},
+    {"type": "text", "isEcho": True, "status": "sent"},
+    {"type": "text", "isEcho": "true", "status": "sent"},
+    {"type": "text", "status": "outbound"},
+]
+for _e in _ECHOS:
+    check(f"эхо распознано как исходящее: {_e.get('status')}",
+          reconcile._is_outgoing_echo(_e) is True, str(_e))
+
+_INBOUND = [
+    {"type": "text", "isEcho": False, "status": "inbound", "text": "Не интересно"},
+    {"type": "text", "isEcho": False, "status": "inbound"},
+    # Старые payload'ы без isEcho/status — ответами считать НЕЛЬЗЯ только если
+    # нет признаков исходящего; пустой объект остаётся входящим по умолчанию.
+    {"type": "text", "text": "Здравствуйте"},
+    {},
+]
+for _e in _INBOUND:
+    check(f"входящее не спутано с эхом: {str(_e)[:42]}",
+          reconcile._is_outgoing_echo(_e) is False, str(_e))
+
+# Сквозная проверка маршрутизации: эхо не должно создавать строку в replies.
+_e_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_e_db.close()
+try:
+    with patch.object(config, "DB_PATH", _e_db.name):
+        db.init_db()
+
+        # Настоящий ответ клиента.
+        with patch.object(reconcile, "sync_message_to_sheet", lambda **kw: None):
+            reconcile.process_wazzup_payload("waba", {
+                "messages": [{
+                    "messageId": "real-inbound-1", "chatType": "whatsapp",
+                    "chatId": "79990001111", "type": "text",
+                    "isEcho": False, "status": "inbound", "text": "Не интересно",
+                }],
+            })
+            # Наше исходящее эхо с тем же текстом шаблона.
+            reconcile.process_wazzup_payload("waba", {
+                "messages": [{
+                    "messageId": "our-echo-1", "chatType": "whatsapp",
+                    "chatId": "79990002222", "type": "wapi_template",
+                    "isEcho": True, "status": "sent",
+                    "text": "Здравствуйте, вы у меня покупали квартиру",
+                }],
+            })
+
+        with db.db_conn() as conn:
+            _reps = [r["message_id"] for r in conn.execute(
+                "SELECT message_id FROM replies ORDER BY id")]
+            _texts = [r["message"] for r in conn.execute(
+                "SELECT message FROM replies ORDER BY id")]
+
+    check("настоящий ответ сохранён в replies",
+          "real-inbound-1" in _reps, str(_reps))
+    check("эхо НЕ попало в replies", "our-echo-1" not in _reps, str(_reps))
+    check("эхо не открыло 24ч-окно текстом шаблона",
+          not any("покупали квартиру" in t for t in _texts), str(_texts)[:120])
+    check("в replies ровно одна строка", len(_reps) == 1, str(_reps))
+finally:
+    try:
+        os.unlink(_e_db.name)
+    except OSError:
+        pass
+
+# --- Отказ канала в эхе исходящего: TG/MAX → откат ----------------------------
+# Живой случай 2026-10-07, контакт 79296002444. Wazzup ответил HTTP 200, мы
+# записали «rescued» (доставлено) и списали контакт. Через 2 секунды пришло
+# эхо: isEcho=true, status="error", error={"error":"BAD_CONTACT",
+# "description":"Recipient with this chatId does not exist"}. В Telegram — красный
+# «!». Без обработки отказа контакт навсегда остался бы в Telegram и НИКОГДА
+# не дошёл до MAX — цепочка рвалась на личных каналах.
+section("M. ОТКАЗ В ЭХЕ = ОТКАТ В СЛЕДУЮЩИЙ КАНАЛ")
+
+check("эхо со status=error распознано как отказ",
+      reconcile._echo_is_failure({
+          "status": "error", "error": {"error": "BAD_CONTACT"}}) is True)
+check("эхо со status=sent — НЕ отказ",
+      reconcile._echo_is_failure({"status": "sent"}) is False)
+check("эхо без error при status=error — не отказ (нет чему верить)",
+      reconcile._echo_is_failure({"status": "error"}) is False)
+check("причина отказа читается по-человечески",
+      reconcile._echo_error_text({
+          "error": {"error": "BAD_CONTACT",
+                    "description": "Recipient with this chatId does not exist"}})
+      == "BAD_CONTACT: Recipient with this chatId does not exist")
+
+# Сквозная проверка на живом payload: контакт обязан вернуться в откат.
+_tg_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_tg_db.close()
+_TG_MID = "9f9f5ff8-c87a-4cd9-8fbb-78a2cdcc153b"
+_TG_PHONE = "79296002444"
+try:
+    with patch.object(config, "DB_PATH", _tg_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            _tg_cid = db.upsert_contact(conn, phone=_TG_PHONE, name="Богдан",
+                                        category="Покупатели")
+            _tg_pk = db.insert_message(
+                conn, contact_id=_tg_cid, channel="telegram",
+                message_text="текст", message_id=_TG_MID, status="sent")
+        # Сначала симулируем то, что делает sender: rescue помечен rescued.
+        db.mark_rescue_success(
+            db.enqueue_rescue(phone=_TG_PHONE, name="Богдан",
+                              category="Покупатели",
+                              original_channel="waba", reason="error"),
+            channel="telegram", message_id="rescued_telegram_161")
+        with db.db_conn() as conn:
+            _tg_r0 = conn.execute(
+                "SELECT status FROM rescue_queue WHERE phone=?",
+                (_TG_PHONE,)).fetchone()["status"]
+
+        with patch.object(reconcile, "sync_message_to_sheet", lambda **kw: None):
+            reconcile.process_wazzup_payload("telegram", {
+                "messages": [{
+                    "messageId": _TG_MID, "dateTime": "2026-10-07T10:38:26.547Z",
+                    "channelId": "1c2ef310-836a-4c16-8f1e-387579ae8146",
+                    "chatType": "telegram", "chatId": _TG_PHONE,
+                    "type": "text", "isEcho": True, "status": "error",
+                    "authorName": "Admin", "text": "Здравствуйте, Богдан!",
+                    "error": {"error": "BAD_CONTACT",
+                              "description": "Recipient with this chatId does not exist"},
+                }],
+            })
+
+        with db.db_conn() as conn:
+            _tg_row = conn.execute(
+                "SELECT status, delivery_state FROM messages WHERE message_id=?",
+                (_TG_MID,)).fetchone()
+            _tg_r = conn.execute(
+                "SELECT status, reason, rescued_channel FROM rescue_queue "
+                "WHERE phone=?", (_TG_PHONE,)).fetchone()
+            _tg_nreply = conn.execute("SELECT COUNT(*) FROM replies").fetchone()[0]
+            _tg_ev = conn.execute(
+                "SELECT event_status FROM delivery_events WHERE message_id=?",
+                (_TG_MID,)).fetchall()
+
+    check("после HTTP 200 контакт был помечен как спасённый",
+          _tg_r0 == "rescued", f"было {_tg_r0}")
+    check("сообщение помечено rejected",
+          _tg_row["delivery_state"] == "rejected", f"{dict(_tg_row)}")
+    check("статус сообщения failed", _tg_row["status"] == "failed",
+          f"{dict(_tg_row)}")
+    check("контакт ВЕРНУЛСЯ в очередь отката (дойдёт до MAX)",
+          _tg_r["status"] in ("pending", "retry"), f"{dict(_tg_r)}")
+    check("rescued_channel очищен — канал больше не считается спасшим",
+          _tg_r["rescued_channel"] in (None, ""), f"{dict(_tg_r)}")
+    check("причина БЕЗ ДОСТОВЕРНОГО ФАКТА не потерялась",
+          "BAD_CONTACT" in (_tg_r["reason"] or ""), f"{dict(_tg_r)}")
+    check("событие записано как rejected",
+          any(e["event_status"] == "rejected" for e in _tg_ev),
+          str([dict(e) for e in _tg_ev]))
+    check("эхо НЕ записалось как ответ клиента", _tg_nreply == 0,
+          f"replies={_tg_nreply}")
+finally:
+    try:
+        os.unlink(_tg_db.name)
+    except OSError:
+        pass
 
 print()
 print("=" * 70)

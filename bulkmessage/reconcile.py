@@ -464,6 +464,28 @@ def process_outgoing_message(channel: str, msg: dict) -> None:
     message_id = msg.get("id") or msg.get("message_id")
     if not message_id:
         return
+
+    # Эхо с status="error" — это ОТКАЗ КАНАЛА, а не «исходящее событие».
+    # Живой случай 2026-10-07 (Telegram): Wazzup ответил HTTP 200, мы записали
+    # «rescued» и списали контакт как доставленного, а через 2 секунды пришло
+    # эхо isEcho=true, status="error", error={"error":"BAD_CONTACT",
+    # "description":"Recipient with this chatId does not exist"}. В интерфейсе
+    # Telegram — красный «!». Без этой ветки контакт навсегда оставался бы в
+    # Telegram и НИКОГДА не дошёл до MAX.
+    # Раньше такое эхо уходило в process_incoming_message и вообще не влияло
+    # на состояние сообщения.
+    if _echo_is_failure(msg):
+        log.warning(
+            f"❌ OUTGOING FAILED: msg_id={message_id} channel={channel} "
+            f"reason={_echo_error_text(msg)[:120]}"
+        )
+        failed = dict(msg)
+        failed["status"] = "error"
+        if not failed.get("detail"):
+            failed["detail"] = _echo_error_text(msg)
+        process_delivery_status(channel, failed)
+        return
+
     log.info(f"📤 OUTGOING event: msg_id={message_id} channel={channel}")
     with db.db_conn() as conn:
         row = db.find_message_by_message_id(conn, message_id)
@@ -471,6 +493,32 @@ def process_outgoing_message(channel: str, msg: dict) -> None:
             return
         if row["status"] in ("queued", "sent"):
             db.update_message_status(conn, message_pk=row["id"], status="sent")
+
+
+def _echo_error_text(evt: dict) -> str:
+    """Человекочитаемая причина из эха: error.error + error.description."""
+    err = evt.get("error")
+    if isinstance(err, dict):
+        code = err.get("error") or err.get("code") or ""
+        desc = err.get("description") or err.get("message") or ""
+        if code and desc and code != desc:
+            return f"{code}: {desc}"
+        return str(code or desc or "delivery_error")
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    return str(evt.get("detail") or "delivery_error")
+
+
+def _echo_is_failure(evt: dict) -> bool:
+    """Эхо исходящего, в котором канал отказал.
+
+    `status: "error"` — единственный признак: Wazzup присылает эхо успешно
+    отправленного сообщения со status "sent", а отказавшего — со "error"
+    и заполненным объектом error.
+    """
+    if str(evt.get("status") or "").strip().lower() != "error":
+        return False
+    return bool(evt.get("error") or evt.get("detail"))
 
 
 # ============================================================
@@ -641,13 +689,26 @@ def process_wazzup_payload(channel_hint: Optional[str], payload: dict) -> None:
                 msg = _wazzup_extract_message(evt)
                 process_delivery_status(ch, msg)
             elif _envelope == "messages":
-                # Конверт `{"messages": [...]}` у Wazzup — это ВХОДЯЩИЕ
-                # сообщения, и у объекта внутри часто нет поля type. Раньше
-                # такие события уходили в "ignored event type=''", то есть
-                # ответы клиентов терялись целиком.
+                # Конверт `{"messages": [...]}` у Wazzup — это сообщения
+                # ОБЕИХ сторон: `isEcho: true` = наше собственное исходящее
+                # эхо, `isEcho: false` + `status: "inbound"` = настоящий ответ
+                # клиента (живая проверка 2026-10-07, payload Wazzup).
+                #
+                # Раньше весь конверт уходил в process_incoming_message. Из 17
+                # свежих событий 15 были нашими же эхами — и они:
+                #   * писались в replies как «ответ клиента»;
+                #   * открывали 24ч-окно WABA → следующая отправка пошла бы
+                #     free text вместо одобренного шаблона (риск у Meta);
+                #   * портили аналитику ответов.
+                # Одно эхо было `status: "error"` — то есть реальный отказ
+                # отправки, который тоже уходил в «ответы».
                 msg = _wazzup_extract_message(evt)
                 msg["chat_type"] = chat_type or "whatsapp"
-                process_incoming_message(ch, msg)
+                if _is_outgoing_echo(evt):
+                    msg["type"] = "outgoing"
+                    process_outgoing_message(ch, msg)
+                else:
+                    process_incoming_message(ch, msg)
             elif evt_type in ("outgoing", "outgoing_message"):
                 msg = _wazzup_extract_message(evt)
                 process_outgoing_message(ch, msg)
@@ -718,6 +779,32 @@ def _handle_wazzup_channel_event(evt: dict) -> None:
     log.info(
         f"🔔 Wazzup channel event: type={evt_type!r} channelId={channel_id!r}"
     )
+
+
+def _is_outgoing_echo(evt: dict) -> bool:
+    """Это наше собственное сообщение (эхо Wazzup), а не ответ клиента.
+
+    Живой payload Wazzup от 2026-10-07:
+      исходящее: {"type":"wapi_template","isEcho":true,"status":"sent",  …}
+      отказ:     {"type":"wapi_template","isEcho":true,"status":"error", …}
+      входящее:  {"type":"text",         "isEcho":false,"status":"inbound",…}
+
+    Признаки держим широкими, но осторожно: у 21 старого события в боевой базе
+    полей isEcho/status нет вовсе. Их трогать нельзя — иначе потеряем
+    настоящие ответы.
+    """
+    if evt.get("isEcho") is True:
+        return True
+    if str(evt.get("isEcho")).strip().lower() in ("true", "1", "yes"):
+        return True
+    st = str(evt.get("status") or "").strip().lower()
+    if st in ("outbound", "outgoing"):
+        return True
+    # `sent`/`error` без явного isEcho — исходящее по определению: у входящих
+    # статус всегда "inbound".
+    if st in ("sent", "error", "delivered", "read") and "isEcho" not in evt:
+        return True
+    return False
 
 
 def _is_status_event(evt: dict, evt_type: str) -> bool:
@@ -821,24 +908,28 @@ def sweep_unconfirmed_deliveries(limit: int = 50,
         попадает только через UNKNOWN_GRACE_MINUTES (12 ч по умолчанию).
       * Молчание старше CONFIRM_MAX_AGE_HOURS → сразу `exhausted`, не откат.
 
-    `minutes` — старый параметр; он теперь значит горизонт для явного отказа
-    и по умолчанию равен REJECT_GRACE_MINUTES. Для обратной совместимости с
-    тестами, которые патчили RESCUE_SETTLE_MINUTES, явный `minutes` перекрывает
-    оба горизонта только если `unknown_minutes` не задан явно.
+    `minutes` — горизонт для ЯВНОГО отказа; по умолчанию равен
+    REJECT_GRACE_MINUTES. Он НЕ влияет на горизонт молчания: явный `minutes`
+    всегда подставляет консервативный UNKNOWN_GRACE_MINUTES.
 
-    Возвращает количество контактов, отправленных в rescue.
+    ⚠️ Живой баг, найденный боевым прогоном 2026-10-07: sender вызывает
+    `sweep_unconfirmed_deliveries(minutes=PHASE_GRACE_MINUTES)`, то есть
+    `minutes` задан ВСЕГДА. Прежнее правило «явный minutes перекрывает оба
+    горизонта» из-за этого делало UNKNOWN_GRACE_MINUTES мёртвой настройкой:
+    в каждом боевом прогоне молчание через 5 минут считалось отказом и
+    уходило в откат — ровно та ложь, ради устранения которой всё и
+    затевалось. Явный `unknown_minutes` по-прежнему перекрывает конфиг —
+    этим пользуются стенды, которым нужен весь разбор сразу.
     """
     reject_minutes = (
         minutes if minutes is not None
         else int(getattr(config, "REJECT_GRACE_MINUTES", 5))
     )
     if unknown_minutes is None:
-        # Явный `minutes` от тестов/вызывающего кода трактуем как «хочу увидеть
-        # откат сейчас»; иначе берём длинный консервативный горизонт.
-        unknown_minutes = (
-            reject_minutes if minutes is not None
-            else int(getattr(config, "UNKNOWN_GRACE_MINUTES", 720))
-        )
+        # Молчание НИКОГДА не наследует горизонт явного отказа. `minutes`
+        # задаёт sender в каждом прогоне, и если бы он перекрывал молчание,
+        # UNKNOWN_GRACE_MINUTES был бы мёртвой настройкой (см. докстроку).
+        unknown_minutes = int(getattr(config, "UNKNOWN_GRACE_MINUTES", 720))
     max_age = getattr(config, "CONFIRM_MAX_AGE_HOURS", 24)
     swept = 0
     rejected_swept = 0
