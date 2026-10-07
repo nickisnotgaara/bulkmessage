@@ -578,6 +578,10 @@ UNKNOWN_GRACE_MINUTES = int(os.environ.get("BULK_UNKNOWN_GRACE_MINUTES", "720"))
 # больше автоматических попыток нет, контакт уходит в ежедневную выгрузку.
 EXHAUST_MAX_ATTEMPTS = int(os.environ.get("BULK_EXHAUST_MAX_ATTEMPTS", "3"))
 EXHAUST_WINDOW_DAYS = int(os.environ.get("BULK_EXHAUST_WINDOW_DAYS", "7"))
+# Верхняя граница «молчания» для перевода в exhausted. Без неё первый запуск
+# после деплоя пометил бы exhausted ВСЮ историю сообщений, а на боевой базе
+# это тысячи строк с июля.
+EXHAUST_MAX_AGE_DAYS = int(os.environ.get("BULK_EXHAUST_MAX_AGE_DAYS", "30"))
 
 # Молчание по WABA почти всегда означает отказ Meta по маркетинговому лимиту
 # («Сейчас этому клиенту нельзя отправить шаблон „Маркетинг“»). Отказ не

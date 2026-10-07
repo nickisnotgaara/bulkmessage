@@ -875,11 +875,13 @@ def sweep_unconfirmed_deliveries(limit: int = 50,
     swept += unknown_swept
 
     # 3) Молчание дольше суток — контакт уходит не в откат, а в exhausted.
-    #    Нижняя граница обязательна: без неё в exhausted уехало бы всё
-    #    свежее, что просто ещё не дождалось подтверждения.
+    #    Границы обязательны с обеих сторон: без нижней в exhausted уехало бы
+    #    всё свежее, а без верхней — ВСЯ история (на боевой базе это тысячи
+    #    сообщений с июля, и первый же запуск после деплоя пометил бы их все).
     try:
         rows = db.find_unconfirmed(
-            minutes=0, limit=limit, max_age_hours=0,
+            minutes=0, limit=limit,
+            max_age_hours=int(getattr(config, "EXHAUST_MAX_AGE_DAYS", 30)) * 24,
             only_status=("sent", "queued"),
             min_age_hours=int(max_age),
         )
@@ -928,15 +930,63 @@ def _sweep_rows(rows, kind: str, reason: str) -> int:
         # SMS — последний в каскаде, откатываться некуда
         if channel == "sms":
             continue
+        if kind == "unknown" and channel == "waba":
+            # Молчание по WABA — почти всегда отказ Meta по маркетинговому
+            # лимиту. Отправить ещё раз завтра бессмысленно: тот же отказ и
+            # тот же сгоревший слот. Но для других каналов контакт остаётся
+            # доступен — антикоастинг только на WABA.
+            # Ставим ДО постановки в очередь: молчание-то настоящее, даже если
+            # строка отката потом окажется дублем и не создастся.
+            try:
+                from datetime import timedelta
+                until = (datetime.now(timezone.utc)
+                         + timedelta(days=int(config.WABA_SILENT_COOLDOWN_DAYS))
+                         ).isoformat()
+                db.set_contact_cooldown(r["phone"], "waba", until,
+                                        "silent_no_confirmation")
+            except Exception:
+                pass
         try:
-            db.enqueue_rescue(
+            rid = db.enqueue_rescue(
                 phone=r["phone"],
                 name=r["name"],
                 category=r["category"],
                 original_channel=channel,
                 reason=reason,
+                # Момент самого сообщения: им же контакт был отложен, если
+                # отказ уже учтён в rescue-строке. Такое «новое» данное не
+                # должно снимать отсрочку.
+                since=r["sent_at"] or r["created_at"],
             )
+            if rid is None:
+                # Контакт уже откатан недавно (или исчерпан) — вторая строка
+                # не создана. Считать его «переключённым» нельзя: иначе в
+                # отчёте и в личке появится контакт, которому НИЧЕГО не
+                # отправили, а квота личного канала при этом списана.
+                # Антикоастинг WABA ниже всё равно применяется — молчание-то
+                # было настоящим.
+                log.info(
+                    f"sweep: {r['phone']} уже откатан — дубль в очередь не создан"
+                )
+                continue
             swept += 1
+            # Контакт, который прошёл ВСЕ каналы отката и нигде не был
+            # подтверждён, обязан получить терминальный статус. Раньше
+            # should_exhaust вызывался только при явном отказе транспорта, и
+            # «молчание везде» давало бесконечный цикл: принято → ждём →
+            # молчание → принято снова. Это и есть сжигание лимита личных
+            # аккаунтов на заведомо недостижимые номера.
+            try:
+                _fallbacks = [c for c in config.PHASE_ORDER if c != "waba"]
+                _why = db.should_exhaust(rid, _fallbacks)
+                if _why:
+                    db.mark_rescue_exhausted(rid, _why)
+                    log.info(
+                        f"🛑 {r['phone']} исчерпан ({_why}) — стоп автоматики, "
+                        "в ежедневную выгрузку"
+                    )
+            except Exception as _se:
+                log.debug(f"should_exhaust не отработал: {_se}")
             # Прозрачность: владелец видит, ЧТО и ПОЧЕМУ ушло в другой канал.
             # Раньше в личку прилетал только «канал умер», и по нему нельзя было
             # понять, сколько контактов реально переключилось и почему.
@@ -954,20 +1004,6 @@ def _sweep_rows(rows, kind: str, reason: str) -> int:
                 pass
         except Exception as e:
             log.warning(f"sweep: rescue не поставить {r['phone']}: {e}")
-        if kind == "unknown" and channel == "waba":
-            # Молчание по WABA — почти всегда отказ Meta по маркетинговому
-            # лимиту. Отправить ещё раз завтра бессмысленно: тот же отказ и
-            # тот же сгоревший слот. Но для других каналов контакт остаётся
-            # доступен — антикоастинг только на WABA.
-            try:
-                from datetime import timedelta
-                until = (datetime.now(timezone.utc)
-                         + timedelta(days=int(config.WABA_SILENT_COOLDOWN_DAYS))
-                         ).isoformat()
-                db.set_contact_cooldown(r["phone"], "waba", until,
-                                        "silent_no_confirmation")
-            except Exception:
-                pass
     return swept
 
 

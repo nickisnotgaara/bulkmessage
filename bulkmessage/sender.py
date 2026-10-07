@@ -477,11 +477,39 @@ def _drain_rescue_queue(current_state: dict, max_items: int = 2) -> int:
         if not rescue_cascade:
             # Ничего не откатываем: важно НЕ тратить попытку (attempts),
             # иначе запись после 3 таких проходов станет 'failed' навсегда.
+            #
+            # Но оставлять её 'pending' нельзя: контакт, у которого все каналы
+            # отката уже в tried_channels, иначе перебирается каждой фазой
+            # бесконечно и просто занимает очередь. Решаем терминально так же,
+            # как при отказе: исчерпан — стоп, иначе — в конец на завтра.
             log.info(
                 f"🚑 Rescue [{r['id']}]: нет доступных каналов для отката "
-                f"(исчерпаны/выключены/уже пробовали) — откладываю, "
-                f"попытку не трачу"
+                f"(исчерпаны/выключены/уже пробовали: {', '.join(tried) or '—'}) "
+                f"— попытку не трачу"
             )
+            _fallbacks = [c for c in _phase_order_channels() if c != "waba"]
+            try:
+                _why = db.should_exhaust(r["id"], _fallbacks)
+            except Exception as _se:
+                log.debug(f"should_exhaust недоступна: {_se}")
+                _why = None
+            if _why:
+                db.mark_rescue_exhausted(r["id"], _why)
+                log.info(
+                    f"  🛑 Rescue {r['id']} ({phone}) исчерпан ({_why}) — "
+                    "стоп автоматики, в ежедневную выгрузку"
+                )
+            elif _fallbacks and set(_fallbacks).issubset(set(tried)):
+                from datetime import timedelta as _td
+                _tomorrow = (
+                    datetime.now(timezone.utc) + _td(days=1)
+                ).isoformat()
+                db.mark_rescue_deferred(r["id"], _tomorrow)
+                log.info(
+                    f"  ⏭️ Rescue {r['id']} ({phone}) — все каналы отката уже "
+                    f"пробованы ({', '.join(tried)}), повтор после "
+                    f"{_tomorrow[:10]}"
+                )
             continue
 
         contact = {"phone": phone, "name": name, "category": category}
@@ -1585,11 +1613,23 @@ def _run_phase(
         ), _bo, _ps
 
     _inflight: dict = {}
-    for i, item in enumerate(items[:_concurrency]):
-        if _pool is not None:
-            _f, _bo, _ps = _submit(item)
-            _inflight[_f] = (item, _bo, _ps)
-    _next_index = _concurrency
+    _next_submit = 0
+
+    def _pump() -> None:
+        """Долить конвейер, не превышая _concurrency одновременных отправок.
+
+        ВАЖНО: долив происходит ВНУТРИ цикла, после всех проверок контакта
+        (safe hours, safety cap, backoff). Раньше первые N контактов
+        отправлялись ДО проверок — то есть прогон, начатый вне окна или после
+        срабатывания safety cap, всё равно отправлял первую пачку.
+        """
+        nonlocal _next_submit
+        if _pool is None:
+            return
+        while len(_inflight) < _concurrency and _next_submit < total:
+            _f, _bo, _ps = _submit(items[_next_submit])
+            _inflight[_f] = (items[_next_submit], _bo, _ps)
+            _next_submit += 1
     for i, item in enumerate(items):
         if stop_requested["v"]:
             log.info("⛔ Остановка по сигналу")
@@ -1615,14 +1655,12 @@ def _run_phase(
         state.save_state(cur)
 
         if _pool is not None:
+            # Сначала доливаем конвейер (после проверок контакта!), затем
+            # забираем самый старый результат — учёт остаётся в порядке
+            # исходного списка.
+            _pump()
             fut = next(iter(_inflight))
             item, _bo, _ps = _inflight.pop(fut)
-            # Дотерпливаем конвейер: следующий контакт уходит в сеть, пока мы
-            # считаем этот.
-            if _next_index < total:
-                _f2, _bo2, _ps2 = _submit(items[_next_index])
-                _inflight[_f2] = (items[_next_index], _bo2, _ps2)
-                _next_index += 1
             try:
                 ok = fut.result()
             except Exception as e:
@@ -1651,6 +1689,14 @@ def _run_phase(
         done += 1
         if ok:
             _run_accepted += 1
+            # Счётчик «принято транспортом» живёт в SQLite. Без этого строки
+            # отчёт был бы пустым: delivered/rejected пишутся вебхуком и
+            # сторожем, а accepted не писал никто — и воронка выглядела бы
+            # как «0 принято, 15 доставлено».
+            try:
+                db.upsert_counter(db.today_str(), phase_ch, "accepted")
+            except Exception as e:
+                log.debug(f"счётчик accepted не записан: {e}")
 
         # Rescue-строки должны получить терминальный статус, иначе они
         # останутся pending и уйдут в фазу MAX повторно.

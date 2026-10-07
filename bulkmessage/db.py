@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -966,35 +967,178 @@ def recent_channel_send(phone: str, channel: str, hours: int = 24) -> bool:
     return bool(row and int(row[0]) > 0)
 
 
+def _iso_newer(a_iso: Optional[str], b_iso: Optional[str]) -> bool:
+    """True, если метка a отвечает моменту позже метки b (мягкая разборка)."""
+    if not a_iso or not b_iso:
+        return False
+    try:
+        a = datetime.fromisoformat(str(a_iso))
+        b = datetime.fromisoformat(str(b_iso))
+    except (TypeError, ValueError):
+        return False
+    if a.tzinfo is None:
+        a = a.replace(tzinfo=timezone.utc)
+    if b.tzinfo is None:
+        b = b.replace(tzinfo=timezone.utc)
+    return a > b
+
+
+def _rescue_delivery_confirmed(conn, row) -> bool:
+    """Подтверждена ли доставка сообщения, которым контакт был «спасён».
+
+    Строка rescue со status='rescued' означает «отправка ПРИНЯТА каналом», а не
+    «доставлено». Разница принципиальна: принятое и неподтверждённое сообщение
+    должно довести контакт до следующего канала, а подтверждённое — закрыть
+    вопрос, чтобы не слать человеку второе сообщение.
+    """
+    mid = row["rescued_message_id"] if "rescued_message_id" in row.keys() else None
+    if not mid:
+        return False
+    r = conn.execute(
+        "SELECT status, delivery_state, delivered_at FROM messages "
+        "WHERE message_id = ?",
+        (mid,),
+    ).fetchone()
+    if r is None:
+        return False
+    if r["delivered_at"] or str(r["status"] or "").lower() == "delivered":
+        return True
+    return str(r["delivery_state"] or "") == "delivered"
+
+
+def _iso_within_hours(iso: Optional[str], hours: float) -> bool:
+    """True, если метка времени не старше N часов назад.
+
+    Мягкая разборка: битая метка считается «старой» — лучше лишняя новая
+    строка (её погасит инвариант 24ч/канал), чем вечно заблокированный контакт.
+    """
+    if not iso:
+        return False
+    try:
+        ts = datetime.fromisoformat(str(iso))
+    except (TypeError, ValueError):
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() < hours * 3600
+
+
 def enqueue_rescue(
     phone: str,
     name: Optional[str],
     category: Optional[str],
     original_channel: str = "waba",
     reason: Optional[str] = None,
+    since: Optional[str] = None,
 ) -> Optional[int]:
     """Ставит phone в очередь на rescue (cascade Personal).
 
-    Идемпотентно: если уже есть pending rescue для этого phone,
-    НЕ создаём дубль (просто обновляем reason/updated_at).
+    Идемпотентно ПО КОНТАКТУ, а не по статусу строки: у номера в каждый момент
+    есть только одна спасательная строка. Раньше совпадение искалось лишь среди
+    pending/deferred, и как только строка уходила в rescued (успешный откат),
+    следующее молчание WABA создавало вторую строку с ПУСТЫМ tried_channels.
+    Дальше каскад заново пробовал каналы, где контакт уже получил сообщение
+    (спасал только инвариант «одно сообщение на канал в сутки»), а
+    should_exhaust смотрел на attempts_total=0 и не срабатывал никогда —
+    контакт крутился в очереди и жег лимиты личных аккаунтов.
+
+    Правила:
+      * pending/deferred — живая строка: обновляем reason, отсрочку снимаем.
+      * rescued с ПОДТВЕРЖДЁННОЙ доставкой — сообщение дошло, вопрос закрыт,
+        в личные каналы второй раз не идём (возвращаем None).
+      * rescued без подтверждения — канал ПРИНЯЛ, но не доставил. Это не
+        дубль: контакт обязан дойти до следующего канала, поэтому строка
+        переоткрывается в той же записи, а tried_channels сохраняется —
+        канал, где сообщение уже было, повторно не трогаем.
+      * failed — попытка не сработала, строка возвращается в работу.
+      * exhausted — терминальный статус, автоматика контакт не трогает (None).
+      * rescued/failed старше окна — новый цикл с чистой историей: окно
+        прошло, а инвариант «одно сообщение на контакт в канале за сутки»
+        снова не даст повторить тот же канал.
+
+    since — момент «нового» события (для сторожа молчания это sent_at самого
+    сообщения). Если строка отложена и это данное не новее её updated_at,
+    отсрочка сохраняется: иначе сторож воскресил бы строку теми же самыми
+    данными, которые её и отложили.
     """
     now = datetime.now(timezone.utc).isoformat()
+    cooldown_hours = int(getattr(config, "CONTACT_CHANNEL_COOLDOWN_HOURS", 24) or 24)
     with db_conn() as conn:
         c = conn.cursor()
         c.execute(
             """
-            SELECT id FROM rescue_queue
-            WHERE phone = ? AND status = 'pending'
+            SELECT * FROM rescue_queue
+            WHERE phone = ? AND status != 'cancelled'
             ORDER BY id DESC LIMIT 1
             """,
             (phone,),
         )
         existing = c.fetchone()
+        if existing is not None and existing["status"] not in ("pending", "deferred"):
+            # Строка уже не ждёт отката: успех (rescued), исчерпание
+            # (exhausted) или неуспех (failed).
+            st = existing["status"]
+            if st == "exhausted":
+                logging.getLogger("db").info(
+                    f"rescue: {phone} исчерпан "
+                    f"({existing['last_outcome'] or ''}) — повторно не ставим"
+                )
+                return None
+            if st == "rescued" and _rescue_delivery_confirmed(conn, existing):
+                logging.getLogger("db").info(
+                    f"rescue: {phone} уже получил сообщение в "
+                    f"{existing['rescued_channel']} (доставка подтверждена) — "
+                    "дубль не создаём"
+                )
+                return None
+            if _iso_within_hours(existing["updated_at"], cooldown_hours):
+                # Свежий неуспех: тот же контакт, тот же каскад. Возвращаем
+                # запись в работу, НЕ трогая tried_channels.
+                c.execute(
+                    """
+                    UPDATE rescue_queue
+                    SET reason = COALESCE(?, reason),
+                        status = 'pending',
+                        retry_after = NULL,
+                        rescued_channel = NULL,
+                        rescued_message_id = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (reason, now, existing["id"]),
+                )
+                logging.getLogger("db").info(
+                    f"rescue: {phone} переоткрыт для следующего канала "
+                    f"(был {st}, tried=[{existing['tried_channels'] or ''}])"
+                )
+                return existing["id"]
         if existing is not None:
+            # Найдена живая запись. Если она отложена (deferred), а контакт
+            # ТОЛЬКО ЧТО снова провалился — новый провал снимает отсрочку,
+            # иначе он «переспрашивал» бы контакт завтра, хотя уже сегодня
+            # есть свежие данные.
+            #
+            # Но только если это действительно НОВЫЕ данные. Сторож молчания
+            # разбирает в том числе тот самый отказ, из-за которого строку
+            # только что отложили; без такой проверки отсрочка снималась бы
+            # теми же данными и контакт крутился бы в очереди бесконечно,
+            # сжигая квоту личных каналов на заведомо мёртвый номер.
+            if existing["status"] == "deferred" and since and not _iso_newer(
+                    since, existing["updated_at"]):
+                logging.getLogger("db").info(
+                    f"rescue: {phone} отложен до "
+                    f"{existing['retry_after'] or 'завтра'} — свежих данных "
+                    "нет, остаётся в конце очереди"
+                )
+                return existing["id"]
             c.execute(
                 """
                 UPDATE rescue_queue
                 SET reason = COALESCE(?, reason),
+                    status = CASE WHEN status = 'deferred' THEN 'pending'
+                                  ELSE status END,
+                    retry_after = CASE WHEN status = 'deferred' THEN NULL
+                                       ELSE retry_after END,
                     updated_at = ?
                 WHERE id = ?
                 """,

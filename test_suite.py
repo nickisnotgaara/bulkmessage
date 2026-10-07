@@ -3874,6 +3874,123 @@ finally:
     except OSError:
         pass
 
+# --- Одна живая строка отката на контакт ---------------------------------
+# Реальный баг, найденный локальным стендом 2026-10-07. enqueue_rescue искал
+# совпадение только среди pending/deferred. Строка, ушедшая в 'rescued',
+# переставала быть «найденной», и следующее молчание WABA создавало ВТОРУЮ
+# строку с пустым tried_channels. Дальше каскад заново пробовал каналы, где
+# контакт уже получил сообщение, а should_exhaust смотрел на attempts_total=0
+# и не срабатывал — контакт крутился в очереди и жег лимиты личных аккаунтов.
+_d_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_d_db.close()
+try:
+    with patch.object(config, "DB_PATH", _d_db.name):
+        db.init_db()
+
+        def _live(phone):
+            with db.db_conn() as c:
+                return c.execute(
+                    "SELECT COUNT(*) FROM rescue_queue WHERE phone=? "
+                    "AND status != 'cancelled'", (phone,)).fetchone()[0]
+
+        def _tried(rid):
+            with db.db_conn() as c:
+                return c.execute("SELECT tried_channels FROM rescue_queue "
+                                 "WHERE id=?", (rid,)).fetchone()[0]
+
+        def _status(rid):
+            with db.db_conn() as c:
+                return c.execute("SELECT status FROM rescue_queue "
+                                 "WHERE id=?", (rid,)).fetchone()[0]
+
+        # 1) Откат прошёл (rescued), но доставку никто не подтвердил →
+        #    следующее молчание обязано ПЕРЕОТКРЫТЬ ту же строку, сохранив
+        #    tried_channels, а не плодить новую с пустой историей.
+        r1 = db.enqueue_rescue(phone="+79990001111", name="А",
+                               category="Покупатели")
+        db.mark_rescue_tried(r1, "telegram")
+        db.mark_rescue_success(r1, "telegram", "mid-silent-1")
+        r1b = db.enqueue_rescue(phone="+79990001111", name="А",
+                                category="Покупатели", reason="waba_silent")
+        check("rescued без подтверждения переоткрывает ТУ ЖЕ строку (не дубль)",
+              r1b == r1 and _live("+79990001111") == 1,
+              f"id={r1} -> {r1b}, живых строк={_live('+79990001111')}")
+        check("переоткрытие сохраняет историю каналов",
+              _tried(r1) == "telegram" and _status(r1) == "pending",
+              f"tried=[{_tried(r1)}] status={_status(r1)}")
+
+        # 2) Откат прошёл И доставку подтвердили вебхуком → контакт получил
+        #    своё сообщение, второй раз в личные каналы не идём.
+        with db.db_conn() as c:
+            cid = db.upsert_contact(c, phone="+79990002222", name="Б",
+                                    category="Покупатели")
+            pk = db.insert_message(c, contact_id=cid, channel="telegram",
+                                   message_text="t", message_id="mid-ok-1",
+                                   status="sent")
+            c.execute("UPDATE messages SET delivered_at=datetime('now') "
+                      "WHERE id=?", (pk,))
+        r2 = db.enqueue_rescue(phone="+79990002222", name="Б",
+                               category="Покупатели")
+        db.mark_rescue_tried(r2, "telegram")
+        db.mark_rescue_success(r2, "telegram", "mid-ok-1")
+        r2b = db.enqueue_rescue(phone="+79990002222", name="Б",
+                                category="Покупатели", reason="waba_silent")
+        check("подтверждённая доставка замыкает очередь (дубль не создаётся)",
+              r2b is None and _live("+79990002222") == 1
+              and _status(r2) == "rescued",
+              f"вернул {r2b}, живых строк={_live('+79990002222')}")
+
+        # 3) Сторож молчания не должен воскрешать отложенную строку теми же
+        #    данными, которые её и отложили, — иначе отсрочка снимается сразу
+        #    и контакт крутится в очереди бесконечно.
+        r3 = db.enqueue_rescue(phone="+79990003333", name="В",
+                               category="Покупатели")
+        db.mark_rescue_tried(r3, "telegram")
+        db.mark_rescue_tried(r3, "max")
+        _tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        db.mark_rescue_deferred(r3, _tomorrow)
+        _old_iso = "2026-10-07T00:00:00+00:00"
+        db.enqueue_rescue(phone="+79990003333", name="В", category="Покупатели",
+                          since=_old_iso)
+        check("старое данное НЕ снимает отсрочку",
+              _status(r3) == "deferred", f"status={_status(r3)}")
+        _newer_iso = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        db.enqueue_rescue(phone="+79990003333", name="В", category="Покупатели",
+                          since=_newer_iso)
+        check("действительно новое данное снимает отсрочку",
+              _status(r3) == "pending", f"status={_status(r3)}")
+
+        # 4) Исчерпанный контакт автоматика не воскрешает.
+        r4 = db.enqueue_rescue(phone="+79990004444", name="Г",
+                               category="Покупатели")
+        db.mark_rescue_tried(r4, "telegram")
+        db.mark_rescue_exhausted(r4, "all_channels_tried")
+        r4b = db.enqueue_rescue(phone="+79990004444", name="Г",
+                                category="Покупатели")
+        check("exhausted не переоткрывается автоматикой",
+              r4b is None and _status(r4) == "exhausted",
+              f"вернул {r4b}, status={_status(r4)}")
+
+        # 5) Молчание по ПОСЛЕДНЕМУ каналу отката обязано дать терминальный
+        #    статус: раньше should_exhaust вызывался только при явном отказе,
+        #    и «молчание везде» давало бесконечный цикл принято→ждём→молчание.
+        r5 = db.enqueue_rescue(phone="+79990005555", name="Д",
+                               category="Покупатели")
+        db.mark_rescue_tried(r5, "telegram")
+        db.mark_rescue_tried(r5, "max")
+        with patch.object(config, "EXHAUST_WINDOW_DAYS", 0):
+            _why5 = db.should_exhaust(r5, ["telegram", "max"])
+            _not5 = db.should_exhaust(r5, ["telegram", "max", "sms"])
+        check("все каналы отката пройдены → контакт исчерпан",
+              bool(_why5), f"причина={_why5!r}")
+        check("неисчерпанный канал продления не делает контакт исчерпанным",
+              _not5 is None, f"причина={_not5!r}")
+finally:
+    try:
+        os.unlink(_d_db.name)
+    except OSError:
+        pass
+
 print()
 print("=" * 70)
 print(f" TOTAL: {passed} passed, {failed} failed")

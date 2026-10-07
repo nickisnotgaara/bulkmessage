@@ -278,13 +278,28 @@ sweep_unconfirmed_deliveries(limit=200, minutes=0)
 con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
 deferred = con.execute("SELECT COUNT(*) FROM rescue_queue "
                        "WHERE status='deferred'").fetchone()[0]
+queue_state = con.execute(
+    "SELECT status, COUNT(*) FROM rescue_queue GROUP BY 1").fetchall()
+rescue_rows = con.execute(
+    "SELECT phone, status, tried_channels, attempts_total FROM rescue_queue "
+    "ORDER BY id").fetchall()
+live_multi = con.execute(
+    "SELECT phone, COUNT(*) c FROM rescue_queue WHERE status != 'cancelled' "
+    "GROUP BY 1 HAVING c > 1").fetchall()
 dupes = con.execute(
     "SELECT c.phone, m.channel, COUNT(*) c FROM messages m "
     "JOIN contacts c ON c.id=m.contact_id "
     "WHERE m.message_id IS NOT NULL GROUP BY 1,2 HAVING c > 1").fetchall()
 con.close()
-check("исчерпавшие все каналы ушли в конец очереди (deferred)",
-      deferred >= 1, f"deferred={deferred}")
+print("\n  Очередь отката:", dict(queue_state))
+for _r in rescue_rows:
+    print(f"    {_r[0]} {_r[1]:9s} tried=[{_r[2] or ''}] attempts={_r[3]}")
+check("провалившийся во всех каналах не крутится в начале очереди "
+      "(deferred/exhausted)", deferred >= 1
+      or any(_r[1] == "exhausted" for _r in rescue_rows),
+      f"deferred={deferred}, очередь={dict(queue_state)}")
+check("на контакт — не больше одной живой строки отката", not live_multi,
+      f"{live_multi}")
 check("ни одного дубля: один контакт — одно сообщение в канале",
       not dupes, f"{dupes}")
 
