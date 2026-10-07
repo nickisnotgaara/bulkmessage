@@ -306,37 +306,50 @@ def process_delivery_status(channel: str, msg: dict) -> None:
             state_mod.record_failed_delivery(cur_state, channel)
             if applied:
                 db.upsert_counter(db.today_str(), channel, "rejected")
-            # WABA: явный failed от вебхука — единственный сигнал, по которому
-            # номер выводится из WABA-пула. reachability_cache ниже протухает
-            # за 24ч, а нам номер нужно исключать надолго (по умолчанию 30
-            # дней), иначе он завтра снова заберёт один из 250 слотов, хотя
-            # заведомо не доходит. Phone — из БД по contact_id: в статусном
-            # вебхуке поле from это ОТПРАВИТЕЛЬ.
-            if channel == "waba" and contact_id:
+            # Телефон контакта нужен и для WABA-исчерпания, и для breaker'а:
+            # в статусном вебхуке поле `from` — это ОТПРАВИТЕЛЬ, а не клиент.
+            _failed_phone = ""
+            if contact_id:
                 with db.db_conn() as conn4:
                     row4 = conn4.execute(
                         "SELECT phone FROM contacts WHERE id = ?", (contact_id,)
                     ).fetchone()
                 if row4 and row4["phone"]:
-                    state_mod.mark_waba_exhausted(
-                        cur_state, row4["phone"],
-                        (msg.get("detail") or msg.get("error") or "failed")[:200],
-                    )
-                    log.info(
-                        f"   🚫 WABA исчерпан: {row4['phone']} исключён из "
-                        f"WABA-пула на "
-                        f"{getattr(config, 'WABA_EXHAUSTED_TTL_DAYS', 30)} дней"
-                    )
-            # Circuit breaker: серия PEER_FLOOD/FLOOD_WAIT/rate-limit гасит канал.
-            # Причина лежит в detail, а не в status (status всегда "error").
+                    _failed_phone = row4["phone"]
+            # WABA: явный failed от вебхука — единственный сигнал, по которому
+            # номер выводится из WABA-пула. reachability_cache ниже протухает
+            # за 24ч, а нам номер нужно исключать надолго (по умолчанию 30
+            # дней), иначе он завтра снова заберёт один из 250 слотов, хотя
+            # заведомо не доходит.
+            if channel == "waba" and _failed_phone:
+                state_mod.mark_waba_exhausted(
+                    cur_state, _failed_phone,
+                    (msg.get("detail") or msg.get("error") or "failed")[:200],
+                )
+                log.info(
+                    f"   🚫 WABA исчерпан: {_failed_phone} исключён из "
+                    f"WABA-пула на "
+                    f"{getattr(config, 'WABA_EXHAUSTED_TTL_DAYS', 30)} дней"
+                )
+            # Circuit breaker. Причина лежит в detail, а не в status (status
+            # всегда "error"). Счёт идёт по РАЗНЫМ контактам: серия
+            # BAD_CONTACT на разных номерах означает мёртвый канал, а не
+            # мёртвые номера, и каскад обязан уйти в следующий канал, а не
+            # жечь личный аккаунт впустую.
             tripped = state_mod.record_delivery_outcome(
                 cur_state, channel, ok=False,
                 error_text=(msg.get("detail") or msg.get("status") or ""),
+                phone=_failed_phone,
             )
             if tripped:
+                _why = "провайдер не адресует контакты" if (
+                    state_mod.is_provider_fail_error(
+                        msg.get("detail") or msg.get("status") or ""
+                    )
+                ) else "серия отказов перегрузки"
                 log.error(
-                    f"   🛑 CIRCUIT BREAKER: {channel} остановлен на 1ч "
-                    f"после серии отказов перегрузки"
+                    f"   🛑 CIRCUIT BREAKER: {channel} остановлен ({_why}) — "
+                    f"каскад пойдёт в следующий доступный канал"
                 )
         state_mod.save_state(cur_state)
     except Exception as e:

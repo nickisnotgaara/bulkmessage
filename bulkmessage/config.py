@@ -329,6 +329,15 @@ COMPLAINT_HALT_DURATION_HOURS = int(
 OVERLOAD_STREAK_LIMIT = int(os.environ.get("BULK_OVERLOAD_STREAK_LIMIT", "5"))
 OVERLOAD_HALT_HOURS = int(os.environ.get("BULK_OVERLOAD_HALT_HOURS", "1"))
 
+# Circuit breaker на ПРОВАЙДЕРСКИЙ отказ: канал принимает сообщения (HTTP 201),
+# но адресовать получателей не может — Wazzup отвечает BAD_CONTACT даже на
+# self-send (живой случай 2026-10-07, Telegram). Считаются только РАЗНЫЕ
+# контакты: один мёртвый номер не должен гасить исправный канал. Порог
+# достигнут → канал в halt, каскад идёт сразу в следующий по порядку.
+# 0 — выключить проверку целиком.
+PROVIDER_FAIL_STREAK_LIMIT = int(os.environ.get("BULK_PROVIDER_FAIL_STREAK_LIMIT", "3"))
+PROVIDER_HALT_HOURS = int(os.environ.get("BULK_PROVIDER_HALT_HOURS", "6"))
+
 # Сторож подтверждений: сколько ждать delivery_status, прежде чем считать
 # сообщение недоставленным и отправить контакт в rescue. Вебхук — единственный
 # источник запуска fallback; если он молчит, контакт иначе навсегда остаётся

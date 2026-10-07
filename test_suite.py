@@ -1870,6 +1870,89 @@ check("успешная доставка сбрасывает streak",
       f"got {state.overload_streak(_cb2, 'telegram')}")
 
 # ---------------------------------------------------------------------------
+# R19b: circuit breaker на провайдерский отказ (канал не адресует контактов)
+# ---------------------------------------------------------------------------
+# Живой случай 2026-10-07: Telegram через Wazzup отвечал HTTP 201 на каждый
+# контакт, включая self-send на собственный номер, а отказ приходил эхом
+# "BAD_CONTACT: Recipient with this chatId does not exist". Это НЕ перегрузка,
+# поэтому автомат R19 его не ловил: sender продолжал жечь личный аккаунт и
+# вял pacing 5-15 мин на каждую попытку вместо перехода в MAX.
+_BAD_CONTACT = "BAD_CONTACT: Recipient with this chatId does not exist"
+check("BAD_CONTACT распознаётся как провайдерский отказ",
+      state.is_provider_fail_error(_BAD_CONTACT))
+check("BAD_CONTACT — НЕ перегрузка (две разные причины)",
+      not state.is_overload_error(_BAD_CONTACT))
+check("PHONE_NOT_OCCUPIED — НЕ провайдерский отказ (смерть номера)",
+      not state.is_provider_fail_error("rpc error code 400: PHONE_NOT_OCCUPIED"))
+check("порог провайдерского breaker в конфиге",
+      config.PROVIDER_FAIL_STREAK_LIMIT == 3,
+      f"got {config.PROVIDER_FAIL_STREAK_LIMIT}")
+
+# Канал гасится только после серии на РАЗНЫХ контактах.
+_pf = state.load_state()
+_pf = state.reset_daily_if_new_day(_pf)
+_pf["_provider_fail_streak"] = {}
+_pf["_provider_fail_seen"] = {}
+_pf["halted_channels"] = {}
+_pf_trip = None
+for _i, _phone in enumerate(["79160000001", "79160000002", "79160000003"], 1):
+    if state.record_delivery_outcome(_pf, "telegram", ok=False,
+                                     error_text=_BAD_CONTACT, phone=_phone):
+        _pf_trip = _i
+        break
+check("серия BAD_CONTACT на разных контактах гасит канал",
+      _pf_trip == config.PROVIDER_FAIL_STREAK_LIMIT, f"trip_at={_pf_trip}")
+check("канал telegram остановлен", state.is_channel_halted(_pf, "telegram"))
+
+# Тот же номер повторно серию НЕ растит: иначе мёртвый номер гасит живой канал.
+_pf2 = state.load_state()
+_pf2 = state.reset_daily_if_new_day(_pf2)
+_pf2["_provider_fail_streak"] = {}
+_pf2["_provider_fail_seen"] = {}
+_pf2["halted_channels"] = {}
+for _ in range(5):
+    state.record_delivery_outcome(_pf2, "telegram", ok=False,
+                                  error_text=_BAD_CONTACT, phone="79160000009")
+check("повторы одного номера не гасят канал",
+      not state.is_channel_halted(_pf2, "telegram"),
+      f"streak={state.provider_fail_streak(_pf2, 'telegram')}")
+
+# Успешная доставка доказала, что канал жив — счётчик сброшен.
+_pf3 = state.load_state()
+_pf3 = state.reset_daily_if_new_day(_pf3)
+_pf3["_provider_fail_streak"] = {"telegram": 2}
+_pf3["_provider_fail_seen"] = {"telegram": ["79160000001", "79160000002"]}
+state.record_delivery_outcome(_pf3, "telegram", ok=True)
+check("успешная доставка сбрасывает провайдерский streak",
+      state.provider_fail_streak(_pf3, "telegram") == 0,
+      f"got {state.provider_fail_streak(_pf3, 'telegram')}")
+
+# Выключатель нуля: проверка не должна срабатывать вовсе.
+_pf4 = state.load_state()
+_pf4 = state.reset_daily_if_new_day(_pf4)
+_pf4["_provider_fail_streak"] = {}
+_pf4["_provider_fail_seen"] = {}
+_pf4["halted_channels"] = {}
+_pf4_limit = config.PROVIDER_FAIL_STREAK_LIMIT
+try:
+    config.PROVIDER_FAIL_STREAK_LIMIT = 0
+    for _i in range(6):
+        state.record_delivery_outcome(_pf4, "telegram", ok=False,
+                                      error_text=_BAD_CONTACT,
+                                      phone=f"7916000010{_i}")
+finally:
+    config.PROVIDER_FAIL_STREAK_LIMIT = _pf4_limit
+check("BULK_PROVIDER_FAIL_STREAK_LIMIT=0 отключает проверку",
+      not state.is_channel_halted(_pf4, "telegram"))
+
+# Каскад обязан перепрыгнуть halted-канал и дойти до следующего.
+check("halted telegram отсекается rescue-каскадом",
+      "telegram" not in sender._rescue_cascade_for(
+          "waba", _pf, already_tried=[])
+      and "max" in sender._rescue_cascade_for("waba", _pf, already_tried=[]),
+      f"cascade={sender._rescue_cascade_for('waba', _pf, already_tried=[])}")
+
+# ---------------------------------------------------------------------------
 # R20: 24ч-окно WABA — окно открывает ОТВЕТ КОНТАКТА, не наша отправка
 # ---------------------------------------------------------------------------
 # Раньше is_waba_in_24h_window() читала waba_sent_meta, который записывался на
@@ -3576,6 +3659,8 @@ try:
              patch.object(state, "record_failed_delivery",
                           lambda st, ch, *a, **k: None), \
              patch.object(state, "load_state", dict), \
+             patch.object(reconcile, "sync_message_to_sheet",
+                          lambda **k: None), \
              patch.object(state, "reset_daily_if_new_day", lambda s: s):
             # ch=None имитирует то, что реально приходит из резолва payload:
             # ни channelId, ни chatType у статус-события нет.

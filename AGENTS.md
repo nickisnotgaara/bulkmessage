@@ -78,6 +78,16 @@
    - **Complaint halt**: при 2 жалобах за 24ч для MAX, 3 для TG/WABA —
      канал HALTED на 24ч, alert в TG-бот.
    - **Adaptive decay**: жалоба → cap × 0.5 на следующий день.
+   - **Circuit breaker (перегрузка)**: серия PEER_FLOOD/FLOOD_WAIT/rate-limit
+     (`BULK_OVERLOAD_STREAK_LIMIT`, по умолчанию 5) → halt на 1ч.
+   - **Circuit breaker (провайдерский отказ)**: серия `BAD_CONTACT` /
+     «Recipient with this chatId does not exist» на **РАЗНЫХ** контактах
+     (`BULK_PROVIDER_FAIL_STREAK_LIMIT`, по умолчанию 3) → halt на
+     `BULK_PROVIDER_HALT_HOURS` (6ч), каскад сразу уходит в следующий канал.
+     Живой случай 2026-10-07: Wazzup отвечал HTTP 201 на Telegram даже на
+     self-send, но адресовать никого не мог. Один и тот же номер повторно
+     серию **не** растит — иначе мёртвый номер гасил бы живой канал.
+     `=0` отключает проверку.
 
 ### 7. **WABA Templates (Phase 1.2)**
    - У пользователя есть **4 одобренных шаблона** в Meta: по одному на

@@ -550,6 +550,29 @@ _OVERLOAD_MARKERS = (
     "131048", "131056", "131049", "130429", "slow_down", "slowdown",
 )
 
+# --- Circuit breaker: провайдер перестал адресовать КОНТАКТЫ ВООБЩЕ ---------
+# Живой случай 2026-10-07 (Telegram через Wazzup, канал 1c2ef310…): каждый
+# контакт отклонялся с `BAD_CONTACT: Recipient with this chatId does not
+# exist` — включая self-send на собственный номер 79771501819. Канал при этом
+# «жив»: Wazzup отвечает HTTP 201, а отказ приходит эхом через пару секунд.
+# Это НЕ перегрузка, поэтому автомат выше его не ловил: sender продолжал
+# слать в мёртвый канал, жёг личный аккаунт и вял pacing 5–15 мин на
+# каждую попытку вместо того, чтобы сразу уйти в MAX.
+#
+# Чем «мёртвый номер» отличается от «мёртвого канала»: один и тот же телефон
+# повторно не считается. Если канал отверг N РАЗНЫХ контактов подряд — виноват
+# канал, а не номера.
+_PROVIDER_FAIL_MARKERS = (
+    "bad_contact",
+    "recipient with this chatid does not exist",
+    "chat not found",
+    "chat_id_invalid",
+    "peer_id_invalid",
+    "user is not found",
+    "user_not_found",
+    "channel invalid",
+)
+
 
 def _bump_overload(state: dict, channel: str) -> int:
     data = state.setdefault("_overload_streak", {})
@@ -568,21 +591,74 @@ def is_overload_error(text: str) -> bool:
     return any(m in t for m in _OVERLOAD_MARKERS)
 
 
-def record_delivery_outcome(
-    state: dict, channel: str, ok: bool, error_text: str = ""
-) -> bool:
-    """Учёт исхода доставки + circuit breaker по перегрузке.
+def is_provider_fail_error(text: str) -> bool:
+    """Канал не может адресовать получателя — провайдерский, а не контактный отказ."""
+    t = str(text or "").lower()
+    return any(m in t for m in _PROVIDER_FAIL_MARKERS)
 
-    ok=True  → счётчик сбрасывается (канал здоров).
-    ok=False и текст ошибки — перегрузка → счётчик растёт; при достижении
-    порога канал уходит в halt на 1 час.
+
+def _bump_provider_fail(state: dict, channel: str, phone: str) -> int:
+    """Считаем отказ, только если этот контакт в канале ещё не падал.
+
+    Без этого мёртвый номер, повторно прошедший через rescue, накапливал бы
+    серию и гасил исправный канал.
+    """
+    seen = state.setdefault("_provider_fail_seen", {})
+    phones = seen.setdefault(channel, [])
+    if phone and phone in phones:
+        return provider_fail_streak(state, channel)
+    if phone:
+        phones.append(phone)
+    streak = state.setdefault("_provider_fail_streak", {})
+    streak[channel] = int(streak.get(channel, 0)) + 1
+    return streak[channel]
+
+
+def _clear_provider_fail(state: dict, channel: str) -> None:
+    for key in ("_provider_fail_streak", "_provider_fail_seen"):
+        data = state.get(key) or {}
+        if channel in data:
+            del data[channel]
+
+
+def provider_fail_streak(state: dict, channel: str) -> int:
+    return int((state.get("_provider_fail_streak") or {}).get(channel, 0))
+
+
+def record_delivery_outcome(
+    state: dict, channel: str, ok: bool, error_text: str = "", phone: str = ""
+) -> bool:
+    """Учёт исхода доставки + два circuit breaker'а.
+
+    ok=True  → оба счётчика сбрасываются (канал отвечает).
+    ok=False → отказ классифицируется:
+      * перегрузка (PEER_FLOOD/FLOOD_WAIT/rate-limit) → серия растёт, при
+        достижении `OVERLOAD_STREAK_LIMIT` канал в halt на 1 час;
+      * провайдерский отказ (BAD_CONTACT и т.п.) → серия по РАЗНЫМ контактам
+        растёт, при `PROVIDER_FAIL_STREAK_LIMIT` канал в halt на
+        `PROVIDER_HALT_HOURS`. Такой канал Wazzup продолжает принимать
+        (HTTP 201), но адресовать не способен никого.
 
     Возвращает True, если канал только что был остановлен.
     """
-    threshold = getattr(config, "OVERLOAD_STREAK_LIMIT", 5)
     if ok:
         _clear_overload(state, channel)
+        _clear_provider_fail(state, channel)
         return False
+    if is_provider_fail_error(error_text):
+        limit = getattr(config, "PROVIDER_FAIL_STREAK_LIMIT", 3)
+        if limit <= 0:            # 0 — проверка выключена
+            return False
+        streak = _bump_provider_fail(state, channel, phone)
+        if streak >= limit:
+            halt_channel(
+                state, channel,
+                hours=getattr(config, "PROVIDER_HALT_HOURS", 6),
+            )
+            _clear_provider_fail(state, channel)
+            return True
+        return False
+    threshold = getattr(config, "OVERLOAD_STREAK_LIMIT", 5)
     if not is_overload_error(error_text):
         return False
     streak = _bump_overload(state, channel)
