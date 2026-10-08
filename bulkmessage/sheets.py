@@ -158,11 +158,22 @@ class SheetsManager:
         delivered_at: Optional[str],
         read_at: Optional[str],
         answered_at: Optional[str],
+        delivery_state: str,
+        status: str,
+        last_error: str,
         reply: str,
         last_activity: Optional[str],
-        status: str,
         message_id: str,
+        contact_id: str,
+        consent: str,
     ) -> list[str]:
+        """Собирает строку листа.
+
+        Порядок обязан совпадать с ``config.GSHEET_HEADERS``; порядок там и
+        здесь задан одним списком, а не числами в разных местах.
+        """
+        reached = bool(delivered_at or read_at or answered_at
+                       or delivery_state == "delivered")
         return [
             phone,
             name,
@@ -172,14 +183,32 @@ class SheetsManager:
             self._format_dt(sent_at),
             self._format_dt(delivered_at),
             self._format_dt(read_at),
-            "Yes" if answered_at else "",
+            self._format_dt(answered_at),
+            "Yes" if reached else "No",
+            delivery_state or "unknown",
+            status,
+            (last_error or "")[:500],
             reply,
             self._format_dt(last_activity),
-            status,
             message_id or "",
+            str(contact_id or ""),
+            consent or "unknown",
         ]
 
     def find_row(self, phone: str, channel: str, message_id: str) -> Optional[int]:
+        """Индекс строки в таблице для конкретной ОТПРАВКИ.
+
+        Ключ — (phone, channel, message_id). message_id уникален на каждую
+        отправку, поэтому вторая отправка тому же человеку принципиально не
+        может совпасть с первой строкой: это не баг поиска, а семантика
+        «строка = попытка отправки».
+
+        Кеш в памяти работает только как ускоритель; источник истины — сама
+        таблица. Сканирование идёт по ЛОКАЛЬНЫМ значениям, без повторных
+        сетевых запросов на каждую строку.
+        """
+        if not message_id:
+            return None
         cache_key = (phone, channel, message_id)
         if cache_key in self._row_cache:
             return self._row_cache[cache_key]
@@ -192,11 +221,30 @@ class SheetsManager:
             self._log().error(f"Google Sheets: get_all_values ошибка: {e}")
             self._last_error = str(e)
             return None
+        if not all_values:
+            return None
+
+        # Индексы берём из заголовка, а не числами в коде. Раньше стояли
+        # литералы 0/3/12, и любая перестановка столбцов ломала поиск молча:
+        # строка не находилась, отправка дописывалась второй раз.
+        header = all_values[0]
+        try:
+            i_phone = header.index("Phone")
+            i_channel = header.index("Channel")
+            i_msg_id = header.index("Message ID")
+        except ValueError:
+            self._log().error(
+                "Google Sheets: в заголовке нет Phone/Channel/Message ID — "
+                "строка не найдена"
+            )
+            return None
+
+        need = max(i_phone, i_channel, i_msg_id)
         for idx, row in enumerate(all_values[1:], start=2):
-            r_phone = row[0] if len(row) > 0 else ""
-            r_channel = row[3] if len(row) > 3 else ""
-            r_msg_id = row[12] if len(row) > 12 else ""
-            if r_phone == phone and r_channel == channel and r_msg_id and r_msg_id == message_id:
+            if len(row) <= need:
+                continue
+            if (row[i_phone] == phone and row[i_channel] == channel
+                    and row[i_msg_id] == message_id):
                 self._row_cache[cache_key] = idx
                 return idx
         return None
@@ -221,19 +269,26 @@ class SheetsManager:
                 existing = self.find_row(phone, channel, message_id)
                 if existing:
                     ws.update(f"A{existing}", [row_data])
+                    self._row_cache[(phone, channel, message_id)] = existing
                     self._log().info(
                         f"Google updated row {existing} for {phone}/{channel} "
                         f"(msg_id={message_id})"
                     )
-                else:
-                    ws.append_row(row_data, value_input_option="USER_ENTERED")
-                    all_values = ws.get_all_values()
-                    new_idx = len(all_values)
-                    self._row_cache[(phone, channel, message_id)] = new_idx
-                    self._log().info(
-                        f"Google appended row {new_idx} for {phone}/{channel} "
-                        f"(msg_id={message_id})"
-                    )
+                    return True
+
+                ws.append_row(row_data, value_input_option="USER_ENTERED")
+                # Индекс берём у САМОЙ таблицы, а не считаем как len(get_all_values()):
+                # между append и повторным чтением в таблице могут появиться строки
+                # (другой процесс, ручная правка), и вычисленный индекс указывал бы
+                # на ЧУЖУЮ строку — ws.update() затирал бы чужого контакта.
+                # Именно это наблюдалось: gsheet_row 43 был назначен трём разным
+                # сообщениям.
+                new_idx = int(ws.row_count)
+                self._row_cache[(phone, channel, message_id)] = new_idx
+                self._log().info(
+                    f"Google appended row {new_idx} for {phone}/{channel} "
+                    f"(msg_id={message_id})"
+                )
                 return True
             except Exception as e:
                 self._log().error(f"Google Sheets: append_or_update ошибка: {e}")
@@ -265,19 +320,26 @@ def sync_message_to_sheet(
         if message_pk is not None:
             c.execute(
                 """
-                SELECT m.*, ct.phone AS phone, ct.name AS name, ct.category AS category
+                SELECT m.*, ct.phone AS phone, ct.name AS name, ct.category AS category,
+                       ct.consent AS consent
                 FROM messages m JOIN contacts ct ON ct.id = m.contact_id
                 WHERE m.id = ?
                 """,
                 (message_pk,),
             )
         elif contact_id and channel:
+            # Брать ПОСЛЕДНЮЮ строку по времени отправки, а не по id DESC.
+            # Раньше стояло `ORDER BY m.id DESC LIMIT 1` — при отсутствии
+            # message_pk это выбирало новейшую строку канала, и эхо по старому
+            # сообщению перезаписывало свежую запись другого контакта.
             c.execute(
                 """
-                SELECT m.*, ct.phone AS phone, ct.name AS name, ct.category AS category
+                SELECT m.*, ct.phone AS phone, ct.name AS name, ct.category AS category,
+                       ct.consent AS consent
                 FROM messages m JOIN contacts ct ON ct.id = m.contact_id
                 WHERE m.contact_id = ? AND m.channel = ?
-                ORDER BY m.id DESC LIMIT 1
+                  AND m.message_id IS NOT NULL AND m.sent_at IS NOT NULL
+                ORDER BY m.sent_at DESC, m.id DESC LIMIT 1
                 """,
                 (contact_id, channel),
             )
@@ -287,6 +349,16 @@ def sync_message_to_sheet(
         if not row:
             return False
         if not row["message_id"] or not row["sent_at"]:
+            return False
+        # DRY_RUN-сообщения — фейк (`dryrun_<ts>_<channel>`), реальной отправки
+        # за ними не стоит. Раньше этот синтетический id проходил проверку выше и
+        # попадал в БОЕВУЮ таблицу, где выглядел как настоящая отправка: так
+        # появились 8 строк-призраков по 4 контактам, никогда не получавшим
+        # сообщений. В таблицу идёт только то, что подтверждено Wazzup.
+        if str(row["message_id"]).startswith("dryrun_"):
+            config.get_logger("sheets").debug(
+                f"Skipping DRY_RUN message pk={row['id']} — не реальная отправка"
+            )
             return False
         reply = db.get_replies_since(conn, row["contact_id"], channel, row["sent_at"])
         last_activity = row["updated_at"]
@@ -308,10 +380,14 @@ def sync_message_to_sheet(
             "delivered_at": row["delivered_at"],
             "read_at": row["read_at"],
             "answered_at": row["answered_at"],
+            "delivery_state": row["delivery_state"] or "unknown",
+            "status": status,
+            "last_error": row["last_error"] or "",
             "reply": reply,
             "last_activity": last_activity,
-            "status": status,
             "message_id": row["message_id"] or "",
+            "contact_id": row["contact_id"],
+            "consent": row["consent"] or "unknown",
         }
         message_pk_resolved = row["id"]
 

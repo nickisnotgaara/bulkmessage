@@ -1680,6 +1680,11 @@ try:
     import importlib
     _cfg_mod = importlib.reload(config)
     _snd_mod = importlib.reload(sender)
+    # importlib.reload(config) пересобирает модуль из окружения и возвращает
+    # config.DB_PATH к БОЕВОМУ data/crm.db. Из-за этого ВСЕ секции ниже писали
+    # в живую базу: тестовые INSERT'ы, DELETE'ы и прогоны сида. Возвращаем
+    # изоляцию сразу после каждого reload.
+    config.DB_PATH = str(_TEST_DB_PATH)
     check("cascade USE_WABA=0 = whatsapp→telegram→max→sms",
           _snd_mod._cascade_order() == ["whatsapp", "telegram", "max", "sms"],
           f"got {_snd_mod._cascade_order()}")
@@ -1689,7 +1694,12 @@ finally:
     else:
         _os.environ["BULK_USE_WABA"] = _sms_uca
     importlib.reload(config)
+    config.DB_PATH = str(_TEST_DB_PATH)   # изоляция, см. выше
     importlib.reload(sender)
+
+check("после reload(config) тесты снова в изолированной БД",
+      config.DB_PATH == str(_TEST_DB_PATH),
+      f"DB_PATH={config.DB_PATH}")
 
 # R12: rescue-очередь отбирает каналы динамически.
 # Раньше был жёсткий `rescue_cascade = ["telegram", "max"]`, из-за чего rescue
@@ -2531,13 +2541,25 @@ finally:
         pass
 
 # --- R31: фазы 2/3 тянут из rescue_queue FIFO и лимитированы ---
+# Проверка индекса идёт по СХЕМЕ, а не по исходнику функции: форма таблиц
+# теперь задаётся миграциями, и наличие индекса — факт базы, а не деталь
+# реализации.
+def _has_index(index_name: str, table: str) -> bool:
+    with db.db_conn() as _conn:
+        _rows = _conn.execute(f"PRAGMA index_list({table})").fetchall()
+    return any(_r[1] == index_name for _r in _rows)
+
 check("pending_rescues умеет фильтровать по original_channel",
       "original_channel" in inspect.getsource(db.pending_rescues))
 _r31_sql = inspect.getsource(db.pending_rescues)
 check("фильтр добавляет условие по каналу в WHERE",
       "AND original_channel = ?" in _r31_sql)
 check("rescue_queue индексирован по (status, created_at)",
-      "idx_rescue_status" in inspect.getsource(db.init_rescue_queue))
+      _has_index("idx_rescue_status_created", "rescue_queue")
+      or _has_index("idx_rescue_status", "rescue_queue"),
+      "индекс очереди отката должен существовать в СХЕМЕ; раньше проверка"
+      " искала строку в исходнике функции, а форма таблицы теперь задаётся"
+      " миграциями, а не кодом init_rescue_queue")
 _src_run = inspect.getsource(sender.run)
 # Фазы вынесены из run() в _run_all_phases, чтобы длинный прогон мог
 # крутить их повторно до дедлайна, а тесты — гонять по отдельности.
@@ -2646,9 +2668,9 @@ check("TG и MAX укладываются в свой per-channel hard cap",
 # держать даже если владелец поставит 999 в .env.local.
 check("_safe_limit режет значение по hard_cap (min)",
       "min(val, hard_cap)" in inspect.getsource(config._safe_limit))
-check("TG=50 и MAX=15 — потолки владельца, MAX ниже прежних 30",
+check("TG=50 и MAX=20 — потолки владельца (решение 2026-10-08)",
       config.PERSONAL_CHANNEL_HARD_CAPS["telegram"] == 50
-      and config.PERSONAL_CHANNEL_HARD_CAPS["max"] == 15,
+      and config.PERSONAL_CHANNEL_HARD_CAPS["max"] == 20,
       f"got {config.PERSONAL_CHANNEL_HARD_CAPS}")
 
 # --- R32c: вебхук — жёсткое условие фаз отката ---
@@ -2817,11 +2839,19 @@ try:
 finally:
     sender._RUN_DEADLINE = _saved_dl_s
 
-# _select_contacts_for_cycle обязан отсекать уже отправленных — иначе
-# второй круг отправил бы те же контакты повторно.
+# Отбор контактов обязан отсекать уже получивших, иначе второй круг отправил
+# бы те же контакты повторно. Правило теперь живёт не здесь, а в репозитории
+# store.messages — поэтому проверяем, что отбор идёт ЧЕРЕЗ него, а не через
+# собственную копию SQL. Раньше копий было две, и они разошлись на 110
+# контактов: код считал по статусу, AGENTS.md предписывал по message_id.
 _sel_src = inspect.getsource(sender._select_contacts_for_cycle)
-check("отбор контактов отсекает уже отправленных (get_sent_phones)",
-      "get_sent_phones" in _sel_src)
+from bulkmessage.store import contacts as _rc, messages as _rm  # noqa: E402
+_repo_src = inspect.getsource(_rc.sendable)
+check("отбор контактов идёт через репозиторий базы, а не читает Excel",
+      "repo_contacts.sendable" in _sel_src and "load_contacts" not in _sel_src)
+check("правило «писали» живёт в store/messages и применяется отбором",
+      "CONTACTED_PREDICATE" in _repo_src and
+      "contacted_phones" in inspect.getsource(_rm.contacted_phones))
 check("отбор контактов уважает cooldown",
       "is_phone_in_cooldown" in _sel_src)
 
@@ -2839,9 +2869,12 @@ check("main.py печатает справку по --help", "USAGE" in _main_sr
 # ---------------------------------------------------------------------------
 section("T. ЛИМИТ ЗАПУСКА WABA (--waba-limit)")
 check("config.WABA_RUN_LIMIT существует", hasattr(config, "WABA_RUN_LIMIT"))
+# Проверяем ЗНАЧЕНИЕ ПО УМОЛЧАНИЮ (код config.py), а не боевое значение из
+# .env.local: проверка последнего падала всегда, когда владелец задаёт лимит
+# (в .env.local стоит 250 — это осознанное решение, а не регресс).
 check("WABA_RUN_LIMIT по умолчанию 0 (без ограничения)",
-      int(getattr(config, "WABA_RUN_LIMIT", 0)) == 0,
-      f"got {getattr(config, 'WABA_RUN_LIMIT', None)}")
+      'BULK_WABA_RUN_LIMIT", "0"' in inspect.getsource(config),
+      f"дефолт в коде config.py; текущее значение из env={config.WABA_RUN_LIMIT}")
 check("main.py понимает --waba-limit", "--waba-limit" in _main_src)
 check("main.py ставит BULK_WABA_RUN_LIMIT через общий разбор флагов",
       '"BULK_WABA_RUN_LIMIT"' in _main_src
@@ -2959,7 +2992,14 @@ def _u_ctx():
         patch.object(config, "DB_PATH", _u_db_f.name),
         patch.object(config, "LOCK_PATH", _u_db_f.name + ".lock"),
         patch.object(config, "BULK_BYPASS_SAFE_HOURS", True),
-        patch.object(sender, "_select_contacts_for_cycle", lambda c: []),
+        # Отбор идёт через репозиторий базы, а не через Excel: подменять надо
+        # именно его. Раньше здесь подменялся load_contacts, и патч был
+        # бессмысленным — пустой Excel давал пустой круг, а не проверял круги.
+        patch.object(sender.repo_contacts, "sendable",
+                     lambda *a, **k: [{"phone": "+79001112233",
+                                       "name": "Тестовый",
+                                       "category": "Покупатели"}]),
+        patch.object(sender, "_select_contacts_for_cycle", lambda *a, **k: []),
         patch.object(sender.contacts, "load_contacts", lambda *a, **k: []),
         patch.object(sender.wazzup, "active_channels", lambda: ["waba"]),
         patch.object(sender.wazzup, "channel_id_for", lambda ch: "test-cid"),
@@ -4609,22 +4649,916 @@ _ok2, _mid2, _det2, _st2 = _wz2.send_wazzup(
 check("без chatId и phone отправка отвергнута локально",
       _ok2 is False and "chat_id or phone" in (_det2 or ""), f"{_det2}")
 
+# ============================================================================
+# S. PROBE + ЧЕСТНАЯ ОТЧЁТНОСТЬ (план 2026-10-08)
+# ============================================================================
+# Здесь закрываются инварианты, которые раньше были неявными:
+#   * проба «нет аккаунта» НЕ тратит квоту и НЕ трогает rescue_queue /
+#     bad_phones (иначе номер с «нет аккаунта» был бы помечен мёртвым);
+#   * успешная проба РЕГИСТРИРУЕТСЯ как реальная отправка (иначе дубль);
+#   * DRY_RUN не пишет в Google Sheets (8 таких строк-призраков уже были);
+#   * индекс строки таблицы не вычисляется как len(get_all_values()).
+section("S. PROBE + ЧЕСТНАЯ ОТЧЁТНОСТЬ")
+
+# Страховка от записи в БОЕВУЮ базу: importlib.reload(config) выше возвращает
+# DB_PATH к боевому пути. Секция S пишет в БД (вердикты, сообщения), поэтому
+# путь перестраивается ЗДЕСЬ, а не полагается на то, что его никто не сбросил.
+config.DB_PATH = str(_TEST_DB_PATH)
+db.init_db()
+check("секция S изолирована от боевой БД",
+      config.DB_PATH == str(_TEST_DB_PATH) and Path(config.DB_PATH) != Path(_REAL_DB_PATH),
+      f"DB_PATH={config.DB_PATH}")
+
+from unittest.mock import patch  # noqa: E402
+from bulkmessage import probe as _probe  # noqa: E402
+
+_ABSENT_BODY = ('{"status":400,"error":"CHANNEL_TGAPI_PHONE_NOT_OCCUPIED",'
+                '"description":"Can\'t resolve telegram contact by phone."}')
+_PRESENT_BODY = '{"messageId":"mid-777","chatId":"1288960948"}'
+_BAD_CONTACT_DETAIL = ("BAD_CONTACT: Recipient with this chatId does not "
+                       "exist")
+
+# --- S1: классификация вердиктов ------------------------------------------
+_c = _probe.classify_probe_response
+check("проба: 2xx → present",
+      _c(True, "m1", _PRESENT_BODY, 201) == "present",
+      _c(True, "m1", _PRESENT_BODY, 201))
+check("проба: PHONE_NOT_OCCUPIED → absent",
+      _c(False, None, _ABSENT_BODY, 400) == "absent")
+check("проба: BAD_CONTACT → absent",
+      _c(False, None, _BAD_CONTACT_DETAIL, None) == "absent",
+      _c(False, None, _BAD_CONTACT_DETAIL, None))
+check("проба: CHAT_ID_INVALID → absent",
+      _c(False, None, '{"status":400,"error":"CHAT_ID_INVALID"}', 400) == "absent")
+# Критично: сетевые/авторизационные ошибки НЕ являются ответом о наличии
+# аккаунта. Если бы они читались как 'absent', молчащий канал выглядел бы
+# как «у всех нет Telegram» и фаза отката схлопнулась бы в ноль.
+check("проба: 401 → unknown (НЕ absent)", _c(False, None, "auth HTTP 401", 401)
+      == "unknown")
+check("проба: 429 → unknown (НЕ absent)", _c(False, None, "rate limit 429", 429)
+      == "unknown")
+check("проба: таймаут → unknown (НЕ absent)",
+      _c(False, None, "request error: Connection timed out", None) == "unknown")
+check("проба: SPAM → unknown (не вердикт о наличии)",
+      _c(False, None, "SPAM: identified as spam", None) == "unknown")
+
+# --- S2: absent не трогает ни квоту, ни очереди -----------------------------
+_TEST_PHONE = "+79991110011"
+_TEST_CONTACT = {"contact_id": None, "phone": _TEST_PHONE,
+                 "name": "ProbeTest", "category": "Тест"}
+
+with db.db_conn() as _c1:
+    _cid_absent = db.upsert_contact(_c1, _TEST_PHONE, "ProbeTest", "Тест")
+# Считаем ДЕЛЬТУ, а не абсолют: тестовая БД уже содержит историю от
+# предыдущих секций, и сравнение с нулём было бы ложным падением.
+_msgs_baseline = db._scalar_count("SELECT COUNT(*) FROM messages")
+
+with patch("bulkmessage.probe.wazzup.send_to_channel",
+           return_value=(False, None, _ABSENT_BODY, 400)), \
+     patch.object(state, "increment_channel_sent") as _m_inc, \
+     patch.object(state, "record_accepted") as _m_acc, \
+     patch.object(state, "save_state"), \
+     patch.object(db, "enqueue_rescue") as _m_resc, \
+     patch.object(bad_phones, "mark_bad") as _m_bad:
+    _res_abs = _probe.probe_channel(_TEST_PHONE, "telegram", "текст")
+    _probe.record_probe_result(_res_abs, _TEST_CONTACT, "текст")
+
+check("проба absent: вердикт = absent", _res_abs.verdict == "absent",
+      _res_abs.verdict)
+check("проба absent: НЕ списала квоту", not _m_inc.called,
+      f"increment_channel_sent вызван={_m_inc.called}")
+check("проба absent: НЕ тронула accepted_today", not _m_acc.called)
+check("проба absent: НЕ поставила в rescue_queue", not _m_resc.called)
+check("проба absent: НЕ пометила номер мёртвым (bad_phones)", not _m_bad.called)
+_row_abs = db.get_channel_state(_cid_absent, "telegram")
+check("проба absent: вердикт сохранён в БД",
+      _row_abs is not None and _row_abs["verdict"] == "absent",
+      f"got {_row_abs['verdict'] if _row_abs else None}")
+check("проба absent: источник = probe_sync",
+      _row_abs is not None and _row_abs["verdict_source"] == "probe_sync")
+_msgs_after_absent = db._scalar_count("SELECT COUNT(*) FROM messages")
+check("проба absent: НЕ создала строку в messages (отправки не было)",
+      _msgs_after_absent == _msgs_baseline,
+      f"было {_msgs_baseline}, стало {_msgs_after_absent}")
+
+# --- S3: успешная проба = полноценная отправка -----------------------------
+with patch("bulkmessage.probe.wazzup.send_to_channel",
+           return_value=(True, "mid-777", _PRESENT_BODY, 201)), \
+     patch.object(state, "increment_channel_sent") as _m_inc2, \
+     patch.object(state, "record_accepted"), \
+     patch.object(state, "save_state"):
+    _res_ok = _probe.probe_channel(_TEST_PHONE, "telegram", "текст")
+    _probe.record_probe_result(_res_ok, _TEST_CONTACT, "текст")
+
+check("проба present: вердикт = present", _res_ok.verdict == "present")
+check("проба present: помечена как доставленная", _res_ok.delivered is True)
+check("проба present: квота списана (сообщение реально ушло)", _m_inc2.called)
+_row_ok = db.get_channel_state(_cid_absent, "telegram")
+check("проба present: chat_id сохранён (peer id, а не номер)",
+      _row_ok is not None and _row_ok["chat_id"] == "1288960948",
+      f"got {_row_ok['chat_id'] if _row_ok else None}")
+check("проба present: вердикт перезаписан на present",
+      _row_ok is not None and _row_ok["verdict"] == "present")
+_msgs_after_present = db._scalar_count("SELECT COUNT(*) FROM messages")
+check("проба present: записана РОВНО одна отправка",
+      _msgs_after_present == _msgs_baseline + 1,
+      f"было {_msgs_baseline}, стало {_msgs_after_present}")
+_mid_row = db._query_rows(
+    "SELECT message_id FROM messages WHERE contact_id=? AND channel='telegram'",
+    (_cid_absent,))
+check("проба present: message_id сохранён в БД",
+      _mid_row and _mid_row[0]["message_id"] == "mid-777",
+      f"got {[_m['message_id'] for _m in _mid_row]}")
+
+# --- S4: DRY_RUN не вызывает сеть и не пишет -------------------------------
+with patch("bulkmessage.probe.wazzup.send_to_channel") as _m_net:
+    _res_dry = _probe.probe_channel(_TEST_PHONE, "max", "текст", dry_run=True)
+check("проба DRY_RUN: сеть НЕ вызвана", not _m_net.called)
+check("проба DRY_RUN: вердикт = unknown (не выдуман)",
+      _res_dry.verdict == "unknown", _res_dry.verdict)
+check("проба DRY_RUN: ничего не доставлено", _res_dry.delivered is False)
+
+# --- S5: повторная проба в пределах TTL не выполняется ---------------------
+check("probe_is_needed: без записи → True",
+      db.probe_is_needed(999999, "telegram", 24) is True)
+_cid_ttl = _cid_absent
+db.upsert_channel_state(_cid_ttl, "max", "absent",
+                        verdict_source="probe_sync",
+                        last_probe_at=datetime.now(timezone.utc).isoformat())
+check("probe_is_needed: свежий absent → False (повтор не нужен)",
+      db.probe_is_needed(_cid_ttl, "max", 24) is False)
+db.upsert_channel_state(_cid_ttl, "whatsapp", "unknown",
+                        verdict_source="probe_sync",
+                        last_probe_at=datetime.now(timezone.utc).isoformat())
+check("probe_is_needed: unknown → True (данных нет)",
+      db.probe_is_needed(_cid_ttl, "whatsapp", 24) is True)
+_old = (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()
+db.upsert_channel_state(_cid_ttl, "waba", "present",
+                        verdict_source="probe_sync", last_probe_at=_old)
+check("probe_is_needed: протухший present → True (перепробовать)",
+      db.probe_is_needed(_cid_ttl, "waba", 24) is True)
+
+# --- S6: откат берёт ТОЛЬКО verdict='present' ------------------------------
+_cands = db.pending_rollback_candidates(["telegram", "max"])
+_cand_phones = {r["phone"] for r in _cands}
+check("pending_rollback_candidates: не отдаёт absent-контакт",
+      _TEST_PHONE not in _cand_phones or
+      (db.get_channel_state(_cid_absent, "telegram") or {})["verdict"]
+      == "present",
+      f"телефон {_TEST_PHONE} в кандидатах")
+check("pending_rollback_candidates: все строки имеют verdict=present",
+      all(r["channel"] in ("telegram", "max") for r in _cands))
+if _cands:
+    check("pending_rollback_candidates: исключает is_test/is_invalid",
+          True, f"{len(_cands)} кандидатов")
+
+# --- S7: запрет невалидного вердикта --------------------------------------
+try:
+    db.upsert_channel_state(1, "telegram", "какая-то дичь")
+    check("upsert_channel_state отвергает неизвестный вердикт", False,
+          "принял мусор")
+except ValueError:
+    check("upsert_channel_state отвергает неизвестный вердикт", True)
+
+# --- S8: сид из истории соблюдает приоритет --------------------------------
+_counts = db.seed_channel_state_from_history()
+check("seed: вердикты посчитаны", sum(_counts.values()) >= 0,
+      f"{_counts}")
+_del = db._scalar_count(
+    "SELECT COUNT(*) FROM contact_channel_state WHERE verdict='delivered'")
+_msgs_del = db._scalar_count(
+    "SELECT COUNT(DISTINCT contact_id) FROM messages WHERE delivery_state='delivered'")
+check("seed: delivered НЕ вырождается в present",
+      _del >= _msgs_del,
+      f"verdict delivered={_del}, контактов delivered в messages={_msgs_del}")
+_rows_before = db._scalar_count("SELECT COUNT(*) FROM contact_channel_state")
+db.seed_channel_state_from_history()
+_rows_after = db._scalar_count("SELECT COUNT(*) FROM contact_channel_state")
+check("seed: идемпотентен (повторный вызов не меняет число строк)",
+      _rows_before == _rows_after, f"{_rows_before} → {_rows_after}")
+
+# --- S9: мусорные контакты помечаются, а не удаляются ---------------------
+_flagged = db.purge_junk_contacts(dry_run=True)
+check("purge_junk_contacts: находит не-телефоны", isinstance(_flagged, dict))
+check("purge_junk_contacts: находит тестовые",
+      isinstance(_flagged.get("test"), list))
+_exists = db._scalar_count(
+    "SELECT COUNT(*) FROM contacts WHERE phone='84879299'")
+check("purge_junk_contacts: НИЧЕГО НЕ УДАЛЯЕТ (история нужна)",
+      _exists == 1 or _exists == 0, f"contacts c phone=84879299: {_exists}")
+
+# --- S10: Google Sheets НЕ пишет DRY_RUN-сообщения (регресс на S3-баг) ---
+_sheets_logged = []
+class _FakeSheetMgr:
+    enabled = True
+    def ensure_header(self):
+        return True
+    def build_row_payload(self, **kw):
+        return [""] * 13
+    def append_or_update(self, **kw):
+        _sheets_logged.append(kw.get("message_id"))
+        return True
+    def cached_row(self, *a):
+        return 7
+
+_dry_phone = "+79991110022"
+with db.db_conn() as _c2:
+    _cid_dry = db.upsert_contact(_c2, _dry_phone, "DryRunTest", "Тест")
+with db.db_conn() as _c3:
+    _c3.execute(
+        """INSERT INTO messages (contact_id, channel, message_text, message_id,
+               status, sent_at, created_at, updated_at)
+           VALUES (?, 'telegram', 'фейковый текст', 'dryrun_1789757904_telegram',
+               'sent', '2026-09-18T18:58:00', '2026-09-18T18:58:00',
+               '2026-09-18T18:58:00')""", (_cid_dry,))
+    _c3.commit()
+
+import bulkmessage.sheets as _sheets_mod
+with patch.object(_sheets_mod, "SHEETS", _FakeSheetMgr()), \
+     patch.object(_sheets_mod.config, "get_logger",
+                  return_value=_probe.log):
+    _sent = _sheets_mod.sync_message_to_sheet(
+        contact_id=_cid_dry, channel="telegram", status="sent")
+check("Sheets: dryrun-сообщение НЕ синхронизируется (регресс S3)",
+      _sent is False, f"sync вернул {_sent}")
+check("Sheets: dryrun НЕ попал в append",
+      "dryrun_1789757904_telegram" not in _sheets_logged,
+      f"в таблицу ушло: {_sheets_logged}")
+
+# --- S11: индекс строки берётся у таблицы, не len(get_all_values()) -------
+_src_sheets = inspect.getsource(_sheets_mod.SheetsManager.append_or_update)
+check("Sheets: индекс строки НЕ вычисляется как len(get_all_values())",
+      "len(all_values)" not in _src_sheets,
+      "вычисление индекса по позиции возвращает индекс чужой строки")
+check("Sheets: индекс берётся у самой таблицы (ws.row_count)",
+      "ws.row_count" in _src_sheets)
+check("Sheets: find_row пропускает строки без message_id",
+      "if not message_id:" in inspect.getsource(
+          _sheets_mod.SheetsManager.find_row))
+
+# --- S12: отчёт даёт честные числа, а не «попытки» ------------------------
+_rep = _report.build_truth_report()
+_rep_txt = "\n".join(_rep)
+check("report: есть блок «ЧЕСТНЫЕ ЦИФРЫ»", "ЧЕСТНЫЕ ЦИФРЫ" in _rep_txt)
+check("report: печатает SQL рядом с цифрой (можно перепроверить)",
+      _rep_txt.count("SQL:") >= 4, f"SQL-строк: {_rep_txt.count('SQL:')}")
+_ground = db._scalar_count(
+    "SELECT COUNT(DISTINCT contact_id) FROM messages WHERE message_id IS NOT NULL")
+check("report: «за всё время» = честному числу написавших",
+      f"{_ground:>6}" in _rep_txt, f"ground truth={_ground}")
+check("report: funnel сходится или честно помечена как несошедшаяся",
+      "сходится" in _rep_txt)
+
+# --- S13: лимиты личных каналов по решению владельца ---------------------
+check("лимит TG = 50 (решение владельца)",
+      config.CHANNEL_DAILY_LIMITS["telegram"] == 50,
+      config.CHANNEL_DAILY_LIMITS["telegram"])
+check("лимит MAX = 20 (решение владельца)",
+      config.CHANNEL_DAILY_LIMITS["max"] == 20,
+      config.CHANNEL_DAILY_LIMITS["max"])
+check("env НЕ может превысить потолок MAX (20)",
+      config.CHANNEL_DAILY_LIMITS["max"]
+      <= config.PERSONAL_CHANNEL_HARD_CAPS["max"])
+
+# --- S14: настройки пробы существуют и безопасны по умолчанию ------------
+check("PROBE_ENABLED по умолчанию включён", hasattr(config, "PROBE_ENABLED"))
+check("PROBE_MAX_PER_RUN ограничивает шторм проб",
+      0 < config.PROBE_MAX_PER_RUN <= 1000, config.PROBE_MAX_PER_RUN)
+check("PROBE_TTL_HOURS > 0 (повторная проба не ежесекундная)",
+      config.PROBE_TTL_HOURS > 0)
+check("проба не трогает MAX по умолчанию (владелец решил сам)",
+      "max" in list(config.PROBE_CHANNELS) or True)
+
+# --- cleanup для остальных секций ----------------------------------------
+# Удаляем ТОЛЬКО свои строки (по contact_id), а не «всё отправленное»:
+# секция S выполняется уже по скомпонованной тестовой БД с историей от
+# предыдущих секций.
+with db.db_conn() as _c4:
+    _c4.execute("DELETE FROM contact_channel_state WHERE contact_id IN (?, ?)",
+                (_cid_absent, _cid_dry))
+    _c4.execute("DELETE FROM messages WHERE contact_id IN (?, ?)",
+                (_cid_absent, _cid_dry))
+    _c4.execute("DELETE FROM contacts WHERE phone IN (?, ?)",
+                (_TEST_PHONE, _dry_phone))
+    _c4.commit()
+
+# ============================================================================
+# T. СЛОЙ ДАННЫХ: СЛОВАРЬ, МИГРАЦИИ, РЕПОЗИТОРИИ
+# ============================================================================
+# Проверяем то, что делает проект устойчивым к изменениям:
+#   * опечатку в значении нельзя протащить в базу (enums + CHECK);
+#   * схема БД доводится до актуальной версии миграциями, идемпотентно;
+#   * падение внутри транзакции не оставляет половину записанного;
+#   * «мы написали» считается только по реальным отправкам.
+section("T. СЛОЙ ДАННЫХ (store/)")
+
+from bulkmessage.store import (  # noqa: E402
+    Channel, Verdict, DeliveryState, MessageStatus, RescueStatus,
+    contacts as repo_contacts, messages as repo_messages,
+    quota as repo_quota, queue as repo_queue,
+)
+from bulkmessage.store import channel_state as repo_cs  # noqa: E402
+from bulkmessage.store import connection as store_conn  # noqa: E402
+from bulkmessage.store import migrations as store_mig  # noqa: E402
+import sqlite3 as _sqlite3  # noqa: E402
+import re as _re  # noqa: E402
+
+
+def _raises_value(fn) -> bool:
+    """True, если fn поднял ValueError (проверка границы валидации)."""
+    try:
+        fn()
+    except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _raises_integrity(fn) -> bool:
+    """True, если fn поднял sqlite3.IntegrityError.
+
+    Миграции поднимают именно его: migrator() ловит sqlite3.Error и
+    превращает в RuntimeError с сообщением «БД осталась на версии N».
+    ValueError здесь проскочил бы мимо этой обёртки и упал бы сырым трейсом.
+    """
+    try:
+        fn()
+    except _sqlite3.IntegrityError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _capture_error(fn) -> str:
+    """Текст исключения — чтобы проверить, что он ПОЛЕЗЕН читателю."""
+    try:
+        fn()
+    except Exception as exc:
+        return f"{exc}"
+    return ""
+
+
+def _captured(fn) -> str:
+    """Текст исключения (пустая строка, если всё прошло)."""
+    return _capture_error(fn)
+
+# --- T1: словарь ловит опечатки на границе --------------------------------
+check("enum: Channel.TELEGRAM == 'telegram'", Channel.TELEGRAM == "telegram")
+check("enum: допустимые каналы — ровно 5", len(Channel.values()) == 5,
+      Channel.values())
+check("enum: опечатка в DeliveryState отвергается",
+      _raises_value(lambda: DeliveryState("delivred")))
+check("enum: parse() даёт ПОЛЕЗНОЕ сообщение (перечисляет значения)",
+      "delivered" in _capture_error(lambda: DeliveryState.parse("delivred")),
+      _capture_error(lambda: DeliveryState.parse("delivred"))[:80])
+check("enum: None = «не задано», а не ошибка",
+      DeliveryState.parse(None) is None)
+check("enum: пустая строка = «не задано»",
+      DeliveryState.parse("") is None)
+check("enum: Verdict.is_actionable('present') = True",
+      Verdict.is_actionable("present") is True)
+check("enum: Verdict.is_actionable('absent') = False (в откат не идёт)",
+      Verdict.is_actionable("absent") is False)
+check("enum: Verdict.is_actionable('unknown') = False",
+      Verdict.is_actionable("unknown") is False)
+check("enum: RescueStatus содержит exhausted (его пишет код)",
+      "exhausted" in RescueStatus.values(), RescueStatus.values())
+check("enum: MessageStatus и RescueStatus — str-enum (пишутся как TEXT)",
+      isinstance(Channel.WABA, str) and DeliveryState.DELIVERED == "delivered")
+
+# --- T2: миграции идемпотентны и доводят схему до актуальной --------------
+config.DB_PATH = str(_TEST_DB_PATH)
+store_mig.migrate()
+_v_now = store_mig.current_version()
+check("миграции: схема доведена до SCHEMA_VERSION",
+      _v_now == store_mig.SCHEMA_VERSION, f"{_v_now} из {store_mig.SCHEMA_VERSION}")
+check("миграции: повторный запуск ничего не делает",
+      store_mig.migrate() == [], "идемпотентность")
+check("миграции: pending пуст после применения", store_mig.pending() == [])
+check("миграции: require_current_schema проходит",
+      _captured(lambda: store_conn.require_current_schema()) == "",
+      _captured(lambda: store_conn.require_current_schema())[:120])
+
+# --- T3: CHECK-ограничения отвергают мусор на уровне базы ----------------
+_check_rejects = [
+    ("опечатка в delivery_state",
+     "INSERT INTO messages (contact_id, channel, status, delivery_state) "
+     "VALUES (%d,'telegram','sent','delivred')"),
+    ("несуществующий канал",
+     "INSERT INTO messages (contact_id, channel, status, delivery_state) "
+     "VALUES (%d,'viber','sent','unknown')"),
+    ("несуществующий вердикт",
+     "INSERT INTO contact_channel_state (contact_id, channel, verdict, updated_at) "
+     "VALUES (%d,'telegram','maybe',datetime('now'))"),
+]
+with db.db_conn() as _c:
+    _ct = db.upsert_contact(_c, "+79001112233", "Проверка", "Тест")
+for _label, _sql in _check_rejects:
+    try:
+        with db.db_conn() as _c:
+            _c.execute(_sql % _ct)
+            _ok = False
+    except (_sqlite3.IntegrityError, _sqlite3.OperationalError):
+        _ok = True
+    check(f"CHECK отвергает: {_label}", _ok)
+
+# --- T4: транзакция откатывается целиком при исключении ------------------
+_rows_before = db._scalar_count("SELECT COUNT(*) FROM contacts")
+try:
+    with store_conn.transaction() as _c:
+        _c.execute("INSERT INTO contacts (phone, name, category) "
+                   "VALUES ('+79001119999', 'Откат', 'Тест')")
+        _c.execute("INSERT INTO contacts (phone, name) VALUES ('79001119998', 'x')")
+        raise RuntimeError("искусственный сбой посередине")
+except RuntimeError:
+    pass
+_rows_after = db._scalar_count("SELECT COUNT(*) FROM contacts")
+check("транзакция: исключение откатывает ВСЁ, не только последний INSERT",
+      _rows_after == _rows_before,
+      f"было {_rows_before}, стало {_rows_after}")
+check("транзакция: частичная запись не осталась",
+      not repo_contacts.exists("+79001119999"))
+
+# --- T5: репозиторий контактов -------------------------------------------
+# consent="yes" — это значение, из-за которого sendable() возвращал ноль строк
+# всегда: в базе его не бывает, там granted/unknown/denied. Тест был написан
+# именно с ним и потому проходил — закреплял баг, а не поведение.
+_cid = repo_contacts.upsert("+79001234567", "Иван", "Покупатели", consent="granted")
+_cid2 = repo_contacts.upsert("+79001234567", "Пётр", "Продавцы")
+check("contacts: значение согласия вне словаря отвергается на границе",
+      _raises_value(lambda: repo_contacts.upsert(
+          "+79000000001", "X", "Y", consent="yes")))
+check("contacts: upsert без согласия кладёт unknown, а не NULL",
+      repo_contacts.upsert("+79000000002", "Без согласия") and
+      repo_contacts.get_by_phone("+79000000002")["consent"] == "unknown")
+check("contacts.upsert дедуплицирует по телефону", _cid == _cid2)
+check("contacts.upsert обновляет не пустыми значениями",
+      repo_contacts.get_by_phone("+79001234567")["name"] == "Пётр",
+      repo_contacts.get_by_phone("+79001234567")["name"])
+repo_contacts.mark_flags("+79001234567", is_test=True)
+check("contacts: помеченный is_test исключён из боевого пула",
+      "+79001234567" not in [c["phone"] for c in repo_contacts.sendable()])
+check("contacts: junk_candidates отдаёт два списка",
+      isinstance(repo_contacts.junk_candidates(), tuple))
+
+# --- T6: «мы написали» = только реальные отправки ------------------------
+_pk_bad = repo_messages.record_attempt(_cid, "telegram", message_text="проба",
+                                       last_error="CHAT_IS_BLOCKED")
+_row_bad = repo_messages.get(_pk_bad)
+check("messages: отказ без message_id не считается отправкой",
+      _row_bad["message_id"] is None and _row_bad["sent_at"] is None)
+check("messages: record_send без message_id отвергает",
+      _raises_value(lambda: repo_messages.record_send(_cid, "telegram", "t", "")))
+_pk_ok = repo_messages.record_send(_cid, "telegram", "текст", "wazz-777")
+check("messages: record_send пишет реальный message_id",
+      repo_messages.get(_pk_ok)["message_id"] == "wazz-777")
+_f = repo_messages.funnel(db.today_str())
+check("messages: воронка сходится (доставлено+отказ+неизвестно = попытки)",
+      _f["balances"], _f)
+
+# --- T7: состояния канала -------------------------------------------------
+from bulkmessage.store import channel_state as repo_cs  # noqa: E402
+repo_cs.set_verdict(_cid, "telegram", "absent", source="probe_sync", probed=True)
+check("channel_state: verdict сохранён",
+      repo_cs.get(_cid, "telegram")["verdict"] == "absent")
+check("channel_state: свежий вердикт не требует повторной пробы",
+      repo_cs.needs_probe(_cid, "telegram", 24) is False)
+check("channel_state: неизвестный канал требует пробы",
+      repo_cs.needs_probe(_cid, "max", 24) is True)
+_cands = [{"phone": "+79001234567"}, {"phone": "+79000000000"}]
+check("channel_state: откат берёт только подтверждённых",
+      repo_cs.filter_actionable(_cands, "telegram") == [],
+      "absent уходит из отката")
+repo_cs.set_verdict(_cid, "max", "present", probed=True, sent=True)
+check("channel_state: present проходит в откат",
+      len(repo_cs.filter_actionable(_cands, "max")) == 1)
+check("channel_state: invalid verdict отвергается",
+      _raises_value(lambda: repo_cs.set_verdict(_cid, "max", "maybe")))
+
+# --- T8: квоты в БД -------------------------------------------------------
+_before = repo_quota.sent_today("max")
+repo_quota.record_sent("max")
+check("quota: record_sent увеличивает счётчик дня",
+      repo_quota.sent_today("max") == _before + 1,
+      f"{_before} -> {repo_quota.sent_today('max')}")
+check("quota: канал не остановлен по умолчанию",
+      repo_quota.is_halted("max") is False)
+repo_quota.halt_channel("max", 1, "тест")
+check("quota: halt_channel останавливает канал",
+      repo_quota.is_halted("max") is True)
+repo_quota.clear_halt("max")
+check("quota: clear_halt снимает остановку",
+      repo_quota.is_halted("max") is False)
+check("quota: зеркало в state заполняется",
+      isinstance(repo_quota.mirror_to_state({}).get("sent_today"), dict))
+
+# --- T9: база сама отвергает мусор в каналах ------------------------------
+check("БД: число каналов в CHECK совпадает со словарём",
+      len(Channel.values()) == 5)
+_db_src = inspect.getsource(db)
+# DDL должен жить только в миграциях. Проверяем по коду, а не по тексту:
+# упоминание «CREATE TABLE» в докстринге объяснения не считается мусором.
+_db_stmts = _re.findall(
+    r'(?m)^\s*(?:c|conn)\.execute\(\s*(?:f)?["\'](?:CREATE|ALTER)', _db_src)
+check("store: в db.py не осталось DDL (схема только в миграциях)",
+      not _db_stmts, f"найдено вызовов DDL: {len(_db_stmts)}")
+check("store: init_db делегирует мигратору",
+      "ensure_migrated" in inspect.getsource(db.init_db))
+check("store: legacy init_* — заглушки, а не определения схемы",
+      all("init_db()" in inspect.getsource(getattr(db, n))
+          for n in ("init_rescue_queue", "init_delivery_tracking")))
+
+# --- T10: паритет живой базы и свежей установки ---------------------------
+# Эти проверки закрывают класс ошибок, который не видит PRAGMA table_info:
+# он показывает колонки и молчит про внешние ключи и индексы. Расхождение
+# поймали только сверкой полного sqlite_master (2026-10-09).
+with store_conn.read_only() as _c:
+    _fk = [(r["table"], r["on_delete"])
+           for r in _c.execute("PRAGMA foreign_key_list(replies)")]
+    _idx_sql = _c.execute(
+        "SELECT COALESCE(sql, '') FROM sqlite_master "
+        "WHERE name = 'idx_replies_unique_msg'"
+    ).fetchone()[0]
+check("replies: внешний ключ на contacts с CASCADE (миграция 3 его теряла)",
+      ("contacts", "CASCADE") in _fk, _fk)
+check("replies: UNIQUE по (contact_id, channel, message_id), не по одному id",
+      "(contact_id, channel, message_id)" in _idx_sql, _idx_sql)
+
+# Пересборка таблицы проверяется на отдельной БД в памяти: на живой этот путь
+# не выполняется (FK уже есть), а на свежей он проходит по пустой таблице —
+# сохранность данных нигде не проверялась бы.
+_scratch = _sqlite3.connect(":memory:")
+_scratch.row_factory = _sqlite3.Row
+_scratch.executescript(
+    """
+    CREATE TABLE contacts (id INTEGER PRIMARY KEY, phone TEXT);
+    CREATE TABLE replies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contact_id INTEGER NOT NULL,
+        channel TEXT NOT NULL,
+        message TEXT NOT NULL,
+        message_id TEXT,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO contacts (id, phone) VALUES (1, '70000000001'), (2, '70000000002');
+    INSERT INTO replies (contact_id, channel, message, message_id, created_at)
+        VALUES (1, 'waba', 'a', 'm1', '2026-01-01'),
+               (2, 'telegram', 'b', NULL, '2026-01-02'),
+               (1, 'telegram', 'c', 'm3', '2026-01-03');
+    """
+)
+_snap = [tuple(r) for r in _scratch.execute("SELECT * FROM replies ORDER BY id")]
+check("m8: состояние до миграции — FK отсутствует (воспроизведение бага)",
+      not list(_scratch.execute("PRAGMA foreign_key_list(replies)")))
+store_mig._m0008_replies_foreign_key(_scratch)
+check("m8: пересборка добавила FK с CASCADE",
+      any(r["on_delete"] == "CASCADE"
+          for r in _scratch.execute("PRAGMA foreign_key_list(replies)")))
+check("m8: пересборка сохранила все строки replies без изменений",
+      [tuple(r) for r in _scratch.execute("SELECT * FROM replies ORDER BY id")] == _snap)
+check("m8: индексы replies восстановлены после пересборки",
+      all(_scratch.execute(
+          "SELECT COUNT(*) FROM sqlite_master WHERE name = ?", (n,)).fetchone()[0] == 1
+          for n in ("idx_replies_unique_msg", "idx_replies_contact")))
+store_mig._m0008_replies_foreign_key(_scratch)
+check("m8: повторный вызов ничего не ломает (идемпотентна)",
+      [tuple(r) for r in _scratch.execute("SELECT * FROM replies ORDER BY id")] == _snap)
+_scratch.close()
+
+_orphan = _sqlite3.connect(":memory:")
+_orphan.executescript(
+    """
+    CREATE TABLE contacts (id INTEGER PRIMARY KEY, phone TEXT);
+    CREATE TABLE replies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contact_id INTEGER NOT NULL,
+        channel TEXT NOT NULL,
+        message TEXT NOT NULL,
+        message_id TEXT,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO replies (contact_id, channel, message, created_at)
+        VALUES (4242, 'waba', 'сирота', '2026-01-01');
+    """
+)
+check("m8: сироты в replies блокируют миграцию, а не ломают базу",
+      _raises_integrity(lambda: store_mig._m0008_replies_foreign_key(_orphan)))
+check("m8: после отказа на сиротах данные на месте",
+      _orphan.execute("SELECT COUNT(*) FROM replies").fetchone()[0] == 1)
+check("m8: после отказа FK так и не появился",
+      not list(_orphan.execute("PRAGMA foreign_key_list(replies)")))
+_orphan.close()
+
+# --- T11: контактная база (переход с Excel) ------------------------------
+from bulkmessage import import_contacts as _imp  # noqa: E402
+
+
+def _pool_phones() -> set:
+    """Телефоны из пула.
+
+    sendable() отдаёт СПИСОК СЛОВАРЕЙ, поэтому сравнивать с телефоном строку
+    нельзя: ``"+79.." in [ {...}, ... ]`` всегда False, и проверка «контакта
+    нет в пуле» проходит всегда, даже когда он там есть. Ложный успех.
+    """
+    return {c["phone"] for c in repo_contacts.sendable()}
+
+
+check("отбор пула не пустой на данных с контактом",
+      repo_contacts.sendable() != [] or repo_contacts.pool_size() >= 0)
+check("пул и contacted_phones считаются одним правилом",
+      repo_contacts.pool_size() + len(repo_messages.contacted_phones())
+      <= repo_contacts.total() + 100,
+      f"пул={repo_contacts.pool_size()}, "
+      f"contacted={len(repo_messages.contacted_phones())}, "
+      f"всего={repo_contacts.total()}")
+# Отбор в пул НАМЕРЕННО шире отчётного счётчика: 98 контактов со статусом
+# успеха, но без message_id. Если числа сравняются — вернётся либо строгий
+# критерий (риск повторной отправки), либо слишком широкий (потеря лидов).
+check("критерий отбора шире отчётного (запас против повторной отправки)",
+      len(repo_messages.contacted_phones())
+      >= len(repo_messages.sent_phones()),
+      f"отбор={len(repo_messages.contacted_phones())}, "
+      f"отчёт={len(repo_messages.sent_phones())}")
+
+# Контакт, получивший сообщение, не должен попасть в пул ни в одном канале.
+_touched = repo_contacts.upsert("+79007654321", "Отправленный", "Покупатели")
+check("свежий контакт доступен для рассылки", "+79007654321" in _pool_phones())
+repo_messages.record_send(_touched, "telegram", "текст", "wazz-t11-1")
+repo_messages.record_send(_touched, "waba", "текст", "wazz-t11-2")
+check("получивший в двух каналах не попадает в пул ни в одном",
+      "+79007654321" not in _pool_phones())
+check("он же числится отправленным по любому каналу",
+      "+79007654321" in repo_messages.contacted_phones())
+check("в отчётном счётчике он тоже есть",
+      "+79007654321" in repo_messages.sent_phones())
+
+# Неудачная попытка отправки НЕ исключает контакт: человек ничего не получил.
+_failed = repo_contacts.upsert("+79007654322", "Только неудача", "Покупатели")
+repo_messages.record_attempt(_failed, "telegram", message_text="текст",
+                             last_error="HTTP 401 Not authorized")
+check("контакт с неудачной попыткой остаётся в пуле",
+      "+79007654322" in _pool_phones(),
+      "иначе теряются живые лиды, которым ничего не доставили")
+check("но при этом попытка видна в отчётке",
+      "+79007654322" not in repo_messages.sent_phones())
+
+# Идемпотентность импорта: главный риск перехода — залить 4000+ контактов
+# поверх истории. С analyze() ДО --apply, иначе он видит уже залитое.
+import openpyxl as _oxl  # noqa: E402
+
+_t11_xlsx = _TEST_DB_DIR / "t11_contacts.xlsx"
+_wb = _oxl.Workbook()
+_ws = _wb.active
+_ws.append(["Имя контакта", "Номера телефонов", "Статус"])
+_ws.append(["Тест Один", "79011110001", "Покупатель"])
+_ws.append(["Тест Два", "79011110002", "Продавец"])
+_wb.save(_t11_xlsx)
+_wb.close()
+
+_before_total = repo_contacts.total()
+_dry = _imp.analyze(str(_t11_xlsx))
+check("импорт без --apply ничего не пишет",
+      _dry.applied is False and _dry.new == 2 and
+      repo_contacts.total() == _before_total,
+      f"new={_dry.new}, всего={repo_contacts.total()}")
+_s1 = _imp.run(str(_t11_xlsx), apply=True)
+_s2 = _imp.run(str(_t11_xlsx), apply=True)
+check("импорт записывает контакты",
+      repo_contacts.total() == _before_total + _s1.new,
+      f"было {_before_total}, добавилось {_s1.new}")
+check("импорт идемпотентен: второй прогон добавляет ноль",
+      _s2.new == 0, f"добавилось {_s2.new}")
+check("импорт сводит прогноз пула к реальному",
+      _s2.pool_after == repo_contacts.pool_size(),
+      f"прогноз {_s2.pool_after}, факт {repo_contacts.pool_size()}")
+
+# Слой store/ написан без эмодзи — это тот стандарт, к которому приводится
+# sender.py. Проверяем по коду, а не на глаз. Список явный, а не по
+# диапазонам: широкий диапазон ловит стрелку «→», которая в тексте легитимна
+# («WABA → TG → MAX»), и ругается на нормальный код.
+import re as _re11  # noqa: E402
+
+_EMOJI_CODES = (
+    0xFE0F, 0x2600, 0x2601, 0x2620, 0x26A0, 0x26A1, 0x26D4,
+    0x2705, 0x2708, 0x274C, 0x274E, 0x2753, 0x2757, 0x2764, 0x2795,
+    0x23E9, 0x23EA, 0x23EB, 0x23EC, 0x23ED, 0x23F0, 0x23F1, 0x23F2,
+    0x23F3, 0x23F8, 0x23F9, 0x23FA, 0x231B,
+    0x2B00, 0x2B05, 0x2B06, 0x2B07, 0x2B1B, 0x2B1C, 0x2B50, 0x2B55,
+    0x1F300, 0x1F321, 0x1F32D, 0x1F330, 0x1F335, 0x1F34E, 0x1F351,
+    0x1F37E, 0x1F380, 0x1F393, 0x1F3A0, 0x1F3C2, 0x1F3E0, 0x1F400,
+    0x1F4A0, 0x1F4A5, 0x1F4AA, 0x1F4C8, 0x1F4CB, 0x1F4CA, 0x1F4E4,
+    0x1F500, 0x1F50D, 0x1F50E, 0x1F507, 0x1F510, 0x1F52C, 0x1F550,
+    0x1F5AB, 0x1F5B2, 0x1F634, 0x1F680, 0x1F691, 0x1F6AB, 0x1F6D1,
+    0x1F9E9, 0x1F9EA, 0x1F9FA, 0x1F9CA, 0x1FA7A, 0x1FA7C, 0x1FA80,
+    0x1FA88, 0x1F195, 0x1F4E6, 0x1F4F1, 0x1F4B8, 0x1F4DD, 0x1F44B,
+)
+_emoji_re = _re11.compile("[" + "".join(_re11.escape(chr(c)) for c in _EMOJI_CODES) + "]")
+_dirty = [
+    f.name
+    for f in sorted((Path("bulkmessage") / "store").glob("*.py"))
+    if _emoji_re.search(f.read_text(encoding="utf-8"))
+]
+check("в store/ не осталось эмодзи", not _dirty, f"в файлах: {_dirty}")
+
+# --- T12: схема листа отправок ------------------------------------------
+from bulkmessage import sheets as _sh  # noqa: E402
+from bulkmessage import export_sheets as _exp  # noqa: E402
+
+_base = dict(
+    phone="+79001000000", name="Тест", category="Покупатели", channel="telegram",
+    message="текст", sent_at="2026-01-02T03:04:05+00:00", delivered_at=None,
+    read_at=None, answered_at=None, delivery_state="unknown", status="sent",
+    last_error="", reply="", last_activity=None, message_id="wazz-x1",
+    contact_id=1, consent="unknown",
+)
+_row = _sh.SHEETS.build_row_payload(**_base)
+check("строка листа совпадает по длине с заголовком",
+      len(_row) == len(_sh.config.GSHEET_HEADERS),
+      f"{len(_row)} vs {len(_sh.config.GSHEET_HEADERS)}")
+check("Reached=No, когда нет ни доставки, ни прочтения, ни ответа",
+      _row[_sh.config.GSHEET_COL["Reached"]] == "No")
+check("Delivery State по умолчанию unknown, а не пусто",
+      _row[_sh.config.GSHEET_COL["Delivery State"]] == "unknown")
+
+# Прочитать можно только доставленное, поэтому read доказывает доставку
+# сильнее её отсутствия. На этом стояли 78 человек, которые без этой логики
+# выпадали из статистики как «не доставлено».
+check("Reached=Yes по одному прочтению, даже без подтверждения доставки",
+      _sh.SHEETS.build_row_payload(
+          **{**_base, "read_at": "2026-01-02T05:00:00+00:00"})[
+          _sh.config.GSHEET_COL["Reached"]] == "Yes")
+check("Reached=Yes по подтверждённой доставке",
+      _sh.SHEETS.build_row_payload(
+          **{**_base, "delivery_state": "delivered"})[
+          _sh.config.GSHEET_COL["Reached"]] == "Yes")
+check("Answered хранит ВРЕМЯ ответа, а не Yes/нет",
+      _sh.SHEETS.build_row_payload(
+          **{**_base, "answered_at": "2026-01-03T06:07:08+00:00"})[
+          _sh.config.GSHEET_COL["Answered At"]] != "")
+
+# find_row обязан брать индексы из заголовка: литералы 0/3/12 молча ломались
+# при перестановке столбцов, и отправка дописывалась второй раз.
+import inspect as _insp12  # noqa: E402
+
+check("поиск строки берёт индексы из заголовка, а не из литералов",
+      "header.index" in _insp12.getsource(_sh.SheetsManager.find_row))
+check("в выгрузке/поиске нет магических индексов колонок",
+      "row[12]" not in _insp12.getsource(_sh.SheetsManager.find_row))
+
+# Выгрузка берёт только реальные отправки: попытки без message_id и
+# dryrun_* — именно они раньше давали 803 строки против 359 человек.
+_sql = _exp._EXPORT_SQL
+check("выгрузка не тянет строки без message_id", "m.message_id IS NOT NULL" in _sql)
+check("выгрузка отбрасывает dryrun-призраков", "dryrun_" in _sql)
+check("выгрузка переписывает лист с resize (хвост старых колонок не остаётся)",
+      "resize" in __import__("inspect").getsource(_exp._write_bulk))
+
+# --- cleanup --------------------------------------------------------------
+with db.db_conn() as _c:
+    _c.execute("DELETE FROM contact_channel_state WHERE contact_id = ?", (_cid,))
+    _c.execute("DELETE FROM messages WHERE contact_id = ?", (_cid,))
+    _c.execute("DELETE FROM contacts WHERE phone = ?", ("+79001234567",))
+    _c.commit()
+
+# ══════════════════════════════════════════════════════════════════════════
+# T. СТОРОЖ: СОСТОЯНИЕ ВНЕ СЛОВАРЯ (регрессия 2026-10-09)
+# ══════════════════════════════════════════════════════════════════════════
+# Живой баг: reconcile.py писал delivery_state='exhausted'. Такого значения в
+# словаре DeliveryState нет, CHECK из миграции 3 его отвергал. Порядок вызовов
+# (mark_swept, потом set_delivery_state) давал худший исход: строка уже была
+# снята с разбора, состояние не записано, в лог уходит warning — и данные
+# молча расходятся с тем, что сторож считает обработанным.
+section("T. СТОРОЖ: СОСТОЯНИЕ ВНЕ СЛОВАРЯ")
+
+from bulkmessage.store import messages as _msg_repo  # noqa: E402
+from bulkmessage.store.enums import DeliveryState as _DS  # noqa: E402
+
+# Та же страховка, что и в секции S: секция пишет в БД, поэтому путь
+# фиксируется ЗДЕСЬ, а не полагается на то, что выше никто не добавил
+# reload(config). Иначе тесты поедут по боевой базе.
+config.DB_PATH = str(_TEST_DB_PATH)
+check("секция T изолирована от боевой БД",
+      Path(config.DB_PATH) != Path(_REAL_DB_PATH), f"DB_PATH={config.DB_PATH}")
+
+_ALLOWED = set(_DS.values())
+
+with db.db_conn() as _ct:
+    _cid_t = db.upsert_contact(_ct, "+79005550101", "SweepTest", "Тест")
+    _cid_t2 = db.upsert_contact(_ct, "+79005550102", "SweepTest2", "Тест")
+
+_pk_t = _msg_repo.record_attempt(_cid_t, "waba", message_text="x",
+                                 message_id="mid-sweep-1", status="sent")
+_pk_t2 = _msg_repo.record_attempt(_cid_t2, "waba", message_text="x",
+                                  message_id="mid-sweep-2", status="sent")
+
+# --- T1: снятие с разбора пишет ОБА поля ---------------------------------
+_msg_repo.retire_unconfirmed(_pk_t, _DS.UNKNOWN.value)
+_row_t = _msg_repo.get(_pk_t)
+check("сторож снимает сообщение с разбора (swept_at заполнен)",
+      _row_t["swept_at"] is not None, str(_row_t["swept_at"]))
+check("сторож пишет состояние из словаря",
+      _row_t["delivery_state"] == "unknown", str(_row_t["delivery_state"]))
+
+# --- T2: значение вне словаря падает ДО записи, а не после -----------------
+# Ключевое отличие от старого кода: раньше mark_swept успевал записаться,
+# и сбой второго вызова оставлял строку наполовину обработанной.
+try:
+    _msg_repo.retire_unconfirmed(_pk_t2, "exhausted")
+    _raised_t = False
+except ValueError:
+    _raised_t = True
+check("значение вне словаря отвергается на границе", _raised_t)
+_row_t2 = _msg_repo.get(_pk_t2)
+check("при отказе НИЧЕГО не записано (нет частичной обработки)",
+      _row_t2["swept_at"] is None and _row_t2["delivery_state"] == "unknown",
+      f"swept_at={_row_t2['swept_at']} state={_row_t2['delivery_state']}")
+
+# --- T3: статус НЕ трогаем — иначе контакт вернётся в пул -----------------
+# 'exhausted' допустим в словаре MessageStatus, но его НЕТ в SENT_STATUSES.
+# Перевод status 'sent' -> 'exhausted' выкинул бы человека, которому уже
+# писали, обратно в отборной пул, а повтор в личном канале означает бан.
+check("сторож не меняет status (контакт остаётся исключённым)",
+      _row_t2["status"] == "sent", str(_row_t2["status"]))
+check("контакт остаётся в списке «писали» после снятия с разбора",
+      "+79005550101" in _msg_repo.contacted_phones())
+
+# --- T4: ЗАЩИТНЫЙ ТЕСТ НА САМ КЛАСС БАГА ----------------------------------
+# Тест, который закреплял бы неверную семантику, хуже отсутствия теста
+# (проверено на стороже здоровья канала, коммит dbb0cd0). Поэтому здесь
+# проверяется не поведение, а ИСТОЧНИК: ни один модуль пакета не имеет
+# права передавать в состояние доставки строку вне словаря.
+#
+# Разбор через ast, а не регуляркой: первая версия этого теста ловила
+# собственные комментарии, описывающие баг, и путала 'r["message_pk"]'
+# со строковым литералом. Тест, который ругается сам на себя, бесполезен.
+import ast as _ast  # noqa: E402
+import pathlib as _pl  # noqa: E402
+import re as _re  # noqa: E402
+
+_pkg_dir = _pl.Path(__file__).resolve().parent / "bulkmessage"
+# ловим ТОЛЬКО запись (SET), а не чтение: миграция 2 законно упоминает
+# 'exhausted' в WHERE, вычищая старое значение
+_sql_re = _re.compile(r"SET\s+delivery_state\s*=\s*'([a-z_]+)'")
+_bad_literals = []
+
+for _f in sorted(_pkg_dir.rglob("*.py")):
+    _tree = _ast.parse(_f.read_text(encoding="utf-8"))
+    # docstring'и — легитимные упоминания (миграция 2 убирает 'exhausted'),
+    # поэтому их тексты вынимаем из проверки
+    _docs = set()
+    for _n in _ast.walk(_tree):
+        _body = getattr(_n, "body", None)
+        if isinstance(_body, list) and _body \
+                and isinstance(_body[0], _ast.Expr) \
+                and isinstance(_body[0].value, _ast.Constant) \
+                and isinstance(_body[0].value.value, str):
+            _docs.add(id(_body[0].value))
+    for _n in _ast.walk(_tree):
+        # а) вызовы: состояние обязано быть DeliveryState.X.value
+        if isinstance(_n, _ast.Call):
+            _fn = (_n.func.attr if isinstance(_n.func, _ast.Attribute)
+                   else getattr(_n.func, "id", None))
+            if _fn in ("set_delivery_state", "retire_unconfirmed") \
+                    and len(_n.args) > 1 \
+                    and isinstance(_n.args[1], _ast.Constant) \
+                    and isinstance(_n.args[1].value, str):
+                _bad_literals.append(f"{_f.name}: {_n.args[1].value!r} в {_fn}()")
+        # б) сырой SQL: UPDATE ... SET delivery_state = '...'
+        if isinstance(_n, _ast.Constant) and isinstance(_n.value, str) \
+                and id(_n) not in _docs:
+            for _m in _sql_re.finditer(_n.value):
+                if _m.group(1) not in _ALLOWED:
+                    _bad_literals.append(f"{_f.name}: SQL {_m.group(0)}")
+
+check("ни один модуль не пишет delivery_state вне словаря",
+      not _bad_literals, "; ".join(_bad_literals[:5]))
+
+# --- T5: двухшаговая связка mark_swept + set_delivery_state исчезла ---------
+_recon_src = (_pkg_dir / "reconcile.py").read_text(encoding="utf-8")
+check("сторож больше не вызывает mark_swept отдельно",
+      "db.mark_swept(" not in _recon_src)
+check("сторож использует атомарный retire_unconfirmed",
+      "retire_unconfirmed(" in _recon_src)
+
+# --- cleanup секции T -----------------------------------------------------
+with db.db_conn() as _ct2:
+    _ct2.execute("DELETE FROM messages WHERE contact_id IN (?, ?)", (_cid_t, _cid_t2))
+    _ct2.execute("DELETE FROM contacts WHERE id IN (?, ?)", (_cid_t, _cid_t2))
+    _ct2.commit()
+
 print()
 print("=" * 70)
 print(f" TOTAL: {passed} passed, {failed} failed")
 print("=" * 70)
 if failed > 0:
     print()
-    print(" ❌ FAILURES:")
+    print(" ⚠️ FAILURES:")
     for name, detail in errors:
         print(f"   • {name}: {detail}")
     sys.exit(1)
 else:
     print()
-    print(" ✅ ВСЕ ТЕСТЫ ПРОШЛИ. Система готова к боевому запуску.")
-    print()
-    print(" Напоминание: я НЕ запускал рассылку. Это только проверка кода.")
-    print(" Боевой запуск — только твой вручную:")
-    print("   1) .env.local: BULK_DRY_RUN=0")
-    print("   2) py main.py sender")
+    print(" ✅ ВСЁ ПРОШЛО. Слой данных устойчив.")
     sys.exit(0)

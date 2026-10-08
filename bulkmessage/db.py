@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
 from . import config
+from .store.enums import Consent
 
 
 _DB_LOCK = threading.RLock()
@@ -49,25 +50,32 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
 #            1 = пропускать
 #   denied  — человек отказался. УВАЖАЕТСЯ ВСЕГДА, независимо от флага:
 #            отписка не обсуждается и не отключается настройкой.
-CONSENT_GRANTED = "granted"
-CONSENT_UNKNOWN = "unknown"
-CONSENT_DENIED = "denied"
+#
+# Значения не выдуманы здесь: они живут в store/enums.Consent и защищены
+# CHECK-ограничением в БД (миграция 9). Дубль определений — прямая причина
+# бага, из-за которого sendable() искал consent='yes' и не находил ничего.
+CONSENT_GRANTED = Consent.GRANTED.value
+CONSENT_UNKNOWN = Consent.UNKNOWN.value
+CONSENT_DENIED = Consent.DENIED.value
 
 _CONSENT_VALUES = (CONSENT_GRANTED, CONSENT_UNKNOWN, CONSENT_DENIED)
 
 
 def normalize_consent(value) -> str:
-    """Приводит любой ввод (из Excel, AmoCRM, API) к трём состояниям."""
+    """Приводит любой ввод (из Excel, AmoCRM, API) к трём состояниям.
+
+    Возвращает значение из словаря ``Consent`` — не изобретает своих.
+    """
     if value is None:
-        return CONSENT_UNKNOWN
+        return Consent.UNKNOWN.value
     s = str(value).strip().lower()
     if s in ("granted", "yes", "y", "true", "1", "да", "1", "согласие",
              "согласие получено", "opt-in", "optin", "подписан", "ok", "+"):
-        return CONSENT_GRANTED
+        return Consent.GRANTED.value
     if s in ("denied", "no", "n", "false", "0", "нет", "отказ", "отписка",
              "opt-out", "optout", "unsubscribe", "stop", "блок", "-"):
-        return CONSENT_DENIED
-    return CONSENT_UNKNOWN
+        return Consent.DENIED.value
+    return Consent.UNKNOWN.value
 
 
 def set_consent(
@@ -149,179 +157,17 @@ def consent_stats() -> dict:
 
 
 def init_db() -> None:
-    with db_conn() as conn:
-        c = conn.cursor()
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS contacts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT UNIQUE NOT NULL,
-                name TEXT,
-                category TEXT,
-                consent TEXT NOT NULL DEFAULT 'unknown',
-                consent_source TEXT,
-                consent_at TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        # Миграция для существующих баз: consent-колонки могло не быть.
-        if not _has_column(conn, "contacts", "consent"):
-            c.execute(
-                "ALTER TABLE contacts ADD COLUMN consent TEXT NOT NULL DEFAULT 'unknown'"
-            )
-        if not _has_column(conn, "contacts", "consent_source"):
-            c.execute("ALTER TABLE contacts ADD COLUMN consent_source TEXT")
-        if not _has_column(conn, "contacts", "consent_at"):
-            c.execute("ALTER TABLE contacts ADD COLUMN consent_at TEXT")
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                contact_id INTEGER NOT NULL,
-                channel TEXT NOT NULL,
-                message_id TEXT,
-                message_text TEXT,
-                sent_at TEXT,
-                delivered_at TEXT,
-                read_at TEXT,
-                answered_at TEXT,
-                status TEXT NOT NULL,
-                last_error TEXT,
-                gsheet_row INTEGER,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
-            )
-            """
-        )
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_contact_channel ON messages(contact_id, channel)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status)")
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS replies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                contact_id INTEGER NOT NULL,
-                channel TEXT NOT NULL,
-                message TEXT NOT NULL,
-                message_id TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
-            )
-            """
-        )
-        c.execute("CREATE INDEX IF NOT EXISTS idx_replies_contact ON replies(contact_id)")
+    """Создаёт или обновляет схему БД до актуальной версии. Идемпотентно.
 
-        # Legacy-migration: для БД, созданных до 2026-09-19, переименовать
-        # старую колонку wappi_message_id → message_id. Идемпотентно.
-        if _has_column(conn, "replies", "wappi_message_id"):
-            try:
-                c.execute(
-                    "ALTER TABLE replies RENAME COLUMN wappi_message_id TO message_id"
-                )
-                c.execute("DROP INDEX IF EXISTS idx_replies_unique_wappi")
-                conn.commit()
-            except Exception as e:
-                import logging
-                logging.getLogger("db").warning(
-                    f"legacy rename wappi_message_id failed: {e}"
-                )
+    Вся работа со схемой живёт в ``bulkmessage.store.migrations``. Здесь её
+    нет намеренно: DDL, продублированный в двух местах, разъезжается — колонка
+    добавляется в одной копии, а работает другая. Свежую базу создаёт
+    применение миграций 1..N по порядку, старая доводится до той же версии
+    теми же миграциями. Один путь — один результат.
+    """
+    from .store import migrations as _migrations
 
-        c.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_replies_unique_msg "
-            "ON replies(contact_id, channel, message_id) "
-            "WHERE message_id IS NOT NULL"
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_webhooks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel TEXT,
-                payload TEXT NOT NULL,
-                received_at TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                processed INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pending_processed ON pending_webhooks(processed)")
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sheets_ops (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                op TEXT NOT NULL,
-                message_pk INTEGER,
-                payload TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                done INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        c.execute("CREATE INDEX IF NOT EXISTS idx_sheets_ops_done ON sheets_ops(done)")
-        # Phase 7: rescue queue (WABA → Personal cascade retry on async WABA failure)
-        init_rescue_queue()
-        # Трёхзначная доставка + счётчики дня в SQLite (план «устойчивый каскад»)
-        init_delivery_tracking()
-        # Phase 0.1: channel_reachability cache (pre-check results, TTL 24h)
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS channel_reachability (
-                phone TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                reachable INTEGER NOT NULL,
-                last_checked_at TEXT NOT NULL,
-                last_error TEXT,
-                PRIMARY KEY (phone, channel)
-            )
-            """
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_reach_checked "
-            "ON channel_reachability(last_checked_at)"
-        )
-        # Phase 1.2: WABA templates registry (synced from Wazzup)
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS waba_templates (
-                template_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                category TEXT,
-                language_code TEXT NOT NULL DEFAULT 'ru',
-                status TEXT NOT NULL,
-                last_synced_at TEXT NOT NULL,
-                last_error TEXT
-            )
-            """
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_waba_templates_status "
-            "ON waba_templates(status)"
-        )
-        # Phase 3.6: complaint events log (rolling 24h window)
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS complaint_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel TEXT NOT NULL,
-                phone TEXT,
-                complaint_kind TEXT NOT NULL,
-                message_id TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_complaints_channel_time "
-            "ON complaint_events(channel, created_at)"
-        )
-        conn.commit()
-
-
-# --- Contacts ---
+    _migrations.ensure_migrated()
 
 
 def upsert_contact(
@@ -354,14 +200,21 @@ def get_contact_by_phone(
     return c.fetchone()
 
 
-def get_sent_phones(conn: sqlite3.Connection) -> set[str]:
-    """Контакты, у которых ХОТЬ ОДИН канал уже доставил сообщение."""
-    c = conn.cursor()
-    c.execute(
-        "SELECT DISTINCT ct.phone FROM contacts ct JOIN messages m ON m.contact_id = ct.id "
-        "WHERE m.status IN ('sent','delivered','read','answered')"
-    )
-    return set(row["phone"] for row in c.fetchall())
+def get_sent_phones(conn: sqlite3.Connection | None = None) -> set[str]:
+    """Контакты, которым уже отправляли в ЛЮБОМ канале.
+
+    Фасад над ``store.messages.contacted_phones`` — правило живёт там, и
+    больше нигде. Держать его здесь тоже было можно, но тогда правило
+    существовало бы в двух местах, и именно это расхождение стоило 110
+    контактов: код считал по статусу, AGENTS.md предписывал по message_id.
+
+    Параметр ``conn`` оставлен ради совместимости вызовов и НЕ используется:
+    репозиторий открывает своё соединение через ``store.connection``, чтобы
+    не тащить SQL сюда. Чтение при включённом WAL не блокирует писателя.
+    """
+    from .store import messages as _messages
+
+    return _messages.contacted_phones()
 
 
 def get_sent_phone_channels(conn: sqlite3.Connection) -> set[tuple[str, str]]:
@@ -584,151 +437,26 @@ def enqueue_sheet_op(op: str, payload: dict, message_pk: Optional[int] = None) -
 
 
 def init_rescue_queue() -> None:
-    """Создаёт таблицу rescue_queue (idempotent)."""
-    with db_conn() as conn:
-        c = conn.cursor()
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS rescue_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT NOT NULL,
-                name TEXT,
-                category TEXT,
-                original_channel TEXT NOT NULL,
-                reason TEXT,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'pending',
-                last_attempt_at TEXT,
-                rescued_channel TEXT,
-                rescued_message_id TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                tried_channels TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        # Миграция для БД, созданных до появления tried_channels.
-        if not _has_column(conn, "rescue_queue", "tried_channels"):
-            c.execute(
-                "ALTER TABLE rescue_queue ADD COLUMN tried_channels "
-                "TEXT NOT NULL DEFAULT ''"
-            )
-        # Контакт, провалившийся во ВСЕХ каналах отката, не должен зависать
-        # в очереди навсегда и не должен блокировать её начало. Он уходит
-        # в status='deferred' с retry_after и возвращается в конец очереди
-        # на следующий день — ровно то «переводим в последние назад».
-        if not _has_column(conn, "rescue_queue", "retry_after"):
-            c.execute(
-                "ALTER TABLE rescue_queue ADD COLUMN retry_after TEXT"
-            )
-        # Потолок попыток (план «устойчивый каскад»): контакт, исчерпавший
-        # каналы, обязан получить ТЕРМИНАЛЬНЫЙ статус 'exhausted', а не крутиться
-        # в очереди вечно. Для этого считаем попытки по всем каналам, а не по
-        # одной строке, и помним исход последней попытки.
-        for _col, _ddl in (
-            ("attempts_total", "INTEGER NOT NULL DEFAULT 0"),
-            ("last_outcome", "TEXT"),
-            ("next_eligible_at", "TEXT"),
-            ("first_seen", "TEXT"),
-        ):
-            if not _has_column(conn, "rescue_queue", _col):
-                c.execute(f"ALTER TABLE rescue_queue ADD COLUMN {_col} {_ddl}")
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_rescue_status "
-            "ON rescue_queue(status, created_at)"
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_rescue_phone "
-            "ON rescue_queue(phone)"
-        )
+    """Схему теперь создаёт мигратор (``bulkmessage.store.migrations``).
 
+    Здесь стоял ещё один ``CREATE TABLE`` со своей формой таблицы. Две копии
+    одной схемы в разных файлах разъезжаются: колонка могла быть добавлена в
+    одной, а работала другая, и результат зависел от порядка вызовов.
+    Функция остаётся как совместимая заглушка, а форма таблицы определяется
+    ТОЛЬКО миграциями.
+    """
+    init_db()
 
 def init_delivery_tracking() -> None:
-    """Трёхзначная доставка + счётчики дня в SQLite.
+    """Схему теперь создаёт мигратор (``bulkmessage.store.migrations``).
 
-    Замер 2026-10-06 показал, что отправка (HTTP 200) и доставка — разные
-    вещи, а молчание Meta вообще не приходит событием. Поэтому:
-
-    * `messages.delivery_state` — трёхзначное состояние: delivered / unknown /
-      rejected. `status` остаётся для обратной совместимости и UI.
-    * `delivery_events` — аудит каждого события; UNIQUE(message_id,
-      event_status) делает обработку идемпотентной, поэтому повторный POST
-      или переигрывание лога не двигают счётчики.
-    * `daily_counters` — счётчики дня, которые раньше жили в state.json.
-      Два процесса (sender и webhook) делали read-modify-write одного файла,
-      из-за чего `delivered_today` переползал `accepted_today` и отчёт
-      показывал 128%. Здесь инкремент атомарен через UPSERT.
+    Здесь стоял ещё один ``CREATE TABLE`` со своей формой таблицы. Две копии
+    одной схемы в разных файлах разъезжаются: колонка могла быть добавлена в
+    одной, а работала другая, и результат зависел от порядка вызовов.
+    Функция остаётся как совместимая заглушка, а форма таблицы определяется
+    ТОЛЬКО миграциями.
     """
-    with db_conn() as conn:
-        c = conn.cursor()
-        if not _has_column(conn, "messages", "delivery_state"):
-            c.execute(
-                "ALTER TABLE messages ADD COLUMN delivery_state "
-                "TEXT NOT NULL DEFAULT 'unknown'"
-            )
-            # Бэкфилл: исторические строки переводятся из прежнего status.
-            c.execute(
-                "UPDATE messages SET delivery_state = CASE "
-                "  WHEN status IN ('delivered','read') THEN 'delivered' "
-                "  WHEN status = 'failed' THEN 'rejected' "
-                "  ELSE 'unknown' END "
-                "WHERE delivery_state = 'unknown'"
-            )
-        # swept_at — метка «сторож уже разбирал это сообщение».
-        #
-        # Без неё тихое сообщение пересобиралось сторожем в каждой фазе
-        # заново: контакт, которому Telegram только что ДОСТАВИЛ, снова
-        # попадал в очередь отката по своему же старому молчаливому
-        # сообщению в WABA и получал дубль в MAX. Раньше этого не
-        # случалось только потому, что сторож переписывал status на
-        # 'failed', и следующий проход его не видел.
-        if not _has_column(conn, "messages", "swept_at"):
-            c.execute("ALTER TABLE messages ADD COLUMN swept_at TEXT")
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS delivery_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_pk INTEGER,
-                message_id TEXT NOT NULL,
-                channel TEXT,
-                event_status TEXT NOT NULL,
-                envelope TEXT,
-                received_at TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'webhook'
-            )
-            """
-        )
-        c.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_delivery_event "
-            "ON delivery_events(message_id, event_status)"
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS daily_counters (
-                date TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                accepted INTEGER NOT NULL DEFAULT 0,
-                delivered INTEGER NOT NULL DEFAULT 0,
-                rejected INTEGER NOT NULL DEFAULT 0,
-                unknown INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT,
-                PRIMARY KEY (date, channel)
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS contact_cooldowns (
-                phone TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                until TEXT NOT NULL,
-                reason TEXT,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (phone, channel)
-            )
-            """
-        )
-
+    init_db()
 
 # ============================================================
 # Счётчики дня (источник истины — SQLite, не state.json)
@@ -1771,3 +1499,94 @@ def cleanup_old_complaints(conn: sqlite3.Connection, older_than_iso: str) -> int
     c = conn.cursor()
     c.execute("DELETE FROM complaint_events WHERE created_at < ?", (older_than_iso,))
     return c.rowcount
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# СОВМЕСТИМОСТЬ: тонкие обёртки над bulkmessage.store
+# ══════════════════════════════════════════════════════════════════════════
+# Реальная логика живёт в store/: там единственный SQL, там миграции и
+# словарь значений. Этот блок существует только для вызывающего кода
+# (probe.py, preflight.py, report.py, sender.py), который исторически
+# обращается к db.<функция>.
+#
+# Новый код должен импортировать store напрямую:
+#     from bulkmessage.store import channel_state
+# и не растить этот список.
+
+
+def _query_rows(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+    """Строки по SQL (совместимость). В store — в репозиториях."""
+    from .store.connection import read_only
+    with read_only() as _conn:
+        return _conn.execute(sql, params).fetchall()
+
+
+def _scalar_count(sql: str, params: tuple = ()) -> int:
+    """Целое по SQL (совместимость)."""
+    from .store.connection import read_only
+    with read_only() as _conn:
+        _row = _conn.execute(sql, params).fetchone()
+    return int(_row[0]) if _row else 0
+
+
+def retire_unconfirmed(message_pk: int, state: str) -> None:
+    """См. store.messages.retire_unconfirmed."""
+    from .store import messages as _messages
+    _messages.retire_unconfirmed(message_pk, state)
+
+
+def upsert_channel_state(
+    contact_id: int,
+    channel: str,
+    verdict: str,
+    *,
+    verdict_source: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    last_probe_at: Optional[str] = None,
+    last_send_at: Optional[str] = None,
+    last_error: Optional[str] = None,
+) -> None:
+    """См. store.channel_state.set_verdict."""
+    from .store import channel_state as _cs
+    _cs.set_verdict(
+        contact_id, channel, verdict, source=verdict_source, chat_id=chat_id,
+        probe_at=last_probe_at, send_at=last_send_at,
+        probed=last_probe_at is not None, sent=last_send_at is not None,
+        last_error=last_error,
+    )
+
+
+def get_channel_state(contact_id: int, channel: str):
+    """См. store.channel_state.get."""
+    from .store import channel_state as _cs
+    return _cs.get(contact_id, channel)
+
+
+def probe_is_needed(contact_id: int, channel: str, ttl_hours: int) -> bool:
+    """См. store.channel_state.needs_probe."""
+    from .store import channel_state as _cs
+    return _cs.needs_probe(contact_id, channel, ttl_hours)
+
+
+def pending_rollback_candidates(channels: Optional[list] = None) -> list:
+    """См. store.channel_state.actionable."""
+    from .store import channel_state as _cs
+    return _cs.actionable(channels)
+
+
+def seed_channel_state_from_history() -> dict:
+    """См. store.channel_state.seed_from_history."""
+    from .store import channel_state as _cs
+    return _cs.seed_from_history()
+
+
+def purge_junk_contacts(dry_run: bool = True) -> dict:
+    """См. store.contacts.junk_candidates + mark_flags."""
+    from .store import contacts as _contacts
+    invalid, tests = _contacts.junk_candidates()
+    if not dry_run:
+        for _phone in invalid:
+            _contacts.mark_flags(_phone, is_invalid=True)
+        for _phone in tests:
+            _contacts.mark_flags(_phone, is_test=True)
+    return {"invalid": invalid, "test": tests}

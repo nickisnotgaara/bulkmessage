@@ -419,6 +419,93 @@ def run_preflight() -> int:
                 f"перезапусти боевой вебхук",
             )
 
+    # 10. Версия схемы. Боевой прогон обязан быть остановлен, если БД устарела:
+    #     код после структурной правки падал бы ПОСЕРЕДИ рассылки, когда
+    #     часть строк уже записана.
+    print("\n── 10. СХЕМА БД ──")
+    try:
+        from .store import migrations as _mig
+        _cur = _mig.current_version()
+        if _cur >= _mig.SCHEMA_VERSION:
+            _check("схема БД актуальна", True, f"версия {_cur}")
+        else:
+            _check(
+                "схема БД актуальна", False,
+                f"версия {_cur}, требуется {_mig.SCHEMA_VERSION} — "
+                f"применить: py main.py migrate",
+            )
+    except Exception as e:
+        all_ok &= _check(
+            "миграции читаются", False, f"{type(e).__name__}: {e}"
+        )
+
+    # 11. Согласованность БД и модели «состояние контакта».
+    # Проверяем то, из-за чего прошлые отчёты расходились с фактом:
+    #   * таблица contact_channel_state вообще создана (иначе фаза PROBE
+    #     откатывается в откат по всем подряд и жжёт личный лимит);
+    #   * вердикты посчитаны — пустая таблица означает «фаза отката будет
+    #     работать как раньше», и это надо видеть ДО боевого прогона;
+    #   * в messages нет мусорных dryrun-строк в свежих прогонах.
+    print("\n── 11. СОСТОЯНИЕ КОНТАКТОВ (contact_channel_state) ──")
+    try:
+        _rows = db._query_rows(
+            "SELECT channel, verdict, COUNT(*) n FROM contact_channel_state "
+            "GROUP BY channel, verdict ORDER BY channel, n DESC"
+        )
+        if not _rows:
+            _note(
+                "таблица contact_channel_state пуста",
+                "пробы ещё не было — фаза отката возьмёт ВСЕ неудачные "
+                "контакты. Прогони: py main.py seed-channel-state",
+            )
+        else:
+            _summary = ", ".join(
+                f"{r['channel']}:{r['verdict']}={r['n']}" for r in _rows
+            )
+            _check("вердикты на месте", True, _summary)
+        _test_n = db._scalar_count(
+            "SELECT COUNT(*) FROM contacts WHERE COALESCE(is_test,0)=1 "
+            "OR COALESCE(is_invalid,0)=1"
+        )
+        if _test_n:
+            _check(
+                "мусорные контакты помечены", True,
+                f"{_test_n} шт. помечены is_test/is_invalid и исключены "
+                f"из боевого пула",
+            )
+
+        # Остаток пула — число, ради которого переход с Excel на базу и
+        # затевался. Его надо видеть ДО запуска: пустой пул означает, что
+        # рассылка закончится не из-за ошибки, а из-за списка.
+        from .store import contacts as _rc
+        from .store import messages as _rm
+
+        _pool = _rc.pool_size()
+        _total = _rc.total()
+        _contacted = len(_rm.contacted_phones())
+        if _pool == 0:
+            _note(
+                "боевой пул пуст — неотправленных контактов не осталось",
+                f"всего {_total}, писали {_contacted}. Добавьте контакты: "
+                f"py main.py import-contacts --apply",
+            )
+        else:
+            _per_day = sum(
+                cap for ch, cap in getattr(config, "CHANNEL_DAILY_LIMITS", {}).items()
+                if ch in ("waba", "telegram", "max")
+            )
+            _days = f" ~{_pool / _per_day:.0f}" if _per_day else ""
+            _check(
+                "боевой пул не пуст", True,
+                f"доступно {_pool} из {_total} (писали {_contacted}), "
+                f"хватит примерно на{_days} дн.",
+            )
+    except Exception as e:
+        all_ok &= _check(
+            "таблица contact_channel_state доступна", False,
+            f"{type(e).__name__}: {e} — прогони py main.py seed-channel-state",
+        )
+
     print()
     print("═" * 60)
     if all_ok:

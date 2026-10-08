@@ -103,6 +103,132 @@ def _forecast(st: dict) -> tuple:
 
 
 
+def _scalar(sql: str, params: tuple = ()) -> int:
+    rows = db._query_rows(sql, params)
+    return int(rows[0][0]) if rows else 0
+
+
+def build_truth_report() -> list[str]:
+    """ЧЕСТНЫЕ числа: сколько людей мы реально тронули.
+
+    Каждая цифра печатается вместе с SQL-запросом, который её даёт, чтобы её
+    можно было перепроверить руками. Это сделано потому, что прежние цифры
+    расходились между собой: таблица Google Sheets показывала ~803 строки при
+    447 реальных отправках, потому что считала ПОПЫТКИ, симуляции и повторы,
+    а не людей.
+
+    Ключевое правило: реальной отправкой считается только строка с
+    message_id IS NOT NULL — этот идентификатор выдаёт исключительно Wazzup.
+    Отказы каскада пишутся с message_id=NULL и сюда не попадают.
+    """
+    today = db.today_str()
+    out: list[str] = []
+    out.append("─" * 70)
+    out.append("   🔍 ЧЕСТНЫЕ ЦИФРЫ (SQL рядом с каждой — проверяется руками)")
+    out.append("─" * 70)
+
+    def line(label: str, value: int, sql: str) -> None:
+        out.append(f"   {label:<34} : {value:>6}")
+        out.append(f"       SQL: {sql}")
+
+    out.append("")
+    out.append("   РЕАЛЬНО НАПИСАЛИ (уникальные люди, есть настоящий message_id)")
+    line(
+        "  сегодня", 
+        _scalar(
+            "SELECT COUNT(DISTINCT m.contact_id) FROM messages m "
+            "WHERE m.message_id IS NOT NULL AND substr(m.sent_at,1,10)=?",
+            (today,),
+        ),
+        "SELECT COUNT(DISTINCT contact_id) FROM messages "
+        "WHERE message_id IS NOT NULL AND substr(sent_at,1,10)=<сегодня>",
+    )
+    line(
+        "  за всё время",
+        _scalar(
+            "SELECT COUNT(DISTINCT m.contact_id) FROM messages m "
+            "WHERE m.message_id IS NOT NULL"
+        ),
+        "SELECT COUNT(DISTINCT contact_id) FROM messages "
+        "WHERE message_id IS NOT NULL",
+    )
+
+    out.append("")
+    out.append("   ПОДТВЕРЖДЁННАЯ ДОСТАВКА (только вебхук, 201 ≠ доставлено)")
+    line(
+        "  сегодня",
+        _scalar(
+            "SELECT COUNT(DISTINCT m.contact_id) FROM messages m "
+            "WHERE m.delivery_state='delivered' AND substr(m.sent_at,1,10)=?",
+            (today,),
+        ),
+        "SELECT COUNT(DISTINCT contact_id) FROM messages "
+        "WHERE delivery_state='delivered' AND substr(sent_at,1,10)=<сегодня>",
+    )
+    line(
+        "  за всё время",
+        _scalar(
+            "SELECT COUNT(DISTINCT m.contact_id) FROM messages m "
+            "WHERE m.delivery_state='delivered'"
+        ),
+        "SELECT COUNT(DISTINCT contact_id) FROM messages "
+        "WHERE delivery_state='delivered'",
+    )
+
+    out.append("")
+    out.append("   ВОРОНКА СЕГОДНЯ (в попытках; сходится: написали = доставили+отказ+тишина)")
+    total = _scalar(
+        "SELECT COUNT(*) FROM messages WHERE substr(sent_at,1,10)=? AND message_id IS NOT NULL",
+        (today,),
+    )
+    delivered = _scalar(
+        "SELECT COUNT(*) FROM messages WHERE substr(sent_at,1,10)=? AND message_id IS NOT NULL "
+        "AND delivery_state='delivered'", (today,),
+    )
+    rejected = _scalar(
+        "SELECT COUNT(*) FROM messages WHERE substr(sent_at,1,10)=? AND message_id IS NOT NULL "
+        "AND delivery_state='rejected'", (today,),
+    )
+    unknown = _scalar(
+        "SELECT COUNT(*) FROM messages WHERE substr(sent_at,1,10)=? AND message_id IS NOT NULL "
+        "AND delivery_state='unknown'", (today,),
+    )
+    out.append(f"   отправлено попыток                : {total:>6}")
+    out.append(f"   ├─ доставлено подтверждённо      : {delivered:>6}")
+    out.append(f"   ├─ отказов (явных)               : {rejected:>6}")
+    out.append(f"   └─ без подтверждения → в откат   : {unknown:>6}")
+    checks_out = delivered + rejected + unknown == total
+    out.append(f"   сходится                         : {'ДА' if checks_out else 'НЕТ ⚠️'}")
+
+    out.append("")
+    out.append("   НАЛИЧИЕ АККАУНТА (из contact_channel_state)")
+    for channel in ("telegram", "max"):
+        present = _scalar(
+            "SELECT COUNT(*) FROM contact_channel_state WHERE channel=? AND verdict IN "
+            "('present','delivered')", (channel,),
+        )
+        absent = _scalar(
+            "SELECT COUNT(*) FROM contact_channel_state WHERE channel=? AND verdict='absent'",
+            (channel,),
+        )
+        out.append(f"   {channel:<9} есть: {present:>5}    нет: {absent:>5}")
+    out.append(
+        "       SQL: SELECT verdict, COUNT(*) FROM contact_channel_state "
+        "GROUP BY channel, verdict"
+    )
+
+    # Сверка с таблицей Google Sheets — источник, который сбивал с толку.
+    sheet_rows = _scalar("SELECT COUNT(*) FROM messages WHERE gsheet_row IS NOT NULL")
+    out.append("")
+    out.append("   СВЕРКА С GOOGLE SHEETS")
+    out.append(f"   строк помечено в БД как синхронизированные : {sheet_rows:>6}")
+    out.append(
+        "       ⚠️ Таблица может содержать больше строк, чем помечено в БД:\n"
+        "       исторические строки и DRY_RUN-фейки никуда не делись."
+    )
+    return out
+
+
 def build_report() -> str:
     st = state.load_state()
     st = state.reset_daily_if_new_day(st)
@@ -320,6 +446,12 @@ def build_report() -> str:
     except Exception:
         pass
     out.append("─" * 70)
+
+    # Честные числа — в конце, чтобы их не потерял длинный прогноз сверху.
+    try:
+        out.extend(build_truth_report())
+    except Exception as e:
+        out.append(f"   ⚠️ Честный отчёт не построился: {type(e).__name__}: {e}")
 
     out.append("=" * 70)
     return "\n".join(out)

@@ -11,6 +11,7 @@ from typing import Optional
 
 from . import config, db, sheets, wazzup
 from .sheets import sync_message_to_sheet
+from .store.enums import DeliveryState
 
 
 log = config.get_logger("reconcile")
@@ -978,8 +979,13 @@ def sweep_unconfirmed_deliveries(limit: int = 50,
     unknown_swept = _sweep_rows(rows, kind="unknown", reason="no_delivery_confirmation")
     swept += unknown_swept
 
-    # 3) Молчание дольше суток — контакт уходит не в откат, а в exhausted.
-    #    Границы обязательны с обеих сторон: без нижней в exhausted уехало бы
+    # 3) Молчание старше max_age — в откат НЕ идёт, а просто снимается с разбора.
+    #    Раньше здесь писали delivery_state='exhausted', но такого значения в
+    #    словаре DeliveryState нет, и CHECK его отвергал: строка выводилась из
+    #    оборота, состояние не записывалось, в лог уходил warning. Честное
+    #    состояние такого сообщения — 'unknown' (подтверждения так и не было),
+    #    см. миграцию 2 _m0002_clean_delivery_state.
+    #    Границы обязательны с обеих сторон: без нижней в этот разбор уехало бы
     #    всё свежее, а без верхней — ВСЯ история (на боевой базе это тысячи
     #    сообщений с июля, и первый же запуск после деплоя пометил бы их все).
     try:
@@ -994,20 +1000,19 @@ def sweep_unconfirmed_deliveries(limit: int = 50,
         rows = []
     for r in rows:
         try:
-            db.mark_swept(r["message_pk"])
-            db.set_delivery_state(r["message_pk"], "exhausted")
+            db.retire_unconfirmed(r["message_pk"], DeliveryState.UNKNOWN.value)
         except Exception as e:
-            log.warning(f"sweep: exhausted не пометить {r['message_id']}: {e}")
+            log.warning(f"sweep: не пометить {r['message_id']}: {e}")
             continue
         exhausted_count += 1
 
     if swept or unknown_count or exhausted_count:
         log.info(
-            f"🔍 Сторож: в rescue={swept} "
+            f"Сторож: в rescue={swept} "
             f"(явных отказов {rejected_swept} за горизонт {reject_minutes} мин + "
             f"молчаний {unknown_swept} за горизонт {unknown_minutes} мин), "
             f"всего молчаний под рассмотрением {unknown_count}, "
-            f"exhausted={exhausted_count}"
+            f"снято с разбора={exhausted_count}"
         )
     return swept
 
@@ -1020,9 +1025,11 @@ def _sweep_rows(rows, kind: str, reason: str) -> int:
     for r in rows:
         channel = r["channel"]
         try:
-            db.mark_swept(r["message_pk"])
-            db.set_delivery_state(r["message_pk"], "rejected" if kind == "rejected"
-                                  else "unknown")
+            db.retire_unconfirmed(
+                r["message_pk"],
+                DeliveryState.REJECTED.value if kind == "rejected"
+                else DeliveryState.UNKNOWN.value,
+            )
         except Exception as e:
             log.warning(f"sweep: не пометить {r['message_id']}: {e}")
             continue

@@ -165,20 +165,25 @@ WABA_TIER_LIMITS = {
 MAX_PERSONAL_DAILY_HARD_CAP = 30  # legacy-значение, ниже не используется
 
 # Жёсткие потолки для личных аккаунтов: env НЕ может их превысить.
+#
+# ВНИМАНИЕ (решение владельца 2026-10-08): MAX поднят 15 → 20.
+# Это ОСОЗНАННЫЙ РИСК: 3-5 жалоб = перманентный бан ЛИЧНОГО номера MAX.
+# Защита — COMPLAINT_HALT_THRESHOLD_MAX (2 жалобы за 24ч → halt канала),
+# она срабатывает независимо от дневного капа.
 PERSONAL_CHANNEL_HARD_CAPS = {
     "telegram": 50,
-    "max": 15,
+    "max": 20,
 }
 
 ORIGINAL_ACCOUNT_DAILY_HARD_CAPS = {
     "waba": 250,
     "telegram": 50,
-    "max": 15,
+    "max": 20,
 }
 
 # --- Daily limits ---
 # WABA — отдельный ключ (BULK_LIMIT_WABA) или авто из tier.
-# Personal-каналы ограничены PERSONAL_CHANNEL_HARD_CAPS (TG 50, MAX 15).
+# Personal-каналы ограничены PERSONAL_CHANNEL_HARD_CAPS (TG 50, MAX 20).
 def _safe_limit(ch: str, default: int, hard_cap: int = 10**9) -> int:
     val = int(os.environ.get(f"BULK_LIMIT_{ch.upper()}", str(default)))
     return min(val, hard_cap)
@@ -186,9 +191,9 @@ def _safe_limit(ch: str, default: int, hard_cap: int = 10**9) -> int:
 CHANNEL_DAILY_LIMITS = {
     "whatsapp": _safe_limit("whatsapp", 60),
     "telegram": _safe_limit(
-        "telegram", 40, hard_cap=PERSONAL_CHANNEL_HARD_CAPS["telegram"]),
+        "telegram", 50, hard_cap=PERSONAL_CHANNEL_HARD_CAPS["telegram"]),
     "max": _safe_limit(
-        "max", 15, hard_cap=PERSONAL_CHANNEL_HARD_CAPS["max"]),
+        "max", 20, hard_cap=PERSONAL_CHANNEL_HARD_CAPS["max"]),
     "waba": _safe_limit("waba", 250),
     # SMS — fallback последней надежды. НЕ ограничен MAX_PERSONAL_DAILY_HARD_CAP:
     # SMS идёт через агрегатор с зарегистрированным именем отправителя, а не через
@@ -416,7 +421,29 @@ GOOGLE_SHEET_ID = os.environ.get("BULK_GOOGLE_SHEET_ID", "")
 GOOGLE_CREDENTIALS_JSON = os.environ.get(
     "BULK_GOOGLE_CREDENTIALS_JSON", str(DATA_DIR / "credentials.json")
 )
-GOOGLE_WORKSHEET_NAME = os.environ.get("BULK_GOOGLE_WORKSHEET", "Messages")
+GOOGLE_WORKSHEET_NAME = os.environ.get("BULK_GOOGLE_WORKSHEET", "new_messages")
+
+# Схема листа отправок.
+#
+# Отличие от прежней (Messages) — не косметика. Старая схема не позволяла
+# отличить «не доставлено» от «подтверждения ещё нет»: колонка Delivered
+# хранила время, а Delivery State (unknown/delivered/rejected) в таблице не
+# было вообще. Из-за этого 803 строки выглядели как отправки, а писали
+# 359 человек.
+#
+# Что добавлено и почему:
+#   Reached        — «дошло ли до человека»: доставлено ИЛИ прочитано
+#                    ИЛИ есть ответ. Прочитать можно только доставленное,
+#                    поэтому событие `read` доказывает доставку сильнее,
+#                    чем её отсутствие. Без этой колонки 78 человек,
+#                    прочитавших без события delivered, выпадали из счёта.
+#   Delivery State — трёхзначный вердикт вебхука. Пусто ≠ «не доставлено».
+#   Last Error     — причина отказа, без неё отказ невозможно разобрать.
+#   Contact ID     — связь строки листа с записью в БД.
+#   Consent        — правовое основание рассылки (ФЗ-38 ч.1 ст.18).
+#
+# Что переименовано: Delivered/Read/Answered → *At, потому что это ВРЕМЯ,
+# а «Answered» было «Yes/нет» и теряло само время ответа.
 GSHEET_HEADERS = [
     "Phone",
     "Name",
@@ -424,14 +451,23 @@ GSHEET_HEADERS = [
     "Channel",
     "Message",
     "Sent At",
-    "Delivered",
-    "Read",
-    "Answered",
+    "Delivered At",
+    "Read At",
+    "Answered At",
+    "Reached",
+    "Delivery State",
+    "Status",
+    "Last Error",
     "Reply",
     "Last Activity",
-    "Status",
     "Message ID",
+    "Contact ID",
+    "Consent",
 ]
+
+# Индексы колонок для поиска строки. Считаются от заголовка, а не числами
+# в коде: перестановка столбца больше не ломает поиск молча.
+GSHEET_COL = {name: i for i, name in enumerate(GSHEET_HEADERS)}
 
 # --- Webhook ---
 WEBHOOK_HOST = os.environ.get("BULK_WEBHOOK_HOST", "0.0.0.0")
@@ -539,6 +575,37 @@ PHASE_ORDER = [
     for ch in os.environ.get("BULK_PHASE_ORDER", "waba,telegram,max").split(",")
     if ch.strip()
 ]
+
+# ============================================================================
+# PROBE — фаза проверки наличия аккаунта в канале
+# ============================================================================
+# Механика: у Wazzup НЕТ эндпоинта «есть ли у номера аккаунт в Telegram».
+# Единственный способ — отправить запрос с `phone`. Отрицательный вердикт
+# приходит СИНХРОННЫМ HTTP 400 (CHANNEL_TGAPI_PHONE_NOT_OCCUPIED) на самом
+# запросе, а не эхом вебхука, и квоту при этом НЕ списывает
+# (increment_channel_sent вызывается только в _persist_success).
+#
+# Цена: если аккаунт ЕСТЬ — придёт 201 и человеку реально уйдёт сообщение.
+# Поэтому проба обязана слать РАБОЧИЙ текст, а успех — немедленно учитываться
+# как реальная отправка, иначе контакт получит дубль в фазе отката.
+PROBE_ENABLED = bool(
+    os.environ.get("BULK_PROBE_ENABLED", "1",).strip().lower()
+    in ("1", "true", "yes", "on")
+)
+# Предохранитель от шторма проб за один прогон.
+PROBE_MAX_PER_RUN = int(os.environ.get("BULK_PROBE_MAX_PER_RUN", "400") or 400)
+# Пауза между пробами, сек. Вежливость к API Wazzup.
+PROBE_INTERVAL_MIN = int(os.environ.get("BULK_PROBE_INTERVAL_MIN", "2") or 2)
+# Повторно не пробивать тот же (контакт, канал) в течение TTL часов.
+PROBE_TTL_HOURS = int(os.environ.get("BULK_PROBE_TTL_HOURS", "24") or 24)
+# Каналы, на которых проба имеет смысл (личные аккаунты).
+PROBE_CHANNELS = [
+    ch.strip()
+    for ch in os.environ.get("BULK_PROBE_CHANNELS", "telegram,max").split(",")
+    if ch.strip()
+]
+# Canary-номер для проверки механики на живом канале (не входит в боевой пул).
+TEST_CONTACT = os.environ.get("BULK_TEST_CONTACT", "").strip()
 
 # --- Режим «длинный прогон»: сколько ЧАСОВ работает один запуск sender'а ---
 # 0 = выключен (по умолчанию): один проход по фазам и выход, как раньше.
