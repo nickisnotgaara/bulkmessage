@@ -3359,13 +3359,44 @@ try:
         check("сторож видит все 8 отправок",
               _h_bad["sent"] == 8, f"sent={_h_bad['sent']}")
 
-        # Теперь подтверждаем половину — канал снова считается живым
+        # Живой случай 2026-10-07: delivered_at у Telegram не заполняется
+        # НИКОГДА — Wazzup не шлёт statuses-событий для личных каналов.
+        # Подтверждением там служит вердикт вебхука по эху исходящего.
+        # Если бы мы считали по delivered_at, фаза Telegram пропускалась бы
+        # целиком при полностью рабочей доставке.
         with db.db_conn() as conn:
             conn.execute("UPDATE messages SET delivered_at = datetime('now') "
                          "WHERE id % 2 = 0 AND channel='telegram'")
+        _h_wrong = sender.channel_delivery_health("telegram", min_sample=5)
+        check("telegram: delivered_at НЕ считается подтверждением",
+              _h_wrong["ok"] is False,
+              f"ok={_h_wrong['ok']} reason={_h_wrong['reason']}")
+
+        with db.db_conn() as conn:
+            conn.execute("UPDATE messages SET delivery_state = 'delivered' "
+                         "WHERE id % 2 = 0 AND channel='telegram'")
         _h_ok = sender.channel_delivery_health("telegram", min_sample=5)
-        check("канал с подтверждениями считается рабочим",
+        check("telegram: вердикт эха считается подтверждением",
               _h_ok["ok"] is True, f"ok={_h_ok['ok']} reason={_h_ok['reason']}")
+        check("telegram: считает ровно половину (4 из 8)",
+              _h_ok["delivered"] == 4, f"got {_h_ok['delivered']}")
+
+        # WABA — наоборот, подтверждается именно событием доставки.
+        with db.db_conn() as conn:
+            for i in range(8):
+                cid = db.upsert_contact(
+                    conn, phone=f"+7999666{i:04d}", name="W",
+                    category="Покупатели")
+                db.insert_message(conn, contact_id=cid, channel="waba",
+                                  message_text="t", message_id=f"w{i}",
+                                  status="sent")
+        with db.db_conn() as conn:
+            conn.execute("UPDATE messages SET delivered_at = datetime('now') "
+                         "WHERE id % 2 = 0 AND channel='waba'")
+        _h_waba = sender.channel_delivery_health("waba", min_sample=5)
+        check("waba: доставка по-прежнему считается по delivered_at",
+              _h_waba["ok"] is True and _h_waba["delivered"] == 4,
+              f"ok={_h_waba['ok']} delivered={_h_waba['delivered']}")
 
         # Мало данных = «не знаем», а не «сломан»
         _h_none = sender.channel_delivery_health("max", min_sample=5)

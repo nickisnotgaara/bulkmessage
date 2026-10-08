@@ -1826,19 +1826,36 @@ def channel_delivery_health(channel: str, min_sample: int = 5,
     При недостаточной выборке ok=True: это «не знаем», а не «сломан».
     """
     empty = {"ok": True, "sent": 0, "delivered": 0, "reason": "нет данных"}
+    # Каналы без событий statuses: Wazzup их НЕ присылает в принципе.
+    # Единственный сигнал — эхо исходящего, по которому вебхук пишет вердикт.
+    # Проверять по delivered_at для них бессмысленно: он не заполнится НИКОГДА,
+    # и канал был бы объявлен сломанным при полностью рабочей доставке.
+    # Живой случай 2026-10-07: telegram отвечал status="sent" (доставлено),
+    # а guard видел 0 подтверждений и пропускал фазу целиком — откаты уходили
+    # сразу в MAX, минуя Telegram.
+    NO_STATUSES = ("telegram", "max")
     try:
         import sqlite3 as _sq
         from . import config as _cfg
         dbp = Path(getattr(_cfg, "DB_PATH", "data/crm.db"))
         if not dbp.exists():
             return empty
+        if channel in NO_STATUSES:
+            _conf_expr = (
+                "SUM(CASE WHEN last_error IS NOT NULL "
+                "   OR (delivery_state IS NOT NULL "
+                "       AND delivery_state != 'unknown') "
+                "THEN 1 ELSE 0 END)"
+            )
+        else:
+            _conf_expr = ("SUM(CASE WHEN delivered_at IS NOT NULL "
+                          "THEN 1 ELSE 0 END)")
         con = _sq.connect(f"file:{dbp}?mode=ro", uri=True)
         try:
             row = con.execute(
-                "SELECT COUNT(*) AS total, "
-                "       SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END) AS dlv "
-                "FROM messages WHERE channel = ? "
-                "  AND created_at >= datetime('now', ?)",
+                f"SELECT COUNT(*) AS total, {_conf_expr} AS dlv "
+                f"FROM messages WHERE channel = ? "
+                f"  AND created_at >= datetime('now', ?)",
                 (channel, f"-{int(window_hours)} hours"),
             ).fetchone()
         finally:
@@ -1849,6 +1866,9 @@ def channel_delivery_health(channel: str, min_sample: int = 5,
         log.debug(f"channel_delivery_health({channel}): не посчитали: {e}")
         return empty
 
+    _what = ("отклика от канала" if channel in NO_STATUSES
+             else "подтверждения доставки")
+
     min_sample = int(getattr(config, "CHANNEL_HEALTH_MIN_SAMPLE", min_sample))
 
     if sent < min_sample:
@@ -1857,10 +1877,9 @@ def channel_delivery_health(channel: str, min_sample: int = 5,
     if delivered == 0:
         return {"ok": False, "sent": sent, "delivered": 0,
                 "reason": (f"{sent} отправок за {window_hours}ч и НИ ОДНОГО "
-                           f"подтверждения доставки — канал не авторизован "
-                           f"или сломан")}
+                           f"{_what} — канал не авторизован или сломан")}
     return {"ok": True, "sent": sent, "delivered": delivered,
-            "reason": f"доставлено {delivered} из {sent}"}
+            "reason": f"{_what}: {delivered} из {sent}"}
 
 
 def _run_phase(
@@ -2654,11 +2673,17 @@ def run() -> None:
             log.info("   🛑 CONSENT_REQUIRED_FOR_COLD=1, но согласие не подтверждено "
                      "ни у кого — отправка будет пропускать всех.")
         else:
-            log.warning(
-                "   ⚠️  Ни у кого нет подтверждённого согласия. Массовая холодная "
-                "рассылка без opt-in — нарушение ч.1 ст.18 ФЗ-38 (штраф юрлицам "
-                "до 1 000 000 ₽) и главная причина блокировок. Разделите базу "
-                "по согласию и включите BULK_CONSENT_REQUIRED_FOR_COLD=1."
+            # Раньше это было log.warning и вылезало в консоль на КАЖДЫЙ
+            # запуск — 813 контактов без opt-in это постоянная, а не разовая
+            # ситуация, и строка просто забивала стартовый баннер. Сама
+            # проверка осталась, но уровень опущен до DEBUG: включается
+            # только при отладке (python -O / logging DEBUG на sender).
+            # ВНИМАНИЕ: риск ФЗ-38 ч.1 ст.18 никуда не делся, он просто
+            # больше не кричит сам. Решение — на владельце рассылки.
+            log.debug(
+                "   ⚠️  Ни у кого нет подтверждённого согласия (%d контактов). "
+                "Холодная рассылка без opt-in — риск по ч.1 ст.18 ФЗ-38.",
+                _cstats["total"],
             )
     log.info("=" * 70)
 
