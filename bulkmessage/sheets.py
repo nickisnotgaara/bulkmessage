@@ -153,46 +153,50 @@ class SheetsManager:
         name: str,
         category: str,
         channel: str,
+        cascade: str,
+        has_whatsapp: str,
+        has_telegram: str,
+        has_max: str,
+        reached: bool,
         message: str,
         sent_at: Optional[str],
         delivered_at: Optional[str],
         read_at: Optional[str],
         answered_at: Optional[str],
-        delivery_state: str,
-        status: str,
-        last_error: str,
         reply: str,
         last_activity: Optional[str],
+        last_error: str,
         message_id: str,
-        contact_id: str,
-        consent: str,
     ) -> list[str]:
-        """Собирает строку листа.
+        """Собирает строку листа — одну на человека.
 
         Порядок обязан совпадать с ``config.GSHEET_HEADERS``; порядок там и
         здесь задан одним списком, а не числами в разных местах.
+
+        ``reached`` приходит готовым из агрегатора, а не вычисляется здесь:
+        решение «дошло ли до человека» принимается по ВСЕМ попыткам контакта
+        сразу. Вычислять его по одной попытке — как раз та ошибка, из-за
+        которой один человек занимал в таблице три строки.
         """
-        reached = bool(delivered_at or read_at or answered_at
-                       or delivery_state == "delivered")
         return [
             phone,
             name,
             category,
             channel,
+            cascade,
+            has_whatsapp,
+            has_telegram,
+            has_max,
+            "Yes" if reached else "No",
             message,
             self._format_dt(sent_at),
             self._format_dt(delivered_at),
             self._format_dt(read_at),
             self._format_dt(answered_at),
-            "Yes" if reached else "No",
-            delivery_state or "unknown",
-            status,
-            (last_error or "")[:500],
             reply,
             self._format_dt(last_activity),
+            (last_error or "")[:500],
             message_id or "",
-            str(contact_id or ""),
-            consent or "unknown",
         ]
 
     def find_row(self, phone: str, channel: str, message_id: str) -> Optional[int]:

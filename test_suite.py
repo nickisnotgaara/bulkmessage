@@ -5368,10 +5368,11 @@ from bulkmessage import export_sheets as _exp  # noqa: E402
 
 _base = dict(
     phone="+79001000000", name="Тест", category="Покупатели", channel="telegram",
+    cascade="waba:rejected → telegram:sent",
+    has_whatsapp="yes", has_telegram="yes", has_max="no", reached=False,
     message="текст", sent_at="2026-01-02T03:04:05+00:00", delivered_at=None,
-    read_at=None, answered_at=None, delivery_state="unknown", status="sent",
+    read_at=None, answered_at=None,
     last_error="", reply="", last_activity=None, message_id="wazz-x1",
-    contact_id=1, consent="unknown",
 )
 _row = _sh.SHEETS.build_row_payload(**_base)
 check("строка листа совпадает по длине с заголовком",
@@ -5379,19 +5380,20 @@ check("строка листа совпадает по длине с загол�
       f"{len(_row)} vs {len(_sh.config.GSHEET_HEADERS)}")
 check("Reached=No, когда нет ни доставки, ни прочтения, ни ответа",
       _row[_sh.config.GSHEET_COL["Reached"]] == "No")
-check("Delivery State по умолчанию unknown, а не пусто",
-      _row[_sh.config.GSHEET_COL["Delivery State"]] == "unknown")
+check("Channel хранит успешный канал, а не ошибку каскада",
+      _row[_sh.config.GSHEET_COL["Channel"]] == "telegram")
+check("Cascade показывает весь след попыток по каналам",
+      "waba:rejected" in _row[_sh.config.GSHEET_COL["Cascade"]]
+      and "telegram:sent" in _row[_sh.config.GSHEET_COL["Cascade"]])
+check("есть колонки доступности по каждому каналу",
+      all(h in _sh.config.GSHEET_COL
+          for h in ("Has WhatsApp", "Has Telegram", "Has MAX")))
 
 # Прочитать можно только доставленное, поэтому read доказывает доставку
 # сильнее её отсутствия. На этом стояли 78 человек, которые без этой логики
 # выпадали из статистики как «не доставлено».
-check("Reached=Yes по одному прочтению, даже без подтверждения доставки",
-      _sh.SHEETS.build_row_payload(
-          **{**_base, "read_at": "2026-01-02T05:00:00+00:00"})[
-          _sh.config.GSHEET_COL["Reached"]] == "Yes")
-check("Reached=Yes по подтверждённой доставке",
-      _sh.SHEETS.build_row_payload(
-          **{**_base, "delivery_state": "delivered"})[
+check("Reached=Yes по прочтению, даже без подтверждения доставки",
+      _sh.SHEETS.build_row_payload(**{**_base, "reached": True})[
           _sh.config.GSHEET_COL["Reached"]] == "Yes")
 check("Answered хранит ВРЕМЯ ответа, а не Yes/нет",
       _sh.SHEETS.build_row_payload(
@@ -5414,6 +5416,58 @@ check("выгрузка не тянет строки без message_id", "m.mess
 check("выгрузка отбрасывает dryrun-призраков", "dryrun_" in _sql)
 check("выгрузка переписывает лист с resize (хвост старых колонок не остаётся)",
       "resize" in __import__("inspect").getsource(_exp._write_bulk))
+
+# --- T13: одна строка на человека -----------------------------------------
+# Главное изменение схемы: раньше строка = попытка, и один человек занимал
+# три строки (WABA отказ → Telegram → MAX). Ответ на «достучались ли» тогда
+# требовал складывать строки вручную — ровно та работа, ради которой отчёт.
+def _att(ch, state, status="sent", **kw):
+    d = dict(contact_id=1, channel=ch, delivery_state=state, status=status,
+             sent_at="2026-10-01T10:00:00+00:00", delivered_at=None,
+             read_at=None, answered_at=None, last_error="",
+             message_id=f"m-{ch}", message_text="t", updated_at=None,
+             created_at=None, phone="+79001000000", name="Т", category="П",
+             reply="")
+    d.update(kw)
+    return d
+
+
+_agg = _exp.aggregate_people
+_v = {}
+
+# Каскад: WABA отрезали, Telegram сработал → в Channel успешный канал,
+# а след попыток остаётся виден в Cascade.
+_p = _agg([_att("waba", "rejected", status="failed"),
+           _att("telegram", "delivered", delivered_at="2026-10-01T10:01:00+00:00")], _v)
+check("три попытки человека схлопываются в одну строку",
+      len(_agg([_att("waba", "rejected", status="failed"),
+                _att("telegram", "delivered", delivered_at="2026-10-01T10:01:00+00:00"),
+                _att("max", "delivered", delivered_at="2026-10-01T10:05:00+00:00")],
+               _v)) == 1)
+check("Channel = канал, которым дошли, а не отказавший WABA",
+      _p[0]["channel"] == "telegram", _p[0]["channel"])
+check("Cascade сохраняет, где именно сломалось",
+      _p[0]["cascade"] == "waba:rejected → telegram:delivered",
+      _p[0]["cascade"])
+check("Reached=Yes, если дошёл хотя бы один канал", _p[0]["reached"] is True)
+
+# Все каналы дали отказ — честное «ни один», а не последний неудачный канал.
+_p2 = _agg([_att("waba", "rejected", status="failed"),
+            _att("telegram", "rejected", status="failed")], _v)
+check("Channel = none of them, когда не сработал ни один канал",
+      _p2[0]["channel"] == "none of them", _p2[0]["channel"])
+check("Reached=No, когда ни один канал не доставил",
+      _p2[0]["reached"] is False)
+
+# Вердикты доступности приходят из contact_channel_state.
+_p3 = _agg([_att("waba", "delivered", delivered_at="2026-10-01T10:01:00+00:00")],
+           {1: ("delivered", "absent", None)})
+check("Has WhatsApp=yes при вердикте delivered",
+      _p3[0]["has_whatsapp"] == "yes", _p3[0]["has_whatsapp"])
+check("Has Telegram=no при вердикте absent",
+      _p3[0]["has_telegram"] == "no", _p3[0]["has_telegram"])
+check("Has MAX=unknown, если вердикта нет",
+      _p3[0]["has_max"] == "unknown", _p3[0]["has_max"])
 
 # --- cleanup --------------------------------------------------------------
 with db.db_conn() as _c:

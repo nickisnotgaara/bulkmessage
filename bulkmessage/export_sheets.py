@@ -30,19 +30,54 @@ from .sheets import SHEETS
 # без отправки (отказ каскада, синхронный 400, ошибка транспорта), и именно
 # они раньше раздували таблицу.
 _EXPORT_SQL = """
-SELECT m.id, m.contact_id, m.channel, m.message_text, m.message_id,
-       m.status, m.delivery_state, m.sent_at, m.delivered_at, m.read_at,
-       m.answered_at, m.last_error, m.updated_at, m.created_at,
-       c.phone, c.name, c.category, c.consent,
+SELECT m.contact_id, m.channel, m.delivery_state, m.status, m.sent_at,
+       m.delivered_at, m.read_at, m.answered_at, m.last_error, m.message_id,
+       m.message_text, m.updated_at, m.created_at,
+       c.phone, c.name, c.category,
        (SELECT r.message FROM replies r
-         WHERE r.contact_id = m.contact_id AND r.channel = m.channel
+         WHERE r.contact_id = m.contact_id
          ORDER BY r.created_at DESC LIMIT 1) AS reply
 FROM messages m
 JOIN contacts c ON c.id = m.contact_id
 WHERE m.message_id IS NOT NULL
   AND m.message_id NOT LIKE 'dryrun_%'
-ORDER BY m.sent_at, m.id
+ORDER BY m.contact_id, m.sent_at, m.id
 """
+
+# Вердикты «есть ли у человека аккаунт» — из contact_channel_state. Именно они
+# дают колонки Has WhatsApp / Has Telegram / Has MAX: они отвечают на вопрос
+# «куда вообще можно достучаться» ещё ДО отправки, а не по факту попытки.
+_VERDICT_SQL = """
+SELECT contact_id,
+       MAX(CASE WHEN channel IN ('waba', 'whatsapp') THEN verdict END) AS wa,
+       MAX(CASE WHEN channel = 'telegram' THEN verdict END) AS tg,
+       MAX(CASE WHEN channel = 'max' THEN verdict END) AS mx
+FROM contact_channel_state
+GROUP BY contact_id
+"""
+
+# Ранг исхода попытки: меньше — лучше. Дойти до человека важнее, чем просто
+# быть отправленным; отказ хуже молчания.
+_RANK = {
+    "delivered": 0, "read": 0, "answered": 0,
+    "sent": 1,
+    "unknown": 1, "queued": 1,
+    "rejected": 2, "failed": 2, "exhausted": 2,
+}
+
+_VERDICT_YES = {"present", "delivered"}
+_VERDICT_NO = {"absent", "blocked"}
+
+
+def _verdict_cell(value: Optional[str]) -> str:
+    """Вердикт канала → «yes» / «no» / «unknown»."""
+    if value is None:
+        return "unknown"
+    if value in _VERDICT_YES:
+        return "yes"
+    if value in _VERDICT_NO:
+        return "no"
+    return "unknown"
 
 
 def collect_rows() -> list[dict]:
@@ -54,29 +89,99 @@ def collect_rows() -> list[dict]:
         return [dict(r) for r in conn.execute(_EXPORT_SQL).fetchall()]
 
 
-def build_rows(records: list[dict]) -> list[list[str]]:
-    return [
-        SHEETS.build_row_payload(
-            phone=r["phone"] or "",
-            name=r["name"] or "",
-            category=r["category"] or "",
-            channel=r["channel"] or "",
-            message=r["message_text"] or "",
-            sent_at=r["sent_at"],
-            delivered_at=r["delivered_at"],
-            read_at=r["read_at"],
-            answered_at=r["answered_at"],
-            delivery_state=r["delivery_state"] or "unknown",
-            status=r["status"] or "",
-            last_error=r["last_error"] or "",
-            reply=r["reply"] or "",
-            last_activity=r["updated_at"] or r["created_at"],
-            message_id=r["message_id"] or "",
-            contact_id=r["contact_id"],
-            consent=r["consent"] or "unknown",
+def collect_verdicts() -> dict:
+    """Вердикты «есть ли аккаунт» по контактам: contact_id → (wa, tg, mx)."""
+    from .db import db_conn
+
+    with db_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        return {
+            r["contact_id"]: (r["wa"], r["tg"], r["mx"])
+            for r in conn.execute(_VERDICT_SQL).fetchall()
+        }
+
+
+def _outcome(r: dict) -> str:
+    """Короткая метка исхода попытки для колонки Cascade."""
+    state = (r["delivery_state"] or "").strip()
+    status = (r["status"] or "").strip()
+    if r["delivered_at"]:
+        return "delivered"
+    if r["read_at"]:
+        return "read"
+    if r["answered_at"]:
+        return "answered"
+    if state == "delivered":
+        return "delivered"
+    if state == "rejected" or status == "failed":
+        return "rejected"
+    if status in ("sent", "queued"):
+        return "sent"
+    return state or status or "unknown"
+
+
+def aggregate_people(records: list[dict], verdicts: dict) -> list[dict]:
+    """Сворачивает попытки в одну запись на человека.
+
+    Раньше лист строился по одной строке на ПОПЫТКУ, и один и тот же человек
+    занимал три строки (WABA отказ → Telegram → MAX). Ответ на вопрос
+    «достучались мы» требовал складывать их вручную — ровно та работа, ради
+    которой отчёт и делался.
+    """
+    grouped: dict = {}
+    for r in records:
+        grouped.setdefault(r["contact_id"], []).append(r)
+
+    people = []
+    for cid, attempts in grouped.items():
+        # Победитель — попытка с лучшим рангом; при равенстве берём самую
+        # раннюю, чтобы канал отражал ПЕРВЫЙ успех, а не последний повтор.
+        best = min(
+            attempts,
+            key=lambda a: (_RANK.get(_outcome(a), 1), a["sent_at"] or ""),
         )
-        for r in records
-    ]
+        best_outcome = _outcome(best)
+        channel = (best["channel"] or "") if _RANK.get(best_outcome, 1) < 2 \
+            else "none of them"
+
+        cascade = " → ".join(
+            f"{a['channel']}:{_outcome(a)}" for a in attempts
+        )
+        wa, tg, mx = verdicts.get(cid, (None, None, None))
+        people.append({
+            "phone": best["phone"] or "",
+            "name": best["name"] or "",
+            "category": best["category"] or "",
+            "channel": channel,
+            "cascade": cascade,
+            "has_whatsapp": _verdict_cell(wa),
+            "has_telegram": _verdict_cell(tg),
+            "has_max": _verdict_cell(mx),
+            "reached": any(
+                a["delivered_at"] or a["read_at"] or a["answered_at"]
+                or a["delivery_state"] == "delivered"
+                for a in attempts
+            ),
+            "message": best["message_text"] or "",
+            "sent_at": best["sent_at"],
+            "delivered_at": next(
+                (a["delivered_at"] for a in attempts if a["delivered_at"]), None),
+            "read_at": next(
+                (a["read_at"] for a in attempts if a["read_at"]), None),
+            "answered_at": next(
+                (a["answered_at"] for a in attempts if a["answered_at"]), None),
+            "reply": best["reply"] or "",
+            "last_activity": max(
+                (a["updated_at"] or a["created_at"] or "") for a in attempts),
+            "last_error": best["last_error"] or "",
+            "message_id": best["message_id"] or "",
+        })
+    people.sort(key=lambda p: p["phone"])
+    return people
+
+
+def build_rows(people: list[dict]) -> list[list[str]]:
+    return [SHEETS.build_row_payload(**p) for p in people]
 
 
 def _write_bulk(ws, header: list[str], rows: list[list[str]]) -> int:
@@ -110,24 +215,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     records = collect_rows()
-    rows = build_rows(records)
+    people_rows = aggregate_people(records, collect_verdicts())
+    rows = build_rows(people_rows)
 
-    reached = sum(
-        1 for r in records
-        if r["delivered_at"] or r["read_at"] or r["answered_at"]
-        or r["delivery_state"] == "delivered"
-    )
-    people = len({r["contact_id"] for r in records})
-    reached_people = len({
-        r["contact_id"] for r in records
-        if r["delivered_at"] or r["read_at"] or r["answered_at"]
-        or r["delivery_state"] == "delivered"
-    })
+    reached = sum(1 for p in people_rows if p["reached"])
     print(f"Лист: {config.GOOGLE_WORKSHEET_NAME}")
-    print(f"Строк (каждая = одна отправка): {len(records)}")
-    print(f"Уникальных людей: {people}")
-    print(f"Дошло до человека: {reached_people} человек "
-          f"({reached} отправок)")
+    print(f"Попыток в базе: {len(records)}")
+    print(f"Строк в листе (каждая = один человек): {len(people_rows)}")
+    print(f"Дошло до человека: {reached}")
+    by_channel: dict = {}
+    for p in people_rows:
+        by_channel[p["channel"]] = by_channel.get(p["channel"], 0) + 1
+    print("Чем доставили: " + ", ".join(
+        f"{k}={v}" for k, v in sorted(by_channel.items())))
     print(f"Столбцов: {len(config.GSHEET_HEADERS)}")
 
     if "--dry-run" in argv:
@@ -152,4 +252,5 @@ def main(argv: Optional[list[str]] = None) -> int:
     return 0
 
 
-__all__ = ["collect_rows", "build_rows", "main"]
+__all__ = ["collect_rows", "collect_verdicts", "aggregate_people",
+           "build_rows", "main"]
