@@ -26,6 +26,8 @@ from typing import Optional
 
 import requests
 
+import logging
+
 from . import config
 
 
@@ -81,6 +83,33 @@ _AUTH_KEYWORDS = (
     "channel not found",
 )
 
+# Числовые коды НЕЛЬЗЯ искать как подстроку: Wazzup возвращает сырой JSON,
+# где task_id/uuid — случайный hex. Реальный случай 2026-10-06:
+# «Peer flood error for 79779612336» с task_id «...4ea40107a...» — внутри
+# task_id нашлась подстрока «401», и отказ ОДНОГО контакта был классифицирован
+# как AUTH → halt канала telegram на 24 часа. Поэтому код ищем по границам
+# слова: «ea40107a» не матчится, «HTTP 401 Unauthorized» — матчится.
+_AUTH_CODE_RE = re.compile(r"(?<![\w-])(401|403)(?![\w-])")
+
+# Ошибки уровня ОДНОГО КОНТАКТА, не уровня канала. Проверяются раньше
+# _AUTH_KEYWORDS, иначе они классифицировались бы как AUTH и гасили канал.
+#
+# Реальный случай 2026-10-06, Telegram: «Пользователь сменил @никнейм или
+# удалил аккаунт». Код Wazzup/TG — CHAT_WRITE_FORBIDDEN, и подстрока
+# «forbidden» стоит в _AUTH_KEYWORDS. Итог был бы: один недовольный
+# получатель → halt Telegram на 24 часа → минус 50 откатов в день.
+_CONTACT_KILL_KEYWORDS = (
+    "chat_write_forbidden",
+    "user_is_blocked",
+    "user_not_found",
+    "chat_id_invalid",
+    "peer_id_invalid",
+    "сменил @никнейм",
+    "удалил аккаунт",
+    "заблокировал бота",
+    "blocked by the user",
+)
+
 _RATE_KEYWORDS = (
     "rate limit",
     "too many",
@@ -126,11 +155,29 @@ def is_configured() -> bool:
 
 
 def classify_error(detail: str, http_status: Optional[int] = None) -> ErrorKind:
-    """Классификация ошибок Wazzup по тексту ответа и HTTP-коду."""
+    """Классификация ошибок Wazzup по тексту ответа и HTTP-коду.
+
+    ПОРЯДОК ПРОВЕРОК ВАЖЕН. Ошибки одного КОНТАКТА проверяются раньше
+    общих слов про аутентификацию, потому что иначе один заблокировавший
+    пользователь роняет весь канал:
+
+      * Telegram отдаёт `CHAT_WRITE_FORBIDDEN` («пользователь заблокировал
+        бота / сменил @никнейм / удалил аккаунт»). Слово «forbidden» есть
+        в _AUTH_KEYWORDS, поэтому раньше такой отказ классифицировался как
+        AUTH и гасил канал на 24 часа — а это отказ ОДНОГО контакта;
+      * `USER_IS_BLOCKED`, `USER_NOT_FOUND` — то же самое.
+
+    Реальный 401/403 от самого Wazzup по-прежнему ловится первым: это
+    проблема аккаунта/ключа, и там гасить канал правильно.
+    """
     s = (detail or "").lower()
     if http_status in (401, 403):
         return ErrorKind.AUTH
-    if any(k in s for k in _AUTH_KEYWORDS):
+    if any(k in s for k in _CONTACT_KILL_KEYWORDS):
+        return ErrorKind.PERMANENT
+    if _AUTH_CODE_RE.search(s):
+        return ErrorKind.AUTH
+    if any(k in s for k in _AUTH_KEYWORDS if not k.isdigit()):
         return ErrorKind.AUTH
     if any(k in s for k in _PERMANENT_KEYWORDS):
         return ErrorKind.PERMANENT
@@ -172,7 +219,8 @@ def _post_with_retry(url: str, payload: dict, timeout: int = 30) -> tuple[Option
 def send_wazzup(
     *,
     channel_id: str,
-    chat_id: str,
+    chat_id: Optional[str] = None,
+    phone: Optional[str] = None,
     chat_type: str = "whatsapp",
     text: Optional[str] = None,
     template_id: Optional[str] = None,
@@ -195,8 +243,8 @@ def send_wazzup(
         return False, None, "WAZZUP_API_KEY not configured", None
     if not channel_id:
         return False, None, "channel_id required", None
-    if not chat_id:
-        return False, None, "chat_id required", None
+    if not chat_id and not phone:
+        return False, None, "chat_id or phone required", None
     if text and content_uri:
         return False, None, "cannot provide both text and contentUri", None
     if not (text or template_id or content_uri):
@@ -205,8 +253,17 @@ def send_wazzup(
     payload: dict = {
         "channelId": channel_id,
         "chatType": chat_type,
-        "chatId": chat_id,
     }
+    # Для Telegram/MAX номер телефона передаётся в поле `phone`, а НЕ в
+    # `chatId`: по документации Wazzup chatId для telegram/max «не совпадает
+    # с номером телефона» — это внутренний peer id, и он приходит «в ответ на
+    # запрос при отправке исходящего с параметрами phone». Класть номер в
+    # chatId Wazzup принимает молча (HTTP 201), но адресовать peer не может:
+    # Telegram отвечает BAD_CONTACT на КАЖДЫЙ номер, включая self-send.
+    if chat_id:
+        payload["chatId"] = chat_id
+    if phone:
+        payload["phone"] = phone
     if text is not None:
         payload["text"] = text
     if template_id is not None:
@@ -273,16 +330,27 @@ def resolve_wazzup_chat(chat_id: str, channel_id: str) -> Optional[bool]:
 
     Возвращает True/False если ответ определён, None если сеть/timeout
     (тогда sender должен fallthrough на try/send).
+
+    Реализация: GET /v3/channels/{channelId}/contacts/{chatId}
+    Если контакт есть в списке Wazzup → True (Wazzup знает про него).
+    Если 404 → False.
     """
-    if not is_configured():
+    if not is_configured() or not channel_id or not chat_id:
         return None
-    # Wazzup не имеет отдельного endpoint для проверки chat.
-    # Лучший pre-check — попробовать отправить пустое сообщение НЕЛЬЗЯ
-    # (потратит Meta деньги + статус изменится).
-    # Fallback: вернуть None (кэш остаётся) → sender идёт по try/send.
-    # Реальная реализация pre-check для WABA — через webhook channel.qr_update
-    # + history imports (Phase 5).
-    return None
+    url = (
+        f"{config.WAZZUP_BASE_URL}{config.WAZZUP_CHANNELS_PATH}"
+        f"/{channel_id}/contacts/{chat_id}"
+    )
+    try:
+        r = requests.get(url, headers=_headers(), timeout=10)
+        if r.status_code == 200:
+            return True
+        if r.status_code in (404, 400):
+            return False
+        # 5xx / timeout / network → None (fallback на try/send)
+        return None
+    except requests.exceptions.RequestException:
+        return None
 
 
 def subscribe_wazzup_webhook(url: str, subscriptions: dict) -> tuple[bool, str]:
@@ -306,6 +374,32 @@ def subscribe_wazzup_webhook(url: str, subscriptions: dict) -> tuple[bool, str]:
     if 200 <= r.status_code < 300:
         return True, "ok"
     return False, f"http {r.status_code}: {r.text[:300]}"
+
+
+def get_registered_webhook_url() -> tuple[Optional[str], str]:
+    """URL, на который Wazzup шлёт события СЕЙЧАС. (url, ошибка).
+
+    Нужно sender'у, чтобы отличить «вебхук есть» от «вебхук наш». Проверки
+    «слушает ли что-то 127.0.0.1» недостаточно: можно держать локальный
+    вебхук включённым, пока Wazzup смотрит в туннель СЕРВЕРА. Тогда события
+    уходят в чужую базу, локальный sender их не увидит — и каскад снова
+    «молчит», только теперь уже с локальным вебхуком в руках.
+    """
+    if not is_configured():
+        return None, "WAZZUP_API_KEY not configured"
+    api_url = f"{config.WAZZUP_BASE_URL}{config.WAZZUP_WEBHOOKS_PATH}"
+    try:
+        r = requests.get(api_url, headers=_headers(), timeout=20)
+    except requests.exceptions.RequestException as e:
+        return None, f"network error: {e}"
+    if not (200 <= r.status_code < 300):
+        return None, f"http {r.status_code}: {r.text[:200]}"
+    try:
+        body = r.json()
+    except ValueError:
+        return None, "non-JSON response"
+    uri = body.get("webhooksUri") if isinstance(body, dict) else None
+    return (uri or None), "ok"
 
 
 def verify_webhook_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
@@ -361,6 +455,51 @@ def is_personal_channel(channel_transport: str) -> bool:
 _CHANNEL_NAME_CACHE: dict[str, str] = {}
 _CHANNELS_FETCHED = False
 
+# Кэш маппинга НОМЕРА НАШЕГО АККАУНТА (plainId) → channel name.
+#
+# Зачем: Wazzup НЕ присылает channelId ни в одном реальном событии — проверено
+# на всех 139 сохранённых payload'ах в data/pending_webhooks.jsonl: поле
+# channelId отсутствует в 139 из 139. Поэтому `channel_name_for(channel_id)`
+# в бою не вызывается НИКОГДА и канал определяется только по chatType/platform.
+# А там `whatsapp` → 'whatsapp', и sender, который шлёт через канал 'waba',
+# получает для своего же сообщения канал 'whatsapp'.
+#
+# Последствия были не косметические:
+#   - delivered_today копился в 'whatsapp', а квоты/статистика читают 'waba';
+#   - mark_waba_exhausted() не вызывался (ветка `if channel == "waba"`);
+#   - complaint halt вешался на 'whatsapp', а sender проверяет halt по 'waba';
+#   - cooldown писался в last_delivery_per_channel['whatsapp'].
+#
+# В webhook есть `from`/`to`/`chat_id` — там лежит наш собственный номер
+# аккаунта с суффиксом '@c.us'. По нему канал определяется однозначно.
+#
+# Именно ОДНОЗНАЧНО для семейства транспорта: у нас все три канала (WABA,
+# Telegram, MAX) сидят на одном номере 79771501819, поэтому сам по себе
+# номер не различает каналы. Различает семейство, которое приходит в
+# payload'е как platform/chatType. Поэтому кэш хранит СПИСОК имён.
+_PLAINID_NAME_CACHE: dict[str, list] = {}
+
+_FAMILY_OF_NAME = {
+    "telegram": "telegram",
+    "max": "max",
+    "waba": "whatsapp",
+    "whatsapp": "whatsapp",
+}
+
+
+def _transport_to_name(transport: str) -> str:
+    """transport Wazzup → внутреннее имя канала."""
+    transport = (transport or "").lower()
+    if transport in ("telegram", "tg", "tgapi"):
+        return "telegram"
+    if transport in ("max", "vk", "maxapi"):
+        return "max"
+    if transport in ("wapi", "whatsapp_business", "waba"):
+        return "waba"
+    if transport in ("whatsapp", "whapi"):
+        return "whatsapp"
+    return "waba"  # неизвестный → считаем WABA (безопаснее для лимитов)
+
 
 def _fetch_channels_cached() -> list[dict]:
     """Получить список каналов один раз за процесс. Если API недоступен — []."""
@@ -378,18 +517,18 @@ def _fetch_channels_cached() -> list[dict]:
         transport = (ch.get("transport") or "").lower()
         if not cid:
             continue
-        # Маппинг transport → bulkmessage channel name.
-        if transport in ("telegram", "tg", "tgapi"):
-            name = "telegram"
-        elif transport in ("max", "vk", "maxapi"):
-            name = "max"
-        elif transport in ("wapi", "whatsapp_business", "waba"):
-            name = "waba"
-        elif transport in ("whatsapp", "whapi"):
-            name = "whatsapp"  # Personal WhatsApp через Wazzup QR
-        else:
-            name = "waba"  # неизвестный → считаем WABA (безопаснее для лимитов)
+        name = _transport_to_name(transport)
         _CHANNEL_NAME_CACHE[cid] = name
+        # Тот же канал, но опознаваемый по номеру аккаунта — единственный
+        # способ определить канал в реальных payload'ах Wazzup (channelId
+        # в них не приходит). Нормализуем через normalize_phone, потому
+        # что в событии лежит '79771501819@c.us', а здесь — '79771501819'.
+        plain = ch.get("plainId") or ch.get("name") or ""
+        norm = normalize_phone(plain) if plain else ""
+        if norm:
+            bucket = _PLAINID_NAME_CACHE.setdefault(norm, [])
+            if name not in bucket:
+                bucket.append(name)
     return list(_CHANNEL_NAME_CACHE.values())
 
 
@@ -405,6 +544,63 @@ def channel_name_for(channel_id: str) -> Optional[str]:
         return _CHANNEL_NAME_CACHE[channel_id]
     _fetch_channels_cached()
     return _CHANNEL_NAME_CACHE.get(channel_id)
+
+
+def channel_name_for_raw(value, chat_type: str = "") -> Optional[str]:
+    """Опознать канал по «сырому» значению из payload'а Wazzup.
+
+    Принимает то, что реально лежит в событии: '79159997393@c.us',
+    '751747704', None. JID-хвост отрезается, номер нормализуется, дальше
+    ищем в кэше plainId → [channel names].
+
+    Нужен потому, что channelId в payload'ах не приходит (0 из 139), и
+    без этого резолва по chatType WhatsApp-отправка определялась как
+    'whatsapp' вместо 'waba' — счётчики доставки, cooldown, complaint halt
+    и пул WABA уезжали в отдельный канал, которого sender не знает.
+
+    Номер НЕ различает каналы сам по себе (все три канала на одном
+    номере), поэтому сверяемся с семейством из chatType/platform:
+      chatType='whatsapp' + единственный whatsapp-канал → 'waba';
+      chatType='telegram'/'max' → соответствующее имя.
+    Если каналов семейства ровно один (обычный случай) — берём его.
+    """
+    if not value:
+        return None
+    raw = str(value).split("@", 1)[0].split(":", 1)[0].strip()
+    if not raw or not re.fullmatch(r"\d{5,15}", raw):
+        return None
+    num = normalize_phone(raw)
+    if not num:
+        return None
+    if num not in _PLAINID_NAME_CACHE:
+        _fetch_channels_cached()
+    names = _PLAINID_NAME_CACHE.get(num)
+    if not names:
+        return None
+    if len(names) == 1:
+        return names[0]
+
+    # Несколько каналов на одном номере → решает семейство из payload'а.
+    ct = (chat_type or "").lower().strip()
+    if ct in ("telegram", "tg", "tgapi"):
+        family = "telegram"
+    elif ct in ("max", "vk", "maxapi"):
+        family = "max"
+    elif ct in ("whatsapp", "waba", "whatsgroup", "whapi"):
+        family = "whatsapp"
+    else:
+        family = ""
+    if family:
+        cands = [n for n in names if _FAMILY_OF_NAME.get(n) == family]
+        if len(cands) == 1:
+            return cands[0]
+        # Внутри семейства неоднозначность (WABA И Personal на одном
+        # номере) — такие каналы различимы только по channelId, которого
+        # нет. Отдаём 'whatsapp': sender проверяет halt по 'waba', но
+        # иначе мы бы записали доставку в канал, которым не отправляли.
+        if cands:
+            return "whatsapp" if "whatsapp" in cands else cands[0]
+    return None
 
 
 def normalize_phone(phone) -> str:
@@ -463,6 +659,87 @@ def active_channels() -> list[str]:
     return result
 
 
+def fetch_waba_tier() -> Optional[int]:
+    """Текущий tier WABA из GET /v3/channels. None — если данных нет.
+
+    Нужен как независимый источник: tier приходит событием
+    `channel.waba_tier_update`, то есть через вебхук. Если вебхук не поднят
+    или работает на устаревшем коде, система годами считает tier 0 и живёт
+    по капу 250/день, хотя баланс давно пополнен (реальный случай 2026-10-07).
+    """
+    cid = channel_id_for("waba")
+    if not cid:
+        return None
+    url = config.WAZZUP_BASE_URL + config.WAZZUP_CHANNELS_PATH
+    try:
+        r = requests.get(url, headers=_headers(), params={"channelId": cid},
+                         timeout=15)
+        if r.status_code >= 400:
+            return None
+        data = r.json()
+    except Exception:
+        return None
+    items = data.get("data") if isinstance(data, dict) else data
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return None
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("id") or it.get("channelId") or "") != cid:
+            continue
+        for key in ("wabaTier", "tier", "waTier"):
+            v = it.get(key)
+            if v is not None and str(v).isdigit():
+                return int(v)
+        # Иногда tier лежит во вложенном объекте лимитов.
+        for key in ("wabaLimits", "limits", "meta"):
+            sub = it.get(key)
+            if isinstance(sub, dict):
+                for k2 in ("tier", "wabaTier"):
+                    v = sub.get(k2)
+                    if v is not None and str(v).isdigit():
+                        return int(v)
+    return None
+
+
+def refresh_waba_tier(force: bool = False) -> Optional[int]:
+    """Обновляет tier в state (раз в WABA_TIER_REFRESH_HOURS). Возвращает tier.
+
+    Вебхук остаётся основным путём, но не единственным: он может быть
+    мёртв, и тогда мы не должны верить устаревшему tier.
+    """
+    from . import state as _state
+    try:
+        st = _state.load_state()
+    except Exception:
+        return None
+    cur = int(st.get("waba_tier", config.WAZZUP_TIER_DEFAULT))
+    updated_at = st.get("waba_tier_updated_at") or ""
+    if not force and updated_at:
+        try:
+            age_h = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(updated_at)
+            ).total_seconds() / 3600.0
+            if age_h < int(getattr(config, "WABA_TIER_REFRESH_HOURS", 12)):
+                return cur
+        except Exception:
+            pass
+    tier = fetch_waba_tier()
+    if tier is None:
+        return cur
+    if tier != cur:
+        _state.set_waba_tier(tier)
+    else:
+        # Даже без изменения освежаем метку времени: значит проверка прошла.
+        st["waba_tier"] = tier
+        st["waba_tier_updated_at"] = datetime.now(timezone.utc).isoformat()
+        _state.save_state(st)
+    return tier
+
+
 # Map bulkmessage channel name → Wazzup chatType для /v3/message
 CHANNEL_TO_CHAT_TYPE = {
     "telegram": "telegram",
@@ -501,8 +778,29 @@ def send_to_channel(
     elif chat_type == "whatsapp":
         chat_id = normalize_phone(phone) or phone
     else:
-        # TG/MAX — chat_id обычно равен phone, без нормализации
+        # TG/MAX — chat_id НЕ равен номеру телефона (это peer id внутри
+        # Telegram). Номер надо отдать в поле `phone`, тогда Wazzup сам
+        # резолвит его в настоящий chatId и вернёт его в ответе.
         chat_id = phone
+
+    use_phone_param = channel in set(
+        getattr(config, "WAZZUP_PHONE_PARAM_CHANNELS", ("telegram",)) or ()
+    )
+    if use_phone_param:
+        digits = normalize_phone(phone)
+        if not digits:
+            return False, None, "phone normalization produced empty phone", None
+        return send_wazzup(
+            channel_id=channel_id,
+            phone=digits,
+            chat_id=None,
+            text=text,
+            chat_type=chat_type,
+            template_id=template_id,
+            template_values=template_values,
+            request_id=request_id,
+        )
+
     if not chat_id:
         return False, None, "phone normalization produced empty chat_id", None
     return send_wazzup(

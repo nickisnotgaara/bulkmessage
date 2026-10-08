@@ -1,0 +1,56 @@
+{
+  "_comment": "Реальные payload'ы боевого вебхука, снятые 2026-10-06 с /tmp/webhook_new.log. Используются контрактными тестами: код обязан разбирать ИМЕННО такую форму, иначе подтверждения доставки теряются молча.",
+  "statuses_envelope": {
+    "statuses": [
+      {
+        "messageId": "2d67373b-63f7-43fb-aec0-10c907981b4d",
+        "timestamp": "2026-10-06T16:10:47.190Z",
+        "status": "delivered"
+      }
+    ]
+  },
+  "messages_envelope_waba": {
+    "messages": [
+      {
+        "messageId": "862caeed-05e8-4b9d-82ec-04ee8bea93a0",
+        "dateTime": "2026-10-06T16:12:55.818Z",
+        "chatId": "79001234567@c.us",
+        "chatType": "whatsapp",
+        "channelId": "14058d25-0705-421e-9d78-0eb2f1c0d667",
+        "text": "эхо нашего сообщения"
+      }
+    ]
+  },
+  "messages_envelope_telegram": {
+    "messages": [
+      {
+        "messageId": "4569dacb-1111-4222-8333-444455556666",
+        "dateTime": "2026-10-06T16:12:22.000Z",
+        "chatId": "1473000000",
+        "chatType": "telegram",
+        "channelId": "1c2ef310-836a-4c16-8f1e-387579ae8146",
+        "text": "входящее в наш канал"
+      }
+    ]
+  },
+  "statuses_without_channelId": {
+    "_comment": "Ключевая особенность контракта: в статус-событии НЕТ ни channelId, ни chatType. 0 из 1321 боевых событий их содержали. Канал обязан браться из строки БД по messageId.",
+    "statuses": [
+      {
+        "messageId": "862caeed-05e8-4b9d-82ec-04ee8bea93a0",
+        "timestamp": "2026-10-06T16:13:02.000Z",
+        "status": "read"
+      }
+    ]
+  },
+  "error_status_with_detail": {
+    "statuses": [
+      {
+        "messageId": "7c1f0000-0000-4000-8000-000000000001",
+        "timestamp": "2026-10-06T16:14:00.000Z",
+        "status": "error",
+        "detail": "CHANNEL_MAX_PHONE_NOT_OCCUPIED"
+      }
+    ]
+  }
+}

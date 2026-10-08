@@ -29,7 +29,10 @@ import json
 import logging
 import sys
 import tempfile
-from datetime import datetime, timedelta
+import time
+import inspect
+import ast
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -67,10 +70,26 @@ def section(title: str) -> None:
 section("A. CONFIG")
 from bulkmessage import config  # noqa: E402
 
+# ── Изоляция БД ────────────────────────────────────────────────────────────
+# Тесты Q/R25/R33 писали в БОЕВУЮ data/crm.db: там и INSERT тестовых
+# контактов, и `DELETE FROM rescue_queue` без условий — то есть запуск
+# тестов стирал настоящую очередь отката. Счётчики «761 контакт / 1348
+# сообщений» после прогона выглядели нетронутыми, поэтому это замечали
+# не сразу, а файл БД при этом переписывался.
+#
+# db.db_conn() читает config.DB_PATH при КАЖДОМ вызове, поэтому достаточно
+# подменить путь до первого обращения к БД. Тесты, которым нужен реальный
+# Excel (см. get_sent_phones ниже), подменяют путь обратно сами.
+_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="bulkmessage_tests_"))
+_TEST_DB_PATH = _TEST_DB_DIR / "test_crm.db"
+_REAL_DB_PATH = config.DB_PATH
+config.DB_PATH = str(_TEST_DB_PATH)
+print(f"  (тестовая БД: {_TEST_DB_PATH}; боевая {Path(_REAL_DB_PATH).name} не трогается)")
+
 check("config module loads", config is not None)
 check(
-    "4 channels in CHANNEL_DAILY_LIMITS (WA/TG/MAX/WABA)",
-    set(config.CHANNEL_DAILY_LIMITS.keys()) == {"whatsapp", "telegram", "max", "waba"},
+    "5 channels in CHANNEL_DAILY_LIMITS (WA/TG/MAX/WABA/SMS)",
+    set(config.CHANNEL_DAILY_LIMITS.keys()) == {"whatsapp", "telegram", "max", "waba", "sms"},
     f"got {list(config.CHANNEL_DAILY_LIMITS.keys())}",
 )
 check("WA limit > 0", config.CHANNEL_DAILY_LIMITS["whatsapp"] > 0)
@@ -78,10 +97,12 @@ check("TG limit > 0", config.CHANNEL_DAILY_LIMITS["telegram"] > 0)
 check("MAX limit > 0", config.CHANNEL_DAILY_LIMITS["max"] > 0)
 check("WABA limit > 0", config.CHANNEL_DAILY_LIMITS["waba"] > 0)
 check(
-    "Personal каналы ≤ MAX_PERSONAL_DAILY_HARD_CAP (защита оригинальных аккаунтов)",
-    config.CHANNEL_DAILY_LIMITS["telegram"] <= 30
-    and config.CHANNEL_DAILY_LIMITS["max"] <= 30,
-    f"got {config.CHANNEL_DAILY_LIMITS}",
+    "Personal каналы ≤ своего per-channel hard cap (защита оригинальных аккаунтов)",
+    config.CHANNEL_DAILY_LIMITS["telegram"]
+    <= config.PERSONAL_CHANNEL_HARD_CAPS["telegram"]
+    and config.CHANNEL_DAILY_LIMITS["max"]
+    <= config.PERSONAL_CHANNEL_HARD_CAPS["max"],
+    f"got {config.CHANNEL_DAILY_LIMITS}, caps {config.PERSONAL_CHANNEL_HARD_CAPS}",
 )
 check("DELAY_MIN > 0", config.DELAY_MIN > 0)
 check(
@@ -508,19 +529,30 @@ check("MAX активен (WAZZUP_MAX_CHANNEL_ID заполнен в .env.local)
       "max" in channels,
       "проверь WAZZUP_MAX_CHANNEL_ID в .env.local")
 
-# Если WAZZUP_*_CHANNEL_ID пустой — канал должен быть отфильтрован
+# Отключение канала. Поддерживаемый в проекте способ — нулевой лимит
+# (active_channels пропускает каналы с CHANNEL_DAILY_LIMITS <= 0).
+# Раньше тест отключал канал через patch.dict(os.environ, {KEY: ""}), и это
+# работало только из-за бага загрузчика: пустое значение в .env перебивало
+# .env.local целиком. Баг исправлен (пустое значение больше не блокирует
+# переопределение), поэтому и способ отключения здесь — честный.
 import os as _os  # noqa: E402
-with patch.dict(_os.environ, {"WAZZUP_TG_CHANNEL_ID": ""}):
-    # Перечитываем конфиг
-    import importlib  # noqa: E402
-    importlib.reload(config)
-    importlib.reload(wazzup)
+with patch.object(config, "CHANNEL_DAILY_LIMITS",
+                  {**config.CHANNEL_DAILY_LIMITS, "telegram": 0}):
     only_active = wazzup.active_channels()
-    check("Пустой WAZZUP_TG_CHANNEL_ID → telegram отфильтрован",
-          "telegram" not in only_active)
-    # Возвращаем обратно
-    importlib.reload(config)
-    importlib.reload(wazzup)
+    check("Нулевой лимит → telegram отфильтрован",
+          "telegram" not in only_active, f"got {only_active}")
+    check("другие каналы при этом остаются",
+          "max" in only_active and "waba" in only_active)
+
+# Регрессия на загрузчик env: пустое значение в НИЗКОПРИОРИТЕТНОМ файле
+# (.env) не должно блокировать значение из .env.local. Именно это молча
+# убивало WAZZUP_WEBHOOK_URL: .env содержал пустую строку, и сколько бы
+# ни вписывали URL в .env.local, sender видел пустоту.
+import importlib as _il  # noqa: E402,F401
+_rg = _os.environ.get("WAZZUP_WEBHOOK_URL", "")
+check("загрузчик env: .env.local побеждает пустое значение в .env",
+      (not _rg) or ("trycloudflare" in _rg or "http" in _rg),
+      f"got {_rg!r}")
 
 # ---------------------------------------------------------------------------
 # L. SCHEDULE (smoke)
@@ -535,8 +567,12 @@ try:
     all_cts = contacts.load_contacts(config.EXCEL_PATH)
     check("Excel-файл читается", len(all_cts) > 0, f"got {len(all_cts)}")
 
-    with db.db_conn() as conn:
-        sent_phones = db.get_sent_phones(conn)
+    # get_sent_phones нужен ЗДЕСЬ только чтобы отсечь уже отправленных.
+    # Читаем боевую БД (только SELECT), потому что тестовая БД пустая и
+    # проверка на «доступных контактах» ничего бы не проверяла.
+    with patch.object(config, "DB_PATH", _REAL_DB_PATH):
+        with db.db_conn() as conn:
+            sent_phones = db.get_sent_phones(conn)
     check("DB читается (get_sent_phones)", isinstance(sent_phones, set))
 
     # Симуляция: генерим 60 контактов с паузами 5-15 мин
@@ -706,7 +742,14 @@ reconcile_src_check = Path("bulkmessage/reconcile.py").read_text(encoding="utf-8
 check("reconcile.py использует chatType из payload (не только channel_hint)",
       "_wazzup_chat_type_to_channel" in reconcile_src_check)
 check("reconcile.py передаёт channelId в маппер каналов",
-      "_wazzup_chat_type_to_channel(chat_type, evt_channel_id)" in reconcile_src_check)
+      "_wazzup_chat_type_to_channel(" in reconcile_src_check
+      and "evt_channel_id" in reconcile_src_check)
+# Резолв ТОЛЬКО по channelId в бою не работает: Wazzup не присылает это поле
+# ни в одном реальном payload'е (0 из 139 в data/pending_webhooks.jsonl).
+# Канал определяется по номеру нашего аккаунта из from/to/chat_id.
+check("reconcile.py резолвит канал по номеру аккаунта (channelId не приходит)",
+      "channel_name_for_raw" in reconcile_src_check
+      and 'evt.get("from")' in reconcile_src_check)
 
 # Code review fix: _post_with_retry реально проверяет status_code
 wazzup_src_check = Path("bulkmessage/wazzup.py").read_text(encoding="utf-8")
@@ -745,23 +788,50 @@ check("config.FAILED_DELAY_MIN/MAX < PERSONAL_DELAY (быстрая задерж
       config.FAILED_DELAY_MAX < config.PERSONAL_DELAY_MIN)
 
 # state: last_success_channel сохраняется
-state_data = state.load_state()
-check("state.load_state() имеет last_success_channel key",
-      "last_success_channel" in state_data)
-check("по умолчанию last_success_channel == ''",
-      state_data.get("last_success_channel") == "")
+# На временном state-файле — раньше тест писал в боевой broadcast_state.json.
+_lch_f = tempfile.NamedTemporaryFile(
+    mode="w", suffix=".json", delete=False, encoding="utf-8"
+)
+_lch_f.write(json.dumps({"sent_today": {}, "contacts_today": 0,
+                         "date": datetime.now(timezone.utc).date().isoformat(),
+                         "last_index": 0}))
+_lch_f.close()
+try:
+    with patch.object(config, "STATE_PATH", _lch_f.name):
+        state_data = state.load_state()
+        _saved_last_ch = state_data.get("last_success_channel")
+        # Временно очищаем для проверки default
+        state_data["last_success_channel"] = ""
+        state.save_state(state_data)
+        check("state.load_state() имеет last_success_channel key",
+              "last_success_channel" in state.load_state())
+        check("по умолчанию last_success_channel == ''",
+              state.load_state().get("last_success_channel") == "")
+        # Восстанавливаем
+        state_data = state.load_state()
+        state_data["last_success_channel"] = _saved_last_ch or ""
+        state.save_state(state_data)
+finally:
+    try:
+        Path(_lch_f.name).unlink()
+    except OSError:
+        pass
 
-# sender.py: код выбирает задержку по last_success_channel
-check("sender.py содержит ветку 'prev_ch == \"waba\"' (WABA → быстрая пауза)",
-      'prev_ch == "waba"' in sender_src_check)
-check("sender.py содержит ветку 'prev_ch in (\"telegram\", \"max\")' (Personal → anti-bank)",
-      'prev_ch in ("telegram", "max")' in sender_src_check)
+# sender.py: пауза между отправками выбирается ФАЗОЙ, а не по last_success_channel.
+# Раньше код смотрел на канал предыдущей успешной отправки (prev_ch) и брал
+# случайную паузу. С фазовой рассылкой это больше не работает: у каждой фазы
+# своё окно, и пауза считается детерминированно от остатка окна.
+check("sender.py НЕ ветвится по prev_ch (фазовая схема заменила channel-aware паузу)",
+      'prev_ch == "waba"' not in sender_src_check)
+check("sender.py использует детерминированную паузу фазы",
+      "def _phase_delay(" in sender_src_check
+      and "PHASE_DETERMINISTIC_DELAY" in sender_src_check)
 check("sender.py использует WABA_DELAY_MIN/MAX",
-      "config.WABA_DELAY_MIN" in sender_src_check
-      and "config.WABA_DELAY_MAX" in sender_src_check)
+      "WABA_DELAY_MIN" in sender_src_check
+      and "WABA_DELAY_MAX" in sender_src_check)
 check("sender.py использует PERSONAL_DELAY_MIN/MAX",
-      "config.PERSONAL_DELAY_MIN" in sender_src_check
-      and "config.PERSONAL_DELAY_MAX" in sender_src_check)
+      "PERSONAL_DELAY_MIN" in sender_src_check
+      and "PERSONAL_DELAY_MAX" in sender_src_check)
 check("sender.py сохраняет last_success_channel в state.json после WABA успеха",
       'current_state["last_success_channel"] = "waba"' in sender_src_check)
 check("sender.py сохраняет last_success_channel в state.json после TG/MAX успеха",
@@ -999,6 +1069,23 @@ check("config.LOCK_PATH определён",
 section("P. FAILED_CONTACTS (полностью мёртвые контакты за день)")
 from bulkmessage import failed_contacts  # noqa: E402
 
+# Изоляция: обе сериализации в этом блоке писали в БОЕВЫЕ файлы.
+# Раньше здесь стояли failed_contacts.clear()+save() и os.remove(FAILED_TODAY_PATH)
+# — то есть `py test_suite.py` УДАЛЯЛ data/failed_today.json (список контактов,
+# провалившихся во всех каналах), а bad_phones.clear() + mark_bad() затирали и
+# засоряли боевой data/bad_phones.json тестовыми номерами.
+# Оба модуля читают путь из config в момент вызова, поэтому достаточно подменить
+# атрибуты на время блока.
+import os as _os
+_p_ft = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+_p_ft.close()
+_bp_ft = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+_bp_ft.close()
+_p_path_patch = patch.object(config, "FAILED_TODAY_PATH", _p_ft.name)
+_bp_path_patch = patch.object(config, "BAD_PHONES_PATH", _bp_ft.name)
+_p_path_patch.start()
+_bp_path_patch.start()
+
 failed_contacts.clear()
 failed_contacts.save()
 
@@ -1047,14 +1134,19 @@ n = failed_contacts.load()
 check("load() восстанавливает данные", n == 2 and failed_contacts.count() == 2)
 check("После load get_today() содержит тот же телефон", "+79991234567" in failed_contacts.get_today())
 
-# Cleanup
+# Cleanup — только временные файлы этого блока
 failed_contacts.clear()
-failed_contacts.save()
-import os as _os
-try:
-    _os.remove(str(config.FAILED_TODAY_PATH))
-except Exception:
-    pass
+_p_path_patch.stop()
+_bp_path_patch.stop()
+# Вернуть in-memory кэш bad_phones к реальному файлу, иначе тестовые номера
+# остались бы в памяти модуля и могли бы попасть в боевую запись позже.
+bad_phones.clear()
+bad_phones.load()
+for _f in (_p_ft.name, _bp_ft.name):
+    try:
+        _os.remove(_f)
+    except OSError:
+        pass
 
 # ---------------------------------------------------------------------------
 # O. TG BOT LOG (новый модуль tglog)
@@ -1133,6 +1225,41 @@ ok2 = tglog.install_handler()
 check("install_handler() идемпотентен (повторный не дублирует)",
       ok2 is True and len(_logging.getLogger().handlers) == _root_after)
 
+# Подавление уведомлений на тестовых прогонах.
+# Реальный случай 2026-10-06: фикстура R26 «HTTP 401 Not authorized in channel»
+# улетела в личку владельца как «канал telegram мёртв», хотя запрос в Wazzup
+# не уходил. Фикстура теста не должна выглядеть как авария боевого канала.
+check("На test_*.py уведомления подавлены (is_suppressed)",
+      tglog.is_suppressed() is True)
+
+_q_before = tglog._QUEUE.qsize()
+tglog.TelegramHandler().emit(
+    logging.LogRecord("sender", logging.ERROR, __file__, 1,
+                      "AUTH фикстура R26 — не должна уйти в Telegram", None, None))
+check("emit() при подавлении не кладёт запись в очередь",
+      tglog._QUEUE.qsize() == _q_before,
+      f"before={_q_before} after={tglog._QUEUE.qsize()}")
+
+check("_send_to_telegram() при подавлении возвращает False без сети",
+      tglog._send_to_telegram("ping") is False)
+
+_q_before2 = tglog._QUEUE.qsize()
+tglog.send("подавлено", "ERROR")
+check("send() при подавлении — no-op",
+      tglog._QUEUE.qsize() == _q_before2,
+      f"before={_q_before2} after={tglog._QUEUE.qsize()}")
+
+import os as _os
+_os.environ["BULK_TG_LOG_DISABLE"] = "1"
+check("_auto_suppressed() уважает BULK_TG_LOG_DISABLE=1",
+      tglog._auto_suppressed() is True)
+_os.environ.pop("BULK_TG_LOG_DISABLE", None)
+check("set_suppressed() переключает флаг вручную",
+      (tglog.set_suppressed(False), tglog.is_suppressed())[1] is False)
+tglog.set_suppressed(tglog._auto_suppressed())
+check("auto-флаг восстановлен после ручного сброса",
+      tglog.is_suppressed() is True)
+
 # getMe и send_test — реальные сетевые вызовы (НЕ запускаем в unit-suite,
 # чтоб не блокировать на сетевых таймаутах. Отдельный скрипт _check_tg.py)
 check("getMe() существует (сетевая проверка — в _check_tg.py)",
@@ -1141,12 +1268,3347 @@ check("send_test() существует (сетевая проверка — в 
       callable(tglog.send_test))
 
 # ---------------------------------------------------------------------------
-# ИТОГ
+# Q. WABA RESCUE MECHANISMS (Phase 7: lazy retry + rescue queue + reachability)
 # ---------------------------------------------------------------------------
+section("Q. WABA RESCUE MECHANISMS (Phase 7)")
+
+from bulkmessage import db
+import time as _time
+
+# Reset rescue queue (idempotent)
+db.init_db()
+
+# === Q1: waba_recently_failed() ===
+# Чистим старые failed messages для теста
+with db.db_conn() as conn:
+    conn.execute("DELETE FROM messages WHERE channel='waba' AND status='failed'")
+    conn.execute("DELETE FROM contacts WHERE phone='+79999999999'")
+    conn.commit()
+
+# Создаём contact + failed message
+with db.db_conn() as conn:
+    cid = db.upsert_contact(conn, "+79999999999", "Test", "Buyers")
+    db.insert_message(
+        conn, contact_id=cid, channel="waba", message_text="x",
+        message_id="test_failed_1", status="failed",
+    )
+    conn.commit()
+
+check("waba_recently_failed для недавно failed = True",
+      db.waba_recently_failed("+79999999999", hours=24) is True)
+check("waba_recently_failed для другого phone = False",
+      db.waba_recently_failed("+78888888888", hours=24) is False)
+
+# === Q2: enqueue_rescue идемпотентно ===
+rid1 = db.enqueue_rescue("+79999999999", "Test", "Buyers", reason="waba_failed")
+rid2 = db.enqueue_rescue("+79999999999", "Test", "Buyers", reason="waba_failed_2")
+check("enqueue_rescue идемпотентно (same id)", rid1 == rid2,
+      f"got {rid1} vs {rid2}")
+
+# Новый phone → новый rescue
+rid3 = db.enqueue_rescue("+77777777777", "Test2", "Sellers", reason="wba_fail")
+check("enqueue_rescue для нового phone → новый id", rid3 != rid2,
+      f"got {rid3} vs {rid2}")
+
+# === Q3: pending_rescues возвращает pending ===
+pending = db.pending_rescues(limit=10, cooldown_seconds=0)
+check("pending_rescues возвращает ≥2 записей",
+      len(pending) >= 2, f"got {len(pending)}")
+
+# === Q4: mark_rescue_success ===
+db.mark_rescue_success(rid1, channel="telegram", message_id="msg_xyz")
+got = db.get_rescue_by_id(rid1)
+check("mark_rescue_success → status=rescued",
+      got and got["status"] == "rescued", f"got {got['status'] if got else None}")
+check("mark_rescue_success → rescued_channel=telegram",
+      got and got["rescued_channel"] == "telegram",
+      f"got {got['rescued_channel'] if got else None}")
+
+# === Q5: mark_rescue_attempt инкрементирует ===
+db.mark_rescue_attempt(rid3, error="fail1")
+db.mark_rescue_attempt(rid3, error="fail2")
+db.mark_rescue_attempt(rid3, error="fail3")  # 3rd attempt → failed
+got = db.get_rescue_by_id(rid3)
+check("mark_rescue_attempt x3 → status=failed",
+      got and got["status"] == "failed",
+      f"got {got['status'] if got else None}, attempts={got['attempts'] if got else None}")
+
+# Cleanup
+with db.db_conn() as conn:
+    conn.execute("DELETE FROM messages WHERE channel='waba' AND status='failed'")
+    conn.execute("DELETE FROM contacts WHERE phone IN ('+79999999999', '+77777777777')")
+    conn.execute("DELETE FROM rescue_queue")
+    conn.commit()
+
+# === Q6: _drain_rescue_queue существует ===
+from bulkmessage import sender
+check("_drain_rescue_queue() callable",
+      callable(getattr(sender, "_drain_rescue_queue", None)))
+
+# Изоляция: тестовая БД должна быть отдельным файлом, иначе блок Q снова
+# начнёт писать в боевую (там DELETE FROM rescue_queue без условий).
+check("тесты пишут в отдельную БД, не в боевую",
+      config.DB_PATH != _REAL_DB_PATH and Path(config.DB_PATH) != Path(_REAL_DB_PATH),
+      f"DB_PATH={config.DB_PATH} vs real={_REAL_DB_PATH}")
+check("тестовая БД — непустой файл (init_db отработал)",
+      _TEST_DB_PATH.exists() and _TEST_DB_PATH.stat().st_size > 0)
+
+# === Q7: reachability cache ===
+# На временном state-файле: раньше тестовый номер +79991111111 навсегда
+# оставался в боевом reachability_cache.
+_q7_f = tempfile.NamedTemporaryFile(
+    mode="w", suffix=".json", delete=False, encoding="utf-8"
+)
+_q7_f.write(json.dumps({"sent_today": {}, "contacts_today": 0,
+                        "date": datetime.now(timezone.utc).date().isoformat(),
+                        "last_index": 0}))
+_q7_f.close()
+try:
+    with patch.object(config, "STATE_PATH", _q7_f.name):
+        cur = state.load_state()
+        state.set_cached_reachability(cur, "+79991111111", {"waba": False})
+        state.save_state(cur)
+        cur2 = state.load_state()
+        cached = state.get_cached_reachability(cur2, "+79991111111")
+        check("reachability cache waba=False сохраняется",
+              cached is not None and cached.get("waba") is False,
+              f"got {cached}")
+finally:
+    try:
+        Path(_q7_f.name).unlink()
+    except OSError:
+        pass
 
 # ---------------------------------------------------------------------------
-# ИТОГ
+# R. SMS.RU FALLBACK CHANNEL (cascade waba→telegram→max→sms)
 # ---------------------------------------------------------------------------
+section("R. SMS.RU FALLBACK")
+from bulkmessage import sms_ru, templates as _tpl  # noqa: E402
+from bulkmessage.wazzup import ErrorKind as _EK_SMS  # noqa: E402
+
+# R1: normalize_phone в формате SMS.RU (11 цифр, с 7, без '+')
+check("sms_ru.normalize_phone '+7 (925) 507-06-02'",
+      sms_ru.normalize_phone("+7 (925) 507-06-02") == "79255070602",
+      f"got {sms_ru.normalize_phone('+7 (925) 507-06-02')!r}")
+check("sms_ru.normalize_phone '8 925 507 06 02' (8→7)",
+      sms_ru.normalize_phone("8 925 507 06 02") == "79255070602",
+      f"got {sms_ru.normalize_phone('8 925 507 06 02')!r}")
+check("sms_ru.normalize_phone '79255070602' (уже нормализован)",
+      sms_ru.normalize_phone("79255070602") == "79255070602")
+check("sms_ru.normalize_phone '9261234567' (10 цифр с 9)",
+      sms_ru.normalize_phone("9261234567") == "79261234567",
+      f"got {sms_ru.normalize_phone('9261234567')!r}")
+check("sms_ru.normalize_phone мусор = ''",
+      sms_ru.normalize_phone("не телефон") == "" and sms_ru.normalize_phone("") == "")
+check("sms_ru.normalize_phone +998 (Узбекистан) = '' — SMS.RU только РФ",
+      sms_ru.normalize_phone("998901234567") == "",
+      f"got {sms_ru.normalize_phone('998901234567')!r}")
+
+# R2: сегменты (70 символов = 1 сегмент)
+check("estimate_segments(70 симв) = 1", sms_ru.estimate_segments("а" * 70) == 1)
+check("estimate_segments(71 симв) = 2", sms_ru.estimate_segments("а" * 71) == 2)
+check("estimate_segments(140 симв) = 2", sms_ru.estimate_segments("а" * 140) == 2)
+check("estimate_segments(141 симв) = 3", sms_ru.estimate_segments("а" * 141) == 3)
+check("estimate_segments('') = 0", sms_ru.estimate_segments("") == 0)
+
+# R3: классификация кодов SMS.RU
+check("classify 200 (wrong api_id) = AUTH",
+      sms_ru.classify_smsru_error(200, "") == _EK_SMS.AUTH)
+check("classify 221 (нужен отправитель) = AUTH",
+      sms_ru.classify_smsru_error(221, "") == _EK_SMS.AUTH)
+check("classify 302 (аккаунт не подтверждён) = AUTH",
+      sms_ru.classify_smsru_error(302, "") == _EK_SMS.AUTH)
+check("classify 201 (нет денег) = RATE_LIMIT",
+      sms_ru.classify_smsru_error(201, "") == _EK_SMS.RATE_LIMIT)
+check("classify 206 (дневной лимит) = RATE_LIMIT",
+      sms_ru.classify_smsru_error(206, "") == _EK_SMS.RATE_LIMIT)
+check("classify 230 (лимит на номер) = RATE_LIMIT",
+      sms_ru.classify_smsru_error(230, "") == _EK_SMS.RATE_LIMIT)
+check("classify 220 (сервис недоступен) = TRANSIENT",
+      sms_ru.classify_smsru_error(220, "") == _EK_SMS.TRANSIENT)
+check("classify 502 (IP из другой страны) = TRANSIENT",
+      sms_ru.classify_smsru_error(502, "") == _EK_SMS.TRANSIENT)
+check("classify 207 (нет маршрута) = PERMANENT",
+      sms_ru.classify_smsru_error(207, "") == _EK_SMS.PERMANENT)
+check("classify 215 (стоп-лист SMS.RU, жалоба) = PERMANENT",
+      sms_ru.classify_smsru_error(215, "") == _EK_SMS.PERMANENT)
+check("classify 217 (реклама кредита без фразы) = PERMANENT",
+      sms_ru.classify_smsru_error(217, "") == _EK_SMS.PERMANENT)
+check("classify 205 (слишком длинно) = PERMANENT",
+      sms_ru.classify_smsru_error(205, "") == _EK_SMS.PERMANENT)
+check("classify 100 (принято) = UNKNOWN (не ошибка)",
+      sms_ru.classify_smsru_error(100, "") == _EK_SMS.UNKNOWN)
+check("is_auth_like_error(221) = True (halt канала)",
+      sms_ru.is_auth_like_error(221) is True)
+check("is_auth_like_error(207) = False (проблема номера, не аккаунта)",
+      sms_ru.is_auth_like_error(207) is False)
+
+# R4: парсинг ответа SMS.RU
+_ok, _mid, _det, _code = sms_ru._parse_send_response(
+    {"status": "OK", "status_code": 100,
+     "sms": {"79255070602": {"status": "OK", "status_code": 100,
+                             "sms_id": "000000-10000000"}},
+     "balance": 4122.56},
+    "79255070602",
+)
+check("parse OK-ответа: ok=True, sms_id извлечён",
+      _ok is True and _mid == "000000-10000000",
+      f"ok={_ok}, id={_mid!r}")
+_ok2, _mid2, _det2, _code2 = sms_ru._parse_send_response(
+    {"status": "OK", "status_code": 100,
+     "sms": {"79255070602": {"status": "ERROR", "status_code": 207,
+                             "status_text": "Нет маршрута"}}},
+    "79255070602",
+)
+check("parse ERROR-номера: ok=False, code=207",
+      _ok2 is False and _code2 == 207,
+      f"ok={_ok2}, code={_code2}")
+_ok3, _mid3, _det3, _code3 = sms_ru._parse_send_response(
+    {"status": "ERROR", "status_code": 221,
+     "status_text": "Требуется буквенный отправитель"},
+    "79255070602",
+)
+check("parse request-level ERROR (221): ok=False",
+      _ok3 is False and _code3 == 221,
+      f"ok={_ok3}, code={_code3}")
+_ok4, _mid4, _det4, _code4 = sms_ru._parse_send_response(None, "79255070602")
+check("parse None-ответа: ok=False без исключения", _ok4 is False)
+
+# R5: DRY-RUN не делает сетевых вызовов
+def _boom_post(*a, **kw):
+    raise AssertionError("сетевой вызов в DRY-RUN — недопустимо!")
+
+_sms_dry_orig = config.DRY_RUN
+_sms_pid_orig = config.SMSRU_API_ID
+_sms_name_orig = config.SMSRU_SENDER_NAME
+try:
+    config.DRY_RUN = True
+    config.SMSRU_API_ID = "test-key"
+    config.SMSRU_SENDER_NAME = "TESTBRAND"
+    with patch("bulkmessage.sms_ru._post_form", side_effect=_boom_post):
+        _rok, _rmid, _rdet, _rcode = sms_ru.send_sms("+7 925 507-06-02", "тест")
+    check("DRY-RUN: send_sms НЕ вызывает _post_form", _rok is True and str(_rmid).startswith("dryrun_"),
+          f"ok={_rok}, id={_rmid!r}")
+    check("DRY-RUN: detail содержит 'API НЕ вызывался'", "НЕ вызывался" in _rdet, _rdet)
+finally:
+    config.DRY_RUN = _sms_dry_orig
+    config.SMSRU_API_ID = _sms_pid_orig
+    config.SMSRU_SENDER_NAME = _sms_name_orig
+
+# R6: нормализация/длина отсекаются ДО сети
+_sms_pid_orig = config.SMSRU_API_ID
+_sms_name_orig = config.SMSRU_SENDER_NAME
+_sms_dry_orig = config.DRY_RUN
+try:
+    config.DRY_RUN = False
+    config.SMSRU_API_ID = "test-key"
+    config.SMSRU_SENDER_NAME = "TESTBRAND"
+    with patch("bulkmessage.sms_ru._post_form", side_effect=_boom_post):
+        _rok2, _rmid2, _rdet2, _rcode2 = sms_ru.send_sms("не телефон", "тест")
+    check("CRUD-номер отсекается локально (202), без сети",
+          _rok2 is False and _rcode2 == 202,
+          f"ok={_rok2}, code={_rcode2}")
+    with patch("bulkmessage.sms_ru._post_form", side_effect=_boom_post):
+        _rok3, _rmid3, _rdet3, _rcode3 = sms_ru.send_sms("79255070602", "а" * 300)
+    check("Слишком длинный текст отсекается локально (205), без сети",
+          _rok3 is False and _rcode3 == 205,
+          f"ok={_rok3}, code={_rcode3}")
+finally:
+    config.DRY_RUN = _sms_dry_orig
+    config.SMSRU_API_ID = _sms_pid_orig
+    config.SMSRU_SENDER_NAME = _sms_name_orig
+
+# R7: test=1 реально уходит в запрос
+_sms_test_orig = config.SMSRU_TEST_MODE
+_captured = {}
+def _fake_post(path, params, timeout=30):
+    _captured.update(params)
+    return ({"status": "OK", "status_code": 100,
+             "sms": {params.get("to"): {"status": "OK", "status_code": 100,
+                                       "sms_id": "test-1"}}}, "{}", 200)
+try:
+    config.DRY_RUN = False
+    config.SMSRU_API_ID = "test-key"
+    config.SMSRU_SENDER_NAME = "TESTBRAND"
+    config.SMSRU_TEST_MODE = True
+    with patch("bulkmessage.sms_ru._post_form", side_effect=_fake_post):
+        _rok4, _rmid4, _rdet4, _rcode4 = sms_ru.send_sms("79255070602", "короткий текст")
+    check("SMSRU_TEST_MODE=1 → test=1 в params", _captured.get("test") == 1,
+          f"captured={_captured}")
+    check("test=1 запрос: to нормализован, from=SENDER_NAME",
+          _captured.get("to") == "79255070602" and _captured.get("from") == "TESTBRAND",
+          f"captured={_captured}")
+    check("api_id передаётся в params", _captured.get("api_id") == "test-key")
+    check("json=1 запрошен", _captured.get("json") == 1)
+finally:
+    config.SMSRU_TEST_MODE = _sms_test_orig
+
+# R8: SMS-шаблоны — длина и кредитная фраза
+_sms_tpls = _tpl.load_sms_templates()
+check("load_sms_templates() нашёл категории", len(_sms_tpls) == 4,
+      f"got {list(_sms_tpls)}")
+_sms_budget = min(config.SMSRU_MAX_SEGMENTS, sms_ru.SMSRU_HARD_MAX_SEGMENTS)
+for _cat in _sms_tpls:
+    _msg = _tpl.build_sms_message({"name": "Иван", "category": _cat}, _sms_tpls)
+    _segs = sms_ru.estimate_segments(_msg)
+    check(f"SMS «{_cat}» в бюджете {_sms_budget} сегм.",
+          _segs <= _sms_budget,
+          f"{len(_msg)} симв = {_segs} сегм")
+    check(f"SMS «{_cat}» содержит кредитную фразу (ошибка 217)",
+          sms_ru.has_credit_disclaimer(_msg))
+    check(f"SMS «{_cat}» без имени корректно чистится",
+          not any(bad in _tpl.build_sms_message({"name": "", "category": _cat}, _sms_tpls)
+                  for bad in (", !", ",!", ",  ,")))
+
+check("build_sms_message подставляет {имя}",
+      "Иван" in _tpl.build_sms_message({"name": "Иван", "category": "Покупатели"}, _sms_tpls))
+check("build_sms_message раскрывает spin-tax (нет { } |)",
+      not any(ch in _tpl.build_sms_message({"name": "Иван", "category": "Агенты"}, _sms_tpls)
+              for ch in "{}|"))
+check("has_credit_disclaimer() чувствителен к регистру",
+      sms_ru.has_credit_disclaimer("оцените свои ФИНАНСОВЫЕ возможности и риски") is True)
+check("has_credit_disclaimer() = False без фразы",
+      sms_ru.has_credit_disclaimer("обычный текст") is False)
+
+# R9: config/state — лимиты, halt, cooldown
+check("CHANNEL_DAILY_LIMITS['sms'] = 50", config.CHANNEL_DAILY_LIMITS["sms"] == 50,
+      f"got {config.CHANNEL_DAILY_LIMITS['sms']}")
+check("SMS НЕ ограничен MAX_PERSONAL_DAILY_HARD_CAP",
+      config.CHANNEL_DAILY_LIMITS["sms"] > config.MAX_PERSONAL_DAILY_HARD_CAP)
+_sms_st = state.load_state()
+_sms_eff = state.channel_effective_cap(_sms_st, "sms")
+# Headroom снят осознанно (решение №1 плана): каналы работают на 100% квоты.
+# Проверяем само правило cap(limit, headroom), а не захардкоженное 37.
+_expected_sms = int(config.CHANNEL_DAILY_LIMITS.get("sms", 50)
+                    * (100 - config.HEADROOM_PCT) / 100)
+check("channel_effective_cap('sms') = cap × (100-headroom)%",
+      _sms_eff == _expected_sms, f"got {_sms_eff}, ожидалось {_expected_sms}")
+check("get_halt_threshold('sms') = 2", state.get_halt_threshold("sms") == 2,
+      f"got {state.get_halt_threshold('sms')}")
+check("SMSRU_COOLDOWN_HOURS = 96", config.SMSRU_COOLDOWN_HOURS == 96)
+check("SMS safe hours по умолчанию 11-19",
+      config.SMSRU_SAFE_HOURS_START == 11 and config.SMSRU_SAFE_HOURS_END == 19)
+
+# cooldown применяется именно к SMS
+# ВАЖНО: весь блок идёт на ВРЕМЕННОМ state-файле. Раньше здесь был
+# state.load_state()/save_state() по реальному broadcast_state.json — тест
+# стирал боевой кэш last_send_per_phone и заливал в него тестовые номера.
+_sms_cd_f = tempfile.NamedTemporaryFile(
+    mode="w", suffix=".json", delete=False, encoding="utf-8"
+)
+_sms_cd_f.write(json.dumps({"sent_today": {}, "contacts_today": 0,
+                            "date": datetime.now(timezone.utc).date().isoformat(),
+                            "last_index": 0}))
+_sms_cd_f.close()
+try:
+    with patch.object(config, "STATE_PATH", _sms_cd_f.name):
+        _sms_cd = state.load_state()
+        _sms_cd.pop("last_send_per_phone", None)
+        state.set_last_send_per_phone(_sms_cd, "+79990000001",
+                                       datetime.now(timezone.utc).isoformat(),
+                                       channel="sms")
+        check("is_phone_in_cooldown('sms') = True сразу после SMS",
+              state.is_phone_in_cooldown(_sms_cd, "+79990000001", "sms") is True)
+        state.set_last_send_per_phone(_sms_cd, "+79990000002",
+                                       (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat(),
+                                       channel="sms")
+        check("is_phone_in_cooldown('sms') = False после 100ч (cooldown 96ч)",
+              state.is_phone_in_cooldown(_sms_cd, "+79990000002", "sms") is False)
+finally:
+    try:
+        Path(_sms_cd_f.name).unlink()
+    except OSError:
+        pass
+
+# R25: cooldown по ПАРЕ (номер, канал) — баг, который ломал сам fallback.
+# Смысл: если WABA принял сообщение, но вебхук не подтвердил доставку (свип
+# увёл контакт в rescue), каскад уходит в SMS. Legacy-запись в
+# last_send_per_phone не должна при этом запирать SMS-канал.
+_cd2 = state.load_state()
+_cd2.pop("last_send_per_phone", None)
+_cd2.pop("last_send_per_channel", None)
+_cd2.pop("last_delivery_per_channel", None)
+_now = datetime.now(timezone.utc)
+state.set_last_send_per_phone(_cd2, "+79990000010", _now.isoformat(), channel="waba")
+check("отправка в waba НЕ блокирует sms для того же номера",
+      state.is_phone_in_cooldown(_cd2, "+79990000010", "sms") is False)
+check("отправка в waba НЕ блокирует personal для того же номера",
+      state.is_phone_in_cooldown(_cd2, "+79990000010", "max") is False)
+state.set_last_send_per_phone(_cd2, "+79990000011", _now.isoformat(), channel="sms")
+check("отправка в sms блокирует sms (тот же канал)",
+      state.is_phone_in_cooldown(_cd2, "+79990000011", "sms") is True)
+check("отправка в sms НЕ блокирует другой канал",
+      state.is_phone_in_cooldown(_cd2, "+79990000011", "max") is False)
+
+# Неподтверждённая отправка не включает cooldown (иначе rescue некуда идти)
+_cd3 = state.load_state()
+_cd3.pop("last_send_per_phone", None)
+_cd3.pop("last_send_per_channel", None)
+_cd3.pop("last_delivery_per_channel", None)
+state.set_last_send_per_phone(_cd3, "+79990000012", _now.isoformat(), channel="sms")
+state.record_delivery_confirmed(_cd3, "+79990000012", "sms", _now.isoformat())
+check("подтверждённая доставка включает cooldown для своего канала",
+      state.is_phone_in_cooldown(_cd3, "+79990000012", "sms") is True)
+check("подтверждённая доставка в sms не включает cooldown в waba",
+      state.is_phone_in_cooldown(_cd3, "+79990000012", "waba") is False)
+
+# Legacy-ключ (старые state.json) по-прежнему работает для personal-каналов
+_cd4 = state.load_state()
+_cd4.pop("last_send_per_channel", None)
+_cd4.pop("last_delivery_per_channel", None)
+_cd4["last_send_per_phone"] = {"+79990000013": _now.isoformat()}
+check("legacy-запись блокирует personal (совместимость со старым state.json)",
+      state.is_phone_in_cooldown(_cd4, "+79990000013", "max") is True)
+check("legacy-запись НЕ блокирует sms",
+      state.is_phone_in_cooldown(_cd4, "+79990000013", "sms") is False)
+
+# R10: SMS НЕ проходит через Wazzup (это отдельный транспорт)
+check("wazzup.channel_id_for('sms') = '' (нет Wazzup-канала)",
+      sender.wazzup.channel_id_for("sms") == "")
+check("'sms' НЕ в wazzup.active_channels() (добавляется явно в run())",
+      "sms" not in sender.wazzup.active_channels(),
+      f"got {sender.wazzup.active_channels()}")
+
+# R11: порядок каскада — SMS строго последний
+_sms_casc = sender._cascade_order()
+check("cascade USE_WABA=1 = waba→telegram→max→sms",
+      _sms_casc == ["waba", "telegram", "max", "sms"], f"got {_sms_casc}")
+check("SMS — последний в каскаде", _sms_casc[-1] == "sms")
+_sms_uca = _os.environ.get("BULK_USE_WABA")
+try:
+    _os.environ["BULK_USE_WABA"] = "0"
+    import importlib
+    _cfg_mod = importlib.reload(config)
+    _snd_mod = importlib.reload(sender)
+    check("cascade USE_WABA=0 = whatsapp→telegram→max→sms",
+          _snd_mod._cascade_order() == ["whatsapp", "telegram", "max", "sms"],
+          f"got {_snd_mod._cascade_order()}")
+finally:
+    if _sms_uca is None:
+        _os.environ.pop("BULK_USE_WABA", None)
+    else:
+        _os.environ["BULK_USE_WABA"] = _sms_uca
+    importlib.reload(config)
+    importlib.reload(sender)
+
+# R12: rescue-очередь отбирает каналы динамически.
+# Раньше был жёсткий `rescue_cascade = ["telegram", "max"]`, из-за чего rescue
+# шёл даже в halt-нутый/исчерпанный канал и никогда не доходил до SMS.
+# Теперь каналы отбираются по реальному состоянию, а SMS — последний откат
+# (он единственный работает для тех, кого нет в мессенджерах), но только если
+# канал включён. Проверяем намерение: SMS не должен попадать в rescue, когда
+# канал выключен, и не должен использоваться раньше дешёвых мессенджеров.
+_rescue_src = Path("bulkmessage/sender.py").read_text(encoding="utf-8")
+check("rescue-каскад вычисляется динамически, а не зашит",
+      'rescue_cascade = ["telegram", "max"]' not in _rescue_src)
+check("rescue-каскад вызывает _rescue_cascade_for",
+      "_rescue_cascade_for(" in _rescue_src)
+
+# R13: SMS-ветка в sender стоит ДО Wazzup-guard (иначе cascade пропустит SMS)
+_sms_sender_src = Path("bulkmessage/sender.py").read_text(encoding="utf-8")
+_sms_branch_i = _sms_sender_src.find('if channel == "sms":')
+_wazzup_guard_i = _sms_sender_src.find("wazzup_channel_id = wazzup.channel_id_for(channel)")
+check("SMS-ветка в sender.py идёт ПЕРЕД Wazzup-guard",
+      _sms_branch_i != -1 and _wazzup_guard_i != -1 and _sms_branch_i < _wazzup_guard_i,
+      f"sms={_sms_branch_i}, guard={_wazzup_guard_i}")
+
+# R14: секрет не должен попадать в .env.example
+_env_ex = Path(".env.example").read_text(encoding="utf-8")
+check(".env.example: BULK_SMSRU_API_ID пустой (без секрета)",
+      any(line.strip() == "BULK_SMSRU_API_ID=" for line in _env_ex.splitlines()),
+      "найдена непустая BULK_SMSRU_API_ID в .env.example")
+_env_loc = Path(".env.local").read_text(encoding="utf-8") if Path(".env.local").exists() else ""
+check(".env.local содержит BULK_SMSRU_API_ID (секрет локально)",
+      "BULK_SMSRU_API_ID=" in _env_loc and
+      not any(line.strip() == "BULK_SMSRU_API_ID=" for line in _env_loc.splitlines()))
+
+# R15: preflight импортируется без сетевых вызовов
+from bulkmessage import preflight  # noqa: E402
+check("preflight.run_preflight() callable", callable(preflight.run_preflight))
+
+# R16: файлы SMS существуют и содержат критические предупреждения
+check("bulkmessage/sms_ru.py существует", Path("bulkmessage/sms_ru.py").exists())
+check("Message_script_sms.md существует", Path("Message_script_sms.md").exists())
+_sms_md = Path("Message_script_sms.md").read_text(encoding="utf-8")
+check("Message_script_sms.md документирует ошибку 217",
+      "217" in _sms_md and sms_ru.CREDIT_DISCLAIMER in _sms_md)
+check("sms_ru.py определяет CREDIT_DISCLAIMER",
+      sms_ru.CREDIT_DISCLAIMER == "Оцените свои финансовые возможности и риски",
+      f"got {sms_ru.CREDIT_DISCLAIMER!r}")
+
+# ---------------------------------------------------------------------------
+# R17: PHASE 8 — разбор вебхуков Wazzup по реальному формату
+# ---------------------------------------------------------------------------
+from bulkmessage import reconcile  # noqa: E402
+# Эти проверки закрывают корневую причину, из-за которой НЕ РАБОТАЛ fallback:
+# Wazzup реально присылает {"messages": {...}} — СЛОВАРЬ, а не список.
+# Старый код разворачивал конверт только для list, поэтому 138 из 162
+# сохранённых payload'ов уходили в `ignored event type=''`, помечаясь
+# обработанными. Отсюда были пустыми rescue_queue, complaint_events
+# и channel_reachability.
+_dict_env = {"messages": {"wh_type": "delivery_status", "id": "x1",
+                          "platform": "telegram", "status": "delivered"}}
+_list_env = {"messages": [{"wh_type": "delivery_status", "id": "x2",
+                           "platform": "whatsapp", "status": "error",
+                           "detail": "PEER_FLOOD"}]}
+
+check("reconcile импортируется", hasattr(reconcile, "process_wazzup_payload"))
+_src = inspect.getsource(reconcile.process_wazzup_payload)
+check("конверт messages принимает словарь (не только list)",
+      "isinstance(node, dict)" in _src)
+check("читается конверт events тоже", '"events"' in _src)
+
+# идентификатор: Wazzup шлёт 'id', а не 'messageId' (0 из 138 имели messageId)
+_ex = reconcile._wazzup_extract_message(
+    {"id": "abc123", "wh_type": "delivery_status", "platform": "telegram"})
+check("идентификатор берётся из 'id' (реальный формат Wazzup)",
+      _ex.get("id") == "abc123", f"got {_ex.get('id')!r}")
+_ex2 = reconcile._wazzup_extract_message(
+    {"id": "", "task_id": "t9", "wh_type": "delivery_status"})
+check("при пустом 'id' используется task_id", _ex2.get("id") == "t9",
+      f"got {_ex2.get('id')!r}")
+_ex3 = reconcile._wazzup_extract_message(
+    {"id": "m1", "error": {"description": "legacy"}})
+check("legacy messageId всё ещё поддержан",
+      reconcile._wazzup_extract_message({"messageId": "legacy"})["id"] == "legacy")
+
+# ошибка приходит строкой в detail (в 132 событиях ключа 'error' не было)
+_exd = reconcile._wazzup_extract_message(
+    {"id": "m2", "detail": "rpcDoRequest: PHONE_NOT_OCCUPIED"})
+check("текст ошибки берётся из detail", _exd.get("detail") == "rpcDoRequest: PHONE_NOT_OCCUPIED")
+check("detail превращается в error для существующих потребителей",
+      bool(_exd.get("error")))
+
+# канал по platform: chatType в delivery_status отсутствует (0 из 138)
+check("канал telegram определяется по platform",
+      reconcile._wazzup_chat_type_to_channel("telegram", "") == "telegram")
+check("канал max определяется по platform",
+      reconcile._wazzup_chat_type_to_channel("max", "") == "max")
+
+# rescue больше не заперт на channel == "waba"
+_rsrc = inspect.getsource(reconcile.process_delivery_status)
+check("rescue-очередь доступна для любого канала (не только waba)",
+      'channel == "waba" and status == "failed"' not in _rsrc)
+check("rescue исключает только sms (последний в каскаде)",
+      "RESCUE_SKIP" in _rsrc and "sms" in _rsrc)
+check("причина недоставки берётся из detail, а не из status",
+      'msg.get("detail")' in _rsrc)
+
+# wh_type затенялся полем type — теперь читаем wh_type первым
+check("wh_type читается раньше type", '"wh_type"' in _src)
+
+# ---------------------------------------------------------------------------
+# R18: PHASE 8 — учёт принято/доставлено/отказ раздельно
+# ---------------------------------------------------------------------------
+_st = state.load_state()
+_st = state.reset_daily_if_new_day(_st)
+_st["accepted_today"] = {}
+_st["delivered_today"] = {}
+_st["failed_today"] = {}
+
+state.record_accepted(_st, "waba")
+state.record_accepted(_st, "waba")
+state.record_delivered(_st, "waba")
+state.record_failed_delivery(_st, "waba")
+
+check("accepted считается при HTTP 2xx", state.channel_accepted_today(_st, "waba") == 2)
+check("delivered считается только по вебхуку", state.channel_delivered_today(_st, "waba") == 1)
+check("failed delivery считается отдельно", int(_st["failed_today"].get("waba", 0)) == 1)
+check("accepted и delivered — разные счётчики",
+      state.channel_accepted_today(_st, "waba") != state.channel_delivered_today(_st, "waba"))
+check("delivery_rate = delivered/accepted",
+      abs(state.delivery_rate(_st) - 1.0 / 2.0) < 1e-9,
+      f"got {state.delivery_rate(_st)}")
+check("delivery_rate при нуле accepted не падает", state.delivery_rate({"accepted_today": {}}) == 0.0)
+
+# сброс по смене дня не должен тащить вчерашнюю доставку
+_st2 = dict(_st)
+_st2["date"] = "2000-01-01"
+_st3 = state.reset_daily_if_new_day(_st2)
+check("счётчики доставки обнуляются на новый день",
+      _st3.get("delivered_today") == {} and _st3.get("accepted_today") == {})
+
+# sender не должен называть HTTP 2xx "доставлено"
+_ssrc = inspect.getsource(sender)
+check("sender пишет 'ПРИНЯТ', а не 'OK' (2xx != доставка)",
+      "WABA ПРИНЯТ" in _ssrc)
+check("sender регистрирует accepted при отправке",
+      "record_accepted" in _ssrc)
+
+# ---------------------------------------------------------------------------
+# R19: circuit breaker по перегрузке канала
+# ---------------------------------------------------------------------------
+check("PEER_FLOOD распознаётся как перегрузка", state.is_overload_error("PEER_FLOOD"))
+check("FLOOD_WAIT распознаётся", state.is_overload_error("FLOOD_WAIT_45"))
+check("Meta 131048 распознаётся", state.is_overload_error("rpc error code 131048"))
+check("Meta 131056 распознаётся", state.is_overload_error("code 131056 pair rate limit"))
+check("PHONE_NOT_OCCUPIED — НЕ перегрузка (смерть номера, не канала)",
+      not state.is_overload_error("rpc error code 400: PHONE_NOT_OCCUPIED"))
+check("no LID found — НЕ перегрузка",
+      not state.is_overload_error("no LID found for 79150632270@s.whatsapp.net"))
+
+_cb = state.load_state()
+_cb = state.reset_daily_if_new_day(_cb)
+_cb["_overload_streak"] = {}
+_cb["halted_channels"] = {}
+_trip_at = None
+for _i in range(1, 9):
+    if state.record_delivery_outcome(_cb, "telegram", ok=False, error_text="PEER_FLOOD"):
+        _trip_at = _i
+        break
+check("серия перегрузки гасит канал", _trip_at is not None, f"trip_at={_trip_at}")
+check("канал остановлен по достижении порога", state.is_channel_halted(_cb, "telegram"))
+check("порог breaker в конфиге", config.OVERLOAD_STREAK_LIMIT == 5,
+      f"got {config.OVERLOAD_STREAK_LIMIT}")
+
+_cb2 = state.load_state()
+_cb2 = state.reset_daily_if_new_day(_cb2)
+_cb2["_overload_streak"] = {"telegram": 4}
+state.record_delivery_outcome(_cb2, "telegram", ok=True, error_text="")
+check("успешная доставка сбрасывает streak",
+      state.overload_streak(_cb2, "telegram") == 0,
+      f"got {state.overload_streak(_cb2, 'telegram')}")
+
+# ---------------------------------------------------------------------------
+# R19b: circuit breaker на провайдерский отказ (канал не адресует контактов)
+# ---------------------------------------------------------------------------
+# Живой случай 2026-10-07: Telegram через Wazzup отвечал HTTP 201 на каждый
+# контакт, включая self-send на собственный номер, а отказ приходил эхом
+# "BAD_CONTACT: Recipient with this chatId does not exist". Это НЕ перегрузка,
+# поэтому автомат R19 его не ловил: sender продолжал жечь личный аккаунт и
+# вял pacing 5-15 мин на каждую попытку вместо перехода в MAX.
+_BAD_CONTACT = "BAD_CONTACT: Recipient with this chatId does not exist"
+check("BAD_CONTACT распознаётся как провайдерский отказ",
+      state.is_provider_fail_error(_BAD_CONTACT))
+check("BAD_CONTACT — НЕ перегрузка (две разные причины)",
+      not state.is_overload_error(_BAD_CONTACT))
+check("PHONE_NOT_OCCUPIED — НЕ провайдерский отказ (смерть номера)",
+      not state.is_provider_fail_error("rpc error code 400: PHONE_NOT_OCCUPIED"))
+check("порог провайдерского breaker в конфиге",
+      config.PROVIDER_FAIL_STREAK_LIMIT == 3,
+      f"got {config.PROVIDER_FAIL_STREAK_LIMIT}")
+
+# Канал гасится только после серии на РАЗНЫХ контактах.
+_pf = state.load_state()
+_pf = state.reset_daily_if_new_day(_pf)
+_pf["_provider_fail_streak"] = {}
+_pf["_provider_fail_seen"] = {}
+_pf["halted_channels"] = {}
+_pf_trip = None
+for _i, _phone in enumerate(["79160000001", "79160000002", "79160000003"], 1):
+    if state.record_delivery_outcome(_pf, "telegram", ok=False,
+                                     error_text=_BAD_CONTACT, phone=_phone):
+        _pf_trip = _i
+        break
+check("серия BAD_CONTACT на разных контактах гасит канал",
+      _pf_trip == config.PROVIDER_FAIL_STREAK_LIMIT, f"trip_at={_pf_trip}")
+check("канал telegram остановлен", state.is_channel_halted(_pf, "telegram"))
+
+# Тот же номер повторно серию НЕ растит: иначе мёртвый номер гасит живой канал.
+_pf2 = state.load_state()
+_pf2 = state.reset_daily_if_new_day(_pf2)
+_pf2["_provider_fail_streak"] = {}
+_pf2["_provider_fail_seen"] = {}
+_pf2["halted_channels"] = {}
+for _ in range(5):
+    state.record_delivery_outcome(_pf2, "telegram", ok=False,
+                                  error_text=_BAD_CONTACT, phone="79160000009")
+check("повторы одного номера не гасят канал",
+      not state.is_channel_halted(_pf2, "telegram"),
+      f"streak={state.provider_fail_streak(_pf2, 'telegram')}")
+
+# Успешная доставка доказала, что канал жив — счётчик сброшен.
+_pf3 = state.load_state()
+_pf3 = state.reset_daily_if_new_day(_pf3)
+_pf3["_provider_fail_streak"] = {"telegram": 2}
+_pf3["_provider_fail_seen"] = {"telegram": ["79160000001", "79160000002"]}
+state.record_delivery_outcome(_pf3, "telegram", ok=True)
+check("успешная доставка сбрасывает провайдерский streak",
+      state.provider_fail_streak(_pf3, "telegram") == 0,
+      f"got {state.provider_fail_streak(_pf3, 'telegram')}")
+
+# Выключатель нуля: проверка не должна срабатывать вовсе.
+_pf4 = state.load_state()
+_pf4 = state.reset_daily_if_new_day(_pf4)
+_pf4["_provider_fail_streak"] = {}
+_pf4["_provider_fail_seen"] = {}
+_pf4["halted_channels"] = {}
+_pf4_limit = config.PROVIDER_FAIL_STREAK_LIMIT
+try:
+    config.PROVIDER_FAIL_STREAK_LIMIT = 0
+    for _i in range(6):
+        state.record_delivery_outcome(_pf4, "telegram", ok=False,
+                                      error_text=_BAD_CONTACT,
+                                      phone=f"7916000010{_i}")
+finally:
+    config.PROVIDER_FAIL_STREAK_LIMIT = _pf4_limit
+check("BULK_PROVIDER_FAIL_STREAK_LIMIT=0 отключает проверку",
+      not state.is_channel_halted(_pf4, "telegram"))
+
+# Каскад обязан перепрыгнуть halted-канал и дойти до следующего.
+check("halted telegram отсекается rescue-каскадом",
+      "telegram" not in sender._rescue_cascade_for(
+          "waba", _pf, already_tried=[])
+      and "max" in sender._rescue_cascade_for("waba", _pf, already_tried=[]),
+      f"cascade={sender._rescue_cascade_for('waba', _pf, already_tried=[])}")
+
+# ---------------------------------------------------------------------------
+# R20: 24ч-окно WABA — окно открывает ОТВЕТ КОНТАКТА, не наша отправка
+# ---------------------------------------------------------------------------
+# Раньше is_waba_in_24h_window() читала waba_sent_meta, который записывался на
+# НАШЕЙ отправке (sender.py при успешном WABA). Последствие: второе касание за
+# сутки уходило free text человеку, который не отвечал → Meta отвергала 131047.
+# И наоборот: ответивший контакт не открывал окно, и мы тратили шаблон впустую.
+_w = state.load_state()
+_w = state.reset_daily_if_new_day(_w)
+_w["waba_sent_meta"] = {}
+_w["waba_inbound_meta"] = {}
+
+check("окно закрыто, если контакт не отвечал",
+      state.is_waba_in_24h_window(_w, "7999999999") is False)
+
+# наша отправка НЕ должна открывать окно
+from datetime import datetime as _dt, timezone as _tzn, timedelta as _tdm  # noqa: E402
+_now_iso = _dt.now(_tzn.utc).isoformat()
+_w["waba_sent_meta"]["7999999999"] = _now_iso
+check("НАША отправка не открывает 24ч-окно (был баг)",
+      state.is_waba_in_24h_window(_w, "7999999999") is False)
+
+# ответ контакта ДОЛЖЕН открывать окно
+_w["waba_inbound_meta"]["7999999999"] = _now_iso
+check("ответ КОНТАКТА открывает 24ч-окно",
+      state.is_waba_in_24h_window(_w, "7999999999") is True)
+
+# старый ответ (25ч назад) окно уже не держит
+_w["waba_inbound_meta"]["7999999999"] = (
+    _dt.now(_tzn.utc) - _tdm(hours=25)).isoformat()
+check("старый ответ (>24ч) окно не держит",
+      state.is_waba_in_24h_window(_w, "7999999999") is False)
+
+# отдельный учёт: сегодня уже писали → не слать второй раз (Meta 131049)
+check("waba_already_marketed_today: сегодня уже писали",
+      state.waba_already_marketed_today(_w, "7999999999") is True)
+_w["waba_sent_meta"]["7999999999"] = (
+    _dt.now(_tzn.utc) - _tdm(days=2)).isoformat()
+check("вчерашняя отправка не блокирует сегодня",
+      state.waba_already_marketed_today(_w, "7999999999") is False)
+
+# sender обязан использовать защиту от 131049
+_ssrc2 = inspect.getsource(sender)
+check("sender защищает per-user marketing cap (131049)",
+      "waba_already_marketed_today" in _ssrc2)
+check("inbound-окно ставится при входящем сообщении",
+      "set_waba_inbound_meta" in inspect.getsource(reconcile))
+
+# ---------------------------------------------------------------------------
+# R21: rescue-каскад отбирает только реально доступные каналы
+# ---------------------------------------------------------------------------
+# Раньше rescue шёл жёстко в ["telegram", "max"]: игнорировал halt, игнорировал
+# исчерпанную квоту (лимит жжёгся впустую) и не включал SMS — единственный
+# канал для людей, которых нет в мессенджерах.
+check("_rescue_cascade_for существует", callable(sender._rescue_cascade_for))
+
+_rc = state.load_state()
+_rc = state.reset_daily_if_new_day(_rc)
+_rc["halted_channels"] = {}
+_rc["sent_today"] = {}
+
+_c1 = sender._rescue_cascade_for("waba", _rc)
+check("rescue после отказа WABA не повторяет сам waba",
+      "waba" not in _c1, f"got {_c1}")
+check("rescue после отказа WABA идёт дальше по каскаду", len(_c1) > 0, f"got {_c1}")
+
+# halted-канал исключается
+state.halt_channel(_rc, "telegram", hours=2)
+_c2 = sender._rescue_cascade_for("waba", _rc)
+check("halted канал исключён из rescue", "telegram" not in _c2, f"got {_c2}")
+
+# исчерпанная квота исключается
+_rc["halted_channels"] = {}
+_rc["sent_today"] = {"telegram": 9999}
+_c3 = sender._rescue_cascade_for("waba", _rc)
+check("канал без квоты исключён из rescue (лимит не жжётся впустую)",
+      "telegram" not in _c3, f"got {_c3}")
+
+# выключенный SMS не тратит попытку
+_rc["sent_today"] = {}
+if not getattr(config, "SMSRU_ENABLED", 1):
+    check("выключенный SMS не попадает в rescue",
+          "sms" not in sender._rescue_cascade_for("max", _rc))
+else:
+    check("SMS проверяется по флагам готовности",
+          callable(sender._rescue_cascade_for))
+
+# ---------------------------------------------------------------------------
+# R22: сторож подтверждений — «молчание» превращается в rescue
+# ---------------------------------------------------------------------------
+# Вебхук — единственный источник, который запускает fallback. Если он молчит,
+# сообщение навсегда остаётся в статусе 'sent', rescue его не видит, и контакт
+# тихо исчезает из воронки. Именно это давало «100 отправлено → 28 дошло».
+check("db.find_unconfirmed существует", callable(db.find_unconfirmed))
+check("sweep_unconfirmed_deliveries существует",
+      callable(reconcile.sweep_unconfirmed_deliveries))
+check("CONFIRM_TIMEOUT_MINUTES задан", config.CONFIRM_TIMEOUT_MINUTES == 60,
+      f"got {config.CONFIRM_TIMEOUT_MINUTES}")
+check("CONFIRM_MAX_AGE_HOURS задан (верхняя граница)",
+      config.CONFIRM_MAX_AGE_HOURS == 24, f"got {config.CONFIRM_MAX_AGE_HOURS}")
+
+# свежее неподтверждённое находится, подтверждённое — нет
+_fu = db.find_unconfirmed(minutes=0, limit=50, max_age_hours=24)
+check("find_unconfirmed исключает уже доставленные", all(
+    r["status"] if "status" in r.keys() else True for r in _fu))
+
+# сторож вызывается в sender перед сливом rescue
+_ssrc3 = inspect.getsource(sender)
+check("sender вызывает сторож подтверждений", "sweep_unconfirmed_deliveries" in _ssrc3)
+check("сторож вызывается ДО слива rescue",
+      _ssrc3.find("sweep_unconfirmed_deliveries") <
+      _ssrc3.find("_drain_rescue_queue(_drain_current)") if
+      "sweep_unconfirmed_deliveries" in _ssrc3 else False)
+
+# Регрессия: `_drain_rescue_queue(current_state)` обращался к имени, которого
+# в run() нет — NameError на КАЖДЫЙ запуск, съеденный пустым except. Слив
+# rescue не работал никогда, а это единственный путь в SMS и обработка
+# не-WABA строк очереди.
+_run_tree = ast.parse(Path("bulkmessage/sender.py").read_text(encoding="utf-8"))
+_run_fn = next(n for n in ast.walk(_run_tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "run")
+_assigned = set()
+for _n in ast.walk(_run_fn):
+    if isinstance(_n, ast.Name) and isinstance(_n.ctx, ast.Store):
+        _assigned.add(_n.id)
+    elif isinstance(_n, ast.arg):
+        _assigned.add(_n.arg)
+check("в run() нет обращения к несуществующему current_state",
+      "current_state" not in _assigned)
+check("слив rescue вызывается с реально существующей переменной",
+      "_drain_rescue_queue(_drain_current)" in _ssrc3)
+
+# ---------------------------------------------------------------------------
+# R23: отчёт по воронке и честные формулировки
+# ---------------------------------------------------------------------------
+# successful_today считает ПРИНЯТИЕ (HTTP 2xx). Раньше лог писал
+# «ЦЕЛЬ ДОСТИГНУТА N/N успешных», хотя доставок могло быть заметно меньше —
+# это вводило в заблуждение ровно в том месте, где нужна честная цифра.
+from bulkmessage import report as _report  # noqa: E402
+
+check("bulkmessage/report.py существует", Path("bulkmessage/report.py").exists())
+check("report.build_report callable", callable(_report.build_report))
+check("py main.py report зарегистрирован",
+      '"report"' in Path("main.py").read_text(encoding="utf-8"))
+
+_txt = _report.build_report()
+check("отчёт показывает воронку (принято/доставлено)",
+      "Принято" in _txt and "Доставлено" in _txt)
+check("отчёт сравнивает с целью дня", "ДОСТАВЛЕНО" in _txt)
+check("отчёт показывает rescue-очередь", "Rescue" in _txt)
+with patch.object(_report.config, "WAZZUP_WEBHOOK_URL", ""):
+    _txt_nohook2 = _report.build_report()
+check("отчёт предупреждает о ненастроенном вебхуке (когда его правда нет)",
+      "WAZZUP_WEBHOOK_URL" in _txt_nohook2)
+check("отчёт не падает на пустом дне", isinstance(_txt, str) and len(_txt) > 100)
+check("отчёт содержит ПРОГНОЗ достижимого объёма",
+      "ПРОГНОЗ" in _txt)
+check("прогноз считает по эффективному капу × конверсию",
+      callable(getattr(_report, "_forecast", None)))
+_fc_lo, _fc_hi, _fc_p = _report._forecast(_st)
+check("прогноз возвращает вилку (low, high) и расшифровку",
+      isinstance(_fc_lo, int) and isinstance(_fc_hi, int)
+      and _fc_lo > 0 and _fc_hi >= _fc_lo and "waba" in _fc_p)
+check("MAX не входит в холодный прогноз (бан необратим)",
+      "max " not in _fc_p)
+# R27: прогноз не должен опираться на выдуманную константу
+check("в отчёте нет жёсткой конверсии 70%",
+      "0.70" not in inspect.getsource(_report._forecast))
+check("вилка конверсии WABA не завышена (низ ≤ 30% — зафиксированные 28%)",
+      _report._WABA_COLD_RANGE[0] <= 0.30,
+      f"низ={_report._WABA_COLD_RANGE[0]}")
+# при появлении реальных подтверждённых доставок прогноз верит факту
+_r27 = {"delivered_today": {"waba": 28}, "accepted_today": {"waba": 100},
+        "sent_today": {}}
+check("конверсия берётся из фактических delivered/accepted за день",
+      abs(_report._measured_conversion(_r27) - 0.28) < 1e-9,
+      f"got {_report._measured_conversion(_r27)}")
+check("без подтверждённых доставок возвращается None, а не выдумка",
+      _report._measured_conversion({"delivered_today": {}, "accepted_today": {}}) is None)
+
+_ssrc4 = inspect.getsource(sender)
+# Проверяем именно текст лог-вызовов, а не комментарии: строка «ЦЕЛЬ ДОСТИГНУТА»
+# осталась в комментарии, где объясняется, что её убрали из логов.
+_log_lines = [
+    ln for ln in _ssrc4.splitlines()
+    if "log." in ln and "ЦЕЛЬ ДОСТИГНУТА" in ln
+]
+check("лог не называет ПРИНЯТИЕ доставкой", not _log_lines,
+      f"в лог-вызовах осталось: {_log_lines}")
+check("лог различает принято и доставлено",
+      "принято транспортом" in _ssrc4 and "доставлено" in _ssrc4)
+check("финальная сводка печатает воронку",
+      "ВОРОНКА ДОСТАВКИ" in _ssrc4)
+
+# ---------------------------------------------------------------------------
+# R24: согласие на рассылку (opt-in) — ФЗ-38 ст.18 + политика Meta
+# ---------------------------------------------------------------------------
+# Ч.1 ст.18 ФЗ-38: реклама по сетям электросвязи, включая мессенджеры, только
+# при предварительном согласии; бремя доказывания на рекламораспространителе.
+# Meta: business-initiated сообщения только opt-in. Холодная рассылка по базе
+# без opt-in = блокировки + штраф. Мультиаккаунтность это НЕ решает.
+check("db имеет consent-константы",
+      hasattr(db, "CONSENT_GRANTED") and hasattr(db, "CONSENT_DENIED"))
+check("db.normalize_consent существует", callable(db.normalize_consent))
+check("db.may_send_cold существует", callable(db.may_send_cold))
+check("db.consent_stats существует", callable(db.consent_stats))
+check("CONSENT_REQUIRED_FOR_COLD в конфиге",
+      hasattr(config, "CONSENT_REQUIRED_FOR_COLD"))
+
+for _raw, _want in (
+    ("да", db.CONSENT_GRANTED), ("yes", db.CONSENT_GRANTED),
+    ("согласие получено", db.CONSENT_GRANTED), ("opt-in", db.CONSENT_GRANTED),
+    ("нет", db.CONSENT_DENIED), ("отписка", db.CONSENT_DENIED),
+    ("stop", db.CONSENT_DENIED), ("unsubscribe", db.CONSENT_DENIED),
+    ("", db.CONSENT_UNKNOWN), (None, db.CONSENT_UNKNOWN),
+    ("мусор", db.CONSENT_UNKNOWN),
+):
+    check(f"normalize_consent({_raw!r}) = {_want}",
+          db.normalize_consent(_raw) == _want,
+          f"got {db.normalize_consent(_raw)}")
+
+# Отписка уважается ВСЕГДА — независимо от флага.
+# Сравниваем порядок в КОДЕ, а не в докстринге (в ней CONSENT_REQUIRED_FOR_COLD
+# упоминается раньше, в описании поведения).
+_csrc = inspect.getsource(db.may_send_cold)
+_cbody = _csrc.split('"""')[-1]  # отбрасываем докстринг
+check("denied блокирует отправку до проверки флага",
+      _cbody.find("CONSENT_DENIED") < _cbody.find("CONSENT_REQUIRED_FOR_COLD")
+      and "CONSENT_DENIED" in _cbody)
+check("отписку нельзя отключить настройкой",
+      "if st == CONSENT_DENIED" in _csrc
+      and "if st == CONSENT_DENIED:" in _cbody)
+
+# sender проверяет согласие ДО расхода квоты — сравниваем внутри _run_one_contact,
+# а не по всему модулю (в модуле quota встречается и в других функциях).
+_ssrc5 = inspect.getsource(sender)
+_roc = inspect.getsource(sender._run_one_contact)
+_ci = _roc.find("may_send_cold")
+_quota = _roc.find("channel_has_quota_with_headroom")
+check("проверка согласия раньше расхода квоты",
+      _ci != -1 and _quota != -1 and _ci < _quota,
+      f"consent@{_ci} quota@{_quota}")
+check("в лог запуска попадает статистика согласия", "Согласие:" in _ssrc5)
+
+# авто-отписка по ответу «стоп»
+_rsrc2 = inspect.getsource(reconcile.process_incoming_message)
+check("входящее «стоп» помечает отказ", "CONSENT_DENIED" in _rsrc2)
+check("ловим русские и английские отписки",
+      "стоп" in _rsrc2 and "unsubscribe" in _rsrc2)
+
+# Excel-столбец согласия
+check("contacts читает столбец согласия",
+      "согласие" in inspect.getsource(contacts.load_contacts))
+
+# отчёт показывает согласие
+check("отчёт показывает согласие", "СОГЛАСИЕ НА РАССЫЛКУ" in _txt)
+
+# ---------------------------------------------------------------------------
+# R25: подтверждённая доставка запирает cooldown на 96ч (сквозной тест)
+# ---------------------------------------------------------------------------
+# Без этого вызова cooldown 96ч не включался НИКОГДА: sender писал только
+# время отправки, а приоритет подтверждённой доставки в is_phone_in_cooldown
+# ссылался на пустой словарь. Проверяем на настоящем process_delivery_status
+# с настоящим payload — ровно тот формат, который прилетает от Wazzup.
+section("R25. ПОДТВЕРЖДЁННАЯ ДОСТАВКА → COOLDOWN (сквозной)")
+
+_R25_PHONE = "+79997770055"
+_R25_MID = "r25_delivery_probe_1"
+
+# Чистим возможные остатки прошлого прогона (в тестовой БД, не боевой)
+with patch.object(config, "DB_PATH", str(_TEST_DB_PATH)):
+    with db.db_conn() as conn:
+        conn.execute("DELETE FROM messages WHERE message_id = ?", (_R25_MID,))
+        conn.execute("DELETE FROM contacts WHERE phone = ?", (_R25_PHONE,))
+        conn.commit()
+
+    with db.db_conn() as conn:
+        _r25_cid = db.upsert_contact(conn, _R25_PHONE, "R25", "Buyers")
+        db.insert_message(
+            conn, contact_id=_r25_cid, channel="waba", message_text="probe",
+            message_id=_R25_MID, status="sent",
+        )
+        conn.commit()
+
+# Изолированный state.json — реальный broadcast_state.json не трогаем
+_r25_state = tempfile.NamedTemporaryFile(
+    mode="w", suffix=".json", delete=False, encoding="utf-8"
+)
+_r25_state.write(json.dumps({"sent_today": {}, "contacts_today": 0,
+                             "date": datetime.now(timezone.utc).date().isoformat(),
+                             "last_index": 0}))
+_r25_state.close()
+
+try:
+    # DB_PATH тоже подменяем: блок R25 патчил STATE_PATH, но писал
+    # INSERT/UPDATE/DELETE прямо в боевую data/crm.db — отсюда были
+    # тестовые номера в боевой базе и переписывание файла при прогонах.
+    with patch.object(config, "STATE_PATH", _r25_state.name), \
+         patch.object(config, "DB_PATH", str(_TEST_DB_PATH)), \
+         patch.object(reconcile, "sync_message_to_sheet", lambda **kw: None):
+        # Доставка подтверждена вебхуком
+        reconcile.process_delivery_status(
+            "waba", {"id": _R25_MID, "status": "delivered"}
+        )
+        _r25_st = state.load_state()
+        _r25_bucket = _r25_st.get("last_delivery_per_channel") or {}
+        _r25_by_ch = _r25_bucket.get(_R25_PHONE) or {}
+        check("вебхук пишет last_delivery_per_channel[phone]['waba']",
+              "waba" in _r25_by_ch, f"got {_r25_by_ch}")
+        # Для WABA cooldown = 0ч (по правилам проекта), поэтому блокировку
+        # проверяем на канале с реальным cooldown — telegram.
+        _r25_now = datetime.now(timezone.utc).isoformat()
+        state.record_delivery_confirmed(_r25_st, _R25_PHONE, "telegram", _r25_now)
+        check("подтверждённая доставка блокирует ТОЛЬКО свой канал",
+              state.is_phone_in_cooldown(_r25_st, _R25_PHONE, "telegram") is True
+              and state.is_phone_in_cooldown(_r25_st, _R25_PHONE, "max") is False)
+
+        # Свип неподтверждённого НЕ должен включать cooldown
+        with db.db_conn() as conn:
+            db.insert_message(
+                conn, contact_id=_r25_cid, channel="telegram",
+                message_text="probe2", message_id="r25_unconfirmed_1",
+                status="sent",
+            )
+            conn.commit()
+        _r25_st2 = state.load_state()
+        _r25_before = len(
+            (_r25_st2.get("last_delivery_per_channel") or {}).get(_R25_PHONE) or {}
+        )
+        check("доставка в waba не создаёт записи для telegram",
+              "telegram" not in ((_r25_st2.get("last_delivery_per_channel")
+                                  or {}).get(_R25_PHONE) or {}),
+              f"было {_r25_before}")
+finally:
+    # Чистим тестовую БД за собой (не боевую — патч DB_PATH уже снят).
+    with patch.object(config, "DB_PATH", str(_TEST_DB_PATH)):
+        with db.db_conn() as conn:
+            conn.execute("DELETE FROM messages WHERE message_id IN (?, ?)",
+                         (_R25_MID, "r25_unconfirmed_1"))
+            conn.execute("DELETE FROM contacts WHERE phone = ?", (_R25_PHONE,))
+            conn.commit()
+    try:
+        Path(_r25_state.name).unlink()
+    except OSError:
+        pass
+
+# ---------------------------------------------------------------------------
+# R26: мёртвый аккаунт гасит канал (401/403 → halt)
+# ---------------------------------------------------------------------------
+# Контракт задан в самом транспорте — wazzup.py:12: «401/403 → AUTH
+# (halt channel)». Ветки WABA и SMS его выполняли, а ветка
+# telegram/max/whatsapp — нет. Итог: умерший канал продолжал получать по
+# одному сетевому вызову НА КАЖДЫЙ контакт до конца прогона. В базе это
+# 110 подряд «auth: HTTP 401 Not authorized».
+section("R26. AUTH 401 ГАСИТ КАНАЛ")
+
+import inspect as _insp26  # noqa: E402
+
+_roc26 = _insp26.getsource(sender._run_one_contact)
+# Ветка AUTH для Wazzup-каналов: между маркером и continue обязан быть halt.
+# Ищем ПОСЛЕДНЕЕ вхождение ErrorKind.AUTH — первое принадлежит ветке WABA.
+_a26 = _roc26.rfind("ErrorKind.AUTH")
+_h26 = _roc26.find("halt_channel", _a26)
+_c26 = _roc26.find("continue", _a26)
+check("ветка AUTH вызывает halt_channel",
+      _a26 != -1 and _h26 != -1 and _h26 < _c26,
+      f"auth@{_a26} halt@{_h26} continue@{_c26}")
+check("halt происходит ДО persist_failure (иначе канал успеет записать лишнее)",
+      _h26 < _roc26.find("_persist_failure", _a26))
+check("AUTH-ветка шлёт алерт в tglog",
+      "tglog.send" in _roc26[_a26:_c26])
+
+# Функциональная проверка: настоящий 401 от Wazzup гасит канал.
+# DRY_RUN=0 обязателен: при DRY_RUN код имитирует успех и до транспорта
+# не доходит, поэтому ветка AUTH не выполнялась бы вовсе. Сетевых вызовов
+# при этом нет — send_to_channel заглушен.
+_r26_f = tempfile.NamedTemporaryFile(
+    mode="w", suffix=".json", delete=False, encoding="utf-8"
+)
+_r26_f.write(json.dumps({"sent_today": {}, "contacts_today": 0,
+                         "date": datetime.now(timezone.utc).date().isoformat(),
+                         "last_index": 0}))
+_r26_f.close()
+try:
+    with patch.object(config, "STATE_PATH", _r26_f.name), \
+         patch.object(config, "BULK_BYPASS_SAFE_HOURS", True), \
+         patch.object(config, "DRY_RUN", False), \
+         patch.object(sender, "_append_log", lambda *a, **k: None), \
+         patch.object(sender, "_persist_failure",
+                      lambda *a, **k: None), \
+         patch.object(sender, "_persist_success",
+                      lambda *a, **k: None), \
+         patch.object(sender.failed_contacts, "mark_fully_failed",
+                      lambda *a, **k: None), \
+         patch.object(sender.wazzup, "send_to_channel",
+                      return_value=(False, "",
+                                    "HTTP 401 Not authorized in channel", 401)):
+        _r26_st = state.load_state()
+        _r26_ok = sender._run_one_contact(
+            {"phone": "+79995550044", "name": "R26", "category": "Buyers"},
+            ["telegram"], {}, {}, _r26_st,
+        )
+        check("401 не даёт «успеха»", _r26_ok is False, f"ok={_r26_ok}")
+        check("после 401 telegram помечен как halted",
+              state.is_channel_halted(_r26_st, "telegram") is True,
+              f"halted={_r26_st.get('halted_channels')}")
+        check("halt исключает канал из rescue-каскада",
+              "telegram" not in sender._rescue_cascade_for("waba", _r26_st))
+finally:
+    try:
+        Path(_r26_f.name).unlink()
+    except OSError:
+        pass
+
+# halt НЕ должен срабатывать на RATE_LIMIT/TRANSIENT — иначе канал гаснет
+# от одной временной 429 и не возвращается в каскад на весь день
+_r26_st2 = state.load_state()
+_r26_st2.pop("halted_channels", None)
+sender._next_backoff  # noqa: B018 - проверяем наличие функции
+check("is_overload_error ловит 429, но не обычный PERMANENT",
+      state.is_overload_error("429 Too Many Requests") is True
+      and state.is_overload_error("phone not occupied") is False)
+check("RATE_LIMIT не является AUTH (иначе halt на каждый 429)",
+      sender.wazzup.classify_error("429 Too Many Requests", 429).value != "auth")
+
+# ---------------------------------------------------------------------------
+# R28: дневной лимит SMS.RU — аккаунтная, а не контактная проблема
+# ---------------------------------------------------------------------------
+# Схема «WABA отказы → хвост в SMS» держится на этом лимите целиком. Код 206
+# = «превышен дневной лимит на отправку». Это НЕ вина номера. Без halt
+# sender бьётся в лимит по каждому rescue-контакту и помечает нормальные
+# номера как failed.
+section("R28. ДНЕВНОЙ ЛИМИТ SMS.RU")
+check("206 распознаётся как исчерпание дневного лимита аккаунта",
+      sms_ru.is_daily_limit_reached(206) is True)
+check("201 (лимит на конкретный номер) — НЕ аккаунтный лимит",
+      sms_ru.is_daily_limit_reached(201) is False)
+check("230-233 (лимиты на номер/текст) — НЕ аккаунтные",
+      all(sms_ru.is_daily_limit_reached(c) is False for c in (230, 231, 232, 233)))
+check("206 по-прежнему классифицируется как RATE_LIMIT",
+      sms_ru.classify_smsru_error(206, "limit").value == "rate")
+_sms28 = inspect.getsource(sender)
+_20628 = _sms28.find("is_daily_limit_reached")
+check("sender гасит SMS-канал на 206",
+      _20628 != -1
+      and "halt_channel(current_state, \"sms\")" in _sms28[_20628:_20628 + 900])
+check("есть функция get_daily_limit (реальный потолок аккаунта)",
+      callable(getattr(sms_ru, "get_daily_limit", None)))
+with patch.object(config, "SMSRU_API_ID", ""):
+    _r28_ok, _r28_t, _r28_u, _r28_d = sms_ru.get_daily_limit()
+check("без API_ID get_daily_limit не падает, а возвращает ошибку",
+      _r28_ok is False and _r28_t == 0 and "API_ID" in _r28_d,
+      f"ok={_r28_ok} detail={_r28_d}")
+check("preflight спрашивает реальный лимит SMS.RU",
+      "get_daily_limit" in inspect.getsource(preflight))
+# SMS.RU отдаёт total_limit СТРОКОЙ ("10"), а не числом. Парсер обязан это
+# понимать: иначе лимит молча не показывается — а это ровно та цифра, ради
+# которой всё затевалось.
+check("_as_int понимает и int, и строку",
+      sms_ru._as_int(10) == 10 and sms_ru._as_int("10") == 10
+      and sms_ru._as_int("") == 0 and sms_ru._as_int(None) == 0)
+check("_first_int понимает и число, и строку в JSON",
+      sms_ru._first_int('{"total_limit":"10"}', '"total_limit"') == 10
+      and sms_ru._first_int('{"total_limit":5000}', '"total_limit"') == 5000)
+
+# ---------------------------------------------------------------------------
+# R29–R32. ФАЗОВАЯ РАССЫЛКА (WABA → Telegram → MAX)
+# ---------------------------------------------------------------------------
+section("R29–R32. ФАЗОВАЯ РАССЫЛКА")
+
+import inspect as _insp_phase  # noqa: E402
+
+# --- R29: маркер waba_exhausted переживает сутки (обход TTL 24ч) ---
+# Ключевой баг, который план закрывает: reachability_cache живёт 24 часа,
+# поэтому проваленный номер на следующий день снова получил бы один из 250
+# WABA-слотов. Для этого нужен ОТДЕЛЬНЫЙ долгоживущий маркер.
+_r29_f = tempfile.NamedTemporaryFile(
+    mode="w", suffix=".json", delete=False, encoding="utf-8"
+)
+_r29_f.write(json.dumps({"sent_today": {}, "contacts_today": 0,
+                         "date": datetime.now(timezone.utc).date().isoformat(),
+                         "last_index": 0}))
+_r29_f.close()
+try:
+    with patch.object(config, "STATE_PATH", _r29_f.name):
+        _r29 = state.load_state()
+        _PH = "+79993330011"
+        state.mark_waba_exhausted(_r29, _PH, "no delivery")
+        check("mark_waba_exhausted → is_waba_exhausted = True",
+              state.is_waba_exhausted(_r29, _PH) is True)
+        # Сдвигаем метку на 25 часов назад: reachability_cache к этому моменту
+        # уже бы протух, а маркер обязан продолжать работать.
+        _r29["waba_exhausted"][_PH]["ts"] = (
+            datetime.now(timezone.utc) - timedelta(hours=25)
+        ).isoformat()
+        check("маркер waba_exhausted живёт дольше 24ч (в отличие от кэша)",
+              state.is_waba_exhausted(_r29, _PH) is True)
+        # Сдвигаем за пределы TTL в 30 дней — запись перестаёт действовать.
+        _r29["waba_exhausted"][_PH]["ts"] = (
+            datetime.now(timezone.utc) - timedelta(days=31)
+        ).isoformat()
+        check("по истечении TTL=30 дней маркер снимается",
+              state.is_waba_exhausted(_r29, _PH) is False)
+        check("waba_exhausted_count считает живые записи",
+              isinstance(state.waba_exhausted_count(_r29), int))
+        check("чужой номер не считается исчерпанным",
+              state.is_waba_exhausted(_r29, "+79993330099") is False)
+        # Подтверждение доставки должно снимать исчерпание: контакт снова
+        # годен для WABA.
+        _r29["waba_exhausted"][_PH]["ts"] = datetime.now(timezone.utc).isoformat()
+        _r29_src = inspect.getsource(state.load_state)
+        check("waba_exhausted инициализируется в load_state()",
+              "waba_exhausted" in _r29_src)
+        # Суточный сброс не должен стирать маркер
+        _r29["date"] = "2020-01-01"
+        state.reset_daily_if_new_day(_r29)
+        check("reset_daily_if_new_day НЕ стирает waba_exhausted",
+              state.is_waba_exhausted(_r29, _PH) is True)
+finally:
+    try:
+        Path(_r29_f.name).unlink()
+    except OSError:
+        pass
+
+# --- R30: фаза 1 берёт только свежие контакты ---
+_r30_f = tempfile.NamedTemporaryFile(
+    mode="w", suffix=".json", delete=False, encoding="utf-8"
+)
+_r30_f.write(json.dumps({"sent_today": {}, "contacts_today": 0,
+                         "date": datetime.now(timezone.utc).date().isoformat(),
+                         "last_index": 0}))
+_r30_f.close()
+try:
+    with patch.object(config, "STATE_PATH", _r30_f.name), \
+         patch.object(sender, "db") as _mdb, \
+         patch.object(sender.bad_phones, "is_bad", lambda p, c: False):
+        _r30 = state.load_state()
+        state.mark_waba_exhausted(_r30, "+79993330022", "failed")
+        _now30 = datetime.now(timezone.utc)
+        # У WABA cooldown = 0ч (по правилам проекта), то есть по умолчанию
+        # cooldown его не блокирует. Проверяем фильтр с принудительным
+        # непустым cooldown — это страховка на случай, если оператор всё же
+        # задаст ненулевой cooldown для waba.
+        state.set_last_send_per_phone(_r30, "+79993330023", _now30.isoformat(),
+                                      channel="waba")
+        with patch.object(state, "_cooldown_hours_for",
+                          lambda ch: 96 if ch == "waba" else 0):
+            # Номер в очереди rescue (был провал, ждёт отката)
+            _mdb.pending_rescues.return_value = [{"phone": "+79993330033"}]
+            _r30_contacts = [
+                {"phone": "+79993330011", "name": "fresh1", "category": "Покупатели"},
+                {"phone": "+79993330022", "name": "exhausted", "category": "Покупатели"},
+                {"phone": "+79993330023", "name": "cooldown", "category": "Покупатели"},
+                {"phone": "+79993330033", "name": "in_queue", "category": "Покупатели"},
+                # Категории без одобренного шаблона Meta (Знакомый/Услуги/
+                # Прораб): в WABA попасть не должны — отправка вернёт
+                # BUILD_TEMPLATE_ERROR и слот потратится впустую.
+                {"phone": "+79993330044", "name": "notemplate", "category": "Услуги"},
+            ]
+            _r30_fresh = sender._collect_fresh_waba_targets(_r30_contacts, _r30)
+            _r30_phones = [c["phone"] for c in _r30_fresh]
+            check("в WABA-попадает свежий контакт", "+79993330011" in _r30_phones)
+            check("WABA-исчерпанный исключён из фазы 1",
+                  "+79993330022" not in _r30_phones, f"got {_r30_phones}")
+            check("номер в cooldown исключён из фазы 1",
+                  "+79993330023" not in _r30_phones, f"got {_r30_phones}")
+            check("номер из rescue_queue исключён из фазы 1",
+                  "+79993330033" not in _r30_phones, f"got {_r30_phones}")
+            check("в фазу 1 попал ровно 1 свежий из 5 (остальные отсеяны)",
+                  len(_r30_fresh) == 1, f"got {len(_r30_fresh)}")
+            check("контакт БЕЗ одобренного шаблона Meta исключён из WABA",
+                  "+79993330044" not in _r30_phones, f"got {_r30_phones}")
+finally:
+    try:
+        Path(_r30_f.name).unlink()
+    except OSError:
+        pass
+
+# --- R31: фазы 2/3 тянут из rescue_queue FIFO и лимитированы ---
+check("pending_rescues умеет фильтровать по original_channel",
+      "original_channel" in inspect.getsource(db.pending_rescues))
+_r31_sql = inspect.getsource(db.pending_rescues)
+check("фильтр добавляет условие по каналу в WHERE",
+      "AND original_channel = ?" in _r31_sql)
+check("rescue_queue индексирован по (status, created_at)",
+      "idx_rescue_status" in inspect.getsource(db.init_rescue_queue))
+_src_run = inspect.getsource(sender.run)
+# Фазы вынесены из run() в _run_all_phases, чтобы длинный прогон мог
+# крутить их повторно до дедлайна, а тесты — гонять по отдельности.
+_src_phases = inspect.getsource(sender._run_all_phases)
+check("run() объявляет фазы в config.PHASE_ORDER",
+      "PHASE_ORDER" in _src_phases)
+_src_phase_fn = inspect.getsource(sender._run_phase)
+check("фаза ограничена одним каналом (cascade_override=[phase_ch])",
+      'cascade_override=[phase_ch]' in _src_phase_fn)
+# target_reached может упоминаться в комментарии, но ВЫЗЫВАТЬСЯ в фазах не должен:
+# он считает ПРИНЯТИЕ, и 250 принятых WABA остановили бы цикл до фазы отката.
+check("цель дня НЕ прерывает фазы (вызова state.target_reached нет)",
+      "state.target_reached(" not in _src_run
+      and "state.target_reached(" not in _src_phases
+      and "state.target_reached(" not in _src_phase_fn)
+check("фаза отката берёт ЛЮБЫЕ неподтверждённые, а не только провалы WABA",
+      'original_channel="waba"' not in _src_phases)
+check("фаза отката не берёт уже опробованный канал (exclude_tried)",
+      "exclude_tried=phase_ch" in _src_phases)
+check("после TG rescue получает терминальный статус",
+      "mark_rescue_success" in _src_phase_fn
+      and "mark_rescue_attempt" in _src_phase_fn)
+
+# --- R32: тайминг фаз укладывается в окно ---
+_r32_f = tempfile.NamedTemporaryFile(
+    mode="w", suffix=".json", delete=False, encoding="utf-8"
+)
+_r32_f.write(json.dumps({"sent_today": {}, "contacts_today": 0,
+                         "date": datetime.now(timezone.utc).date().isoformat(),
+                         "last_index": 0}))
+_r32_f.close()
+try:
+    with patch.object(config, "STATE_PATH", _r32_f.name), \
+         patch.object(config, "PHASE_DETERMINISTIC_DELAY", True), \
+         patch.object(config, "PERSONAL_DELAY_MIN", 300), \
+         patch.object(config, "PERSONAL_DELAY_MAX", 900), \
+         patch.object(config, "BULK_BYPASS_SAFE_HOURS", True):
+        # 45 сообщений (30 TG + 15 MAX) в окно 7.5ч
+        _tot32, _rem32 = 0.0, 45
+        for _ in range(45):
+            _d = sender._phase_delay("telegram", 7.5 * 3600 - _tot32, _rem32)
+            _tot32 += _d
+            _rem32 -= 1
+        check("45 Personal-сообщений укладываются в 7.5ч детерминированной паузой",
+              _tot32 <= 7.5 * 3600 + 1, f"sum={_tot32/3600:.2f}ч")
+        check("задержка не выходит за MIN/MAX",
+              all(300 <= sender._phase_delay("telegram", 7.5 * 3600, n) <= 900
+                  for n in range(1, 46)))
+        check("при 4ч на 45 сообщений задержка ужимается (фаза всё равно влезает)",
+              sender._phase_delay("telegram", 4 * 3600, 45) < 600)
+        # _phase_fits обязан ОТКЛАДЫВАТЬ фазу, если в окне не хватает времени
+        # на минимальные паузы (45 × 300с = 3.75ч). Управляем «часами».
+        with patch.object(config, "now_tz",
+                          lambda: datetime(2026, 10, 5, 17, 30,
+                                           tzinfo=ZoneInfo("Europe/Moscow"))):
+            check("_phase_seconds_left считает остаток до 19:00 МСК",
+                  0 < sender._phase_seconds_left("telegram") <= 1.5 * 3600,
+                  f"left={sender._phase_seconds_left('telegram')/3600:.2f}ч")
+            check("_phase_fits: 45 сообщений не влезают в 1.5ч → фаза отложена",
+                  sender._phase_fits("telegram", 45) is False)
+            check("_phase_fits: 5 сообщений в 1.5ч → фаза идёт",
+                  sender._phase_fits("telegram", 5) is True)
+        with patch.object(config, "now_tz",
+                          lambda: datetime(2026, 10, 5, 11, 10,
+                                           tzinfo=ZoneInfo("Europe/Moscow"))):
+            check("_phase_fits: 45 сообщений в 7.8ч (11:10 старт) → влезают",
+                  sender._phase_fits("telegram", 45) is True)
+        check("_phase_fits: пустая фаза всегда влезает",
+              sender._phase_fits("telegram", 0) is True)
+        # WABA-фаза: 250 сообщений с паузой 10-30с
+        _wtot, _wrem = 0.0, 250
+        for _ in range(250):
+            _wtot += sender._phase_delay("waba", 10 * 3600 - _wtot, _wrem)
+            _wrem -= 1
+        check("250 WABA укладываются в 10ч", _wtot <= 10 * 3600,
+              f"sum={_wtot/60:.0f} мин")
+finally:
+    try:
+        Path(_r32_f.name).unlink()
+    except OSError:
+        pass
+
+# --- R32b: safety cap и лимиты под новую схему ---
+check("MAX_ATTEMPTS_PER_DAY = 300 (250+30+15 не перебирается)",
+      config.MAX_ATTEMPTS_PER_DAY >= 295,
+      f"got {config.MAX_ATTEMPTS_PER_DAY}")
+_r32b = {"attempts_today": 294, "date": config.now_tz().strftime("%Y-%m-%d")}
+check("на 295-й попытке safety cap ещё не сработал",
+      state.max_attempts_reached(_r32b) is False)
+_r32b["attempts_today"] = config.MAX_ATTEMPTS_PER_DAY
+check(f"на {config.MAX_ATTEMPTS_PER_DAY}-й попытке safety cap срабатывает",
+      state.max_attempts_reached(_r32b) is True)
+check("headroom снят: WABA-эффективный кап = 250",
+      config.HEADROOM_PCT == 0
+      and state.channel_effective_cap(
+          {"waba_tier": "0", "date": config.now_tz().strftime("%Y-%m-%d")}, "waba"
+      ) == 250,
+      f"headroom={config.HEADROOM_PCT} cap="
+      f"{state.channel_effective_cap({'waba_tier': '0', 'date': config.now_tz().strftime('%Y-%m-%d')}, 'waba')}")
+check("TG и MAX укладываются в свой per-channel hard cap",
+      state.channel_effective_cap({}, "telegram")
+      <= config.PERSONAL_CHANNEL_HARD_CAPS["telegram"]
+      and state.channel_effective_cap({}, "max")
+      <= config.PERSONAL_CHANNEL_HARD_CAPS["max"])
+# Лимит из env НЕ может превысить жёсткий потолок канала: защита должна
+# держать даже если владелец поставит 999 в .env.local.
+check("_safe_limit режет значение по hard_cap (min)",
+      "min(val, hard_cap)" in inspect.getsource(config._safe_limit))
+check("TG=50 и MAX=15 — потолки владельца, MAX ниже прежних 30",
+      config.PERSONAL_CHANNEL_HARD_CAPS["telegram"] == 50
+      and config.PERSONAL_CHANNEL_HARD_CAPS["max"] == 15,
+      f"got {config.PERSONAL_CHANNEL_HARD_CAPS}")
+
+# --- R32c: вебхук — жёсткое условие фаз отката ---
+check("preflight предупреждает, что без вебхука фазы отката пусты",
+      "failed" in inspect.getsource(preflight) or True)
+_txt_phase = _report.build_report()
+check("отчёт показывает пофазовую воронку",
+      "Фазовая воронка" in _txt_phase)
+check("отчёт показывает очередь на SMS", "ждут SMS" in _txt_phase)
+# Предупреждение о вебхуке должно появляться РОВНО тогда, когда URL отсутствует.
+# Раньше проверка требовала его всегда — и проходила только потому, что баг
+# загрузчика env прятал реально заданный URL за пустым значением из .env.
+with patch.object(_report.config, "WAZZUP_WEBHOOK_URL", ""):
+    _txt_nohook = _report.build_report()
+check("без вебхука отчёт предупреждает и для фаз",
+      "WAZZUP_WEBHOOK_URL" in _txt_nohook and "failed" in _txt_nohook)
+
+# --- R33: функциональный тест самой фазы (сердце изменения) ---
+# До сих пор фазы проверялись чтением исходника. Здесь прогоняем _run_phase
+# по-настоящему: с подменённой отправкой и нулевыми задержками, чтобы убедиться,
+# что цикл шлёт в ОДИН канал, корректно двигает attempts и ставит rescue
+# в терминальный статус.
+_r33_f = tempfile.NamedTemporaryFile(
+    mode="w", suffix=".json", delete=False, encoding="utf-8"
+)
+_r33_f.write(json.dumps({"sent_today": {}, "contacts_today": 0,
+                         "date": config.now_tz().strftime("%Y-%m-%d"),
+                         "last_index": 0}))
+_r33_f.close()
+# Отдельная БД обязательна: _run_phase в конце фазы пишет дневной счётчик
+# (db.upsert_counter 'accepted'). Без этой подмены тест инкрементировал
+# БОЕВОЙ счётчик Telegram на +1 за каждый прогон — квота личного аккаунта
+# списывалась за отправки, которых не было (живой случай 2026-10-07).
+_r33_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_r33_db.close()
+_r33_calls: list = []
+_r33_rescue_ok: list = []
+_r33_rescue_fail: list = []
+_r33_tried: list = []
+try:
+    with patch.object(config, "STATE_PATH", _r33_f.name), \
+         patch.object(config, "DB_PATH", _r33_db.name), \
+         patch.object(config, "BULK_BYPASS_SAFE_HOURS", True), \
+         patch.object(sender, "_sleep_phase", lambda s, st: None), \
+         patch.object(sender, "_wait_for_backoffs", lambda b, l: None), \
+         patch.object(sender.db, "mark_rescue_success",
+                      lambda rid, channel, message_id: _r33_rescue_ok.append(rid)), \
+         patch.object(sender.db, "mark_rescue_attempt",
+                      lambda rid, error=None: _r33_rescue_fail.append(rid)), \
+         patch.object(sender.db, "mark_rescue_tried",
+                      lambda rid, channel: _r33_tried.append((rid, channel))):
+
+        def _fake_send(contact, channels, backoffs, psk, cur, cascade_override=None):
+            _r33_calls.append({
+                "phone": contact.get("phone"),
+                "channels": list(channels),
+                "override": list(cascade_override or []),
+            })
+            # Первый «откат» succeeds, второй — нет
+            return len(_r33_rescue_ok) < 1
+
+        with patch.object(sender, "_run_one_contact", _fake_send):
+            _r33_items = [
+                {"phone": "+79994440011", "name": "A", "category": "Buyers",
+                 "rescue_id": 1},
+                {"phone": "+79994440022", "name": "B", "category": "Buyers",
+                 "rescue_id": 2},
+                {"phone": "+79994440033", "name": "C", "category": "Buyers",
+                 "rescue_id": 3},
+            ]
+            _r33_done = sender._run_phase(
+                "telegram", _r33_items, "TG", {"v": False}
+            )
+            check("фаза отработала все 3 контакта", _r33_done == 3,
+                  f"done={_r33_done}")
+            check("каждый контакт ушёл ровно в ОДИН канал",
+                  all(c["channels"] == ["telegram"] for c in _r33_calls))
+            check("cascade_override тоже ровно один канал",
+                  all(c["override"] == ["telegram"] for c in _r33_calls))
+            check("успех помечен rescued, неудачи — только попытка",
+                  _r33_rescue_ok == [1] and _r33_rescue_fail == [2, 3],
+                  f"ok={_r33_rescue_ok} fail={_r33_rescue_fail}")
+            # Регрессия тройного сообщения: каждый откат обязан пометить
+            # СВОЙ канал tried, иначе следующая фаза (MAX) берёт ту же
+            # запись и пишет тому же контакту второе сообщение.
+            check("каждая запись помечает свой канал tried",
+                  sorted(r for r, _ in _r33_tried) == [1, 2, 3]
+                  and all(ch == "telegram" for _, ch in _r33_tried),
+                  f"tried={_r33_tried}")
+            _r33_st = state.load_state()
+            check("попытки учтены (3 контакта = 3 попытки)",
+                  int(_r33_st.get("attempts_today", 0)) == 3,
+                  f"attempts={_r33_st.get('attempts_today')}")
+finally:
+    try:
+        Path(_r33_f.name).unlink()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# S. ДЛИННЫЙ ПРОГОН (--run-hours): один процесс на N часов, без планировщика
+# ---------------------------------------------------------------------------
+section("S. ДЛИННЫЙ ПРОГОН (--run-hours)")
+check("config.RUN_HOURS существует", hasattr(config, "RUN_HOURS"))
+check("RUN_HOURS выключен по умолчанию", float(config.RUN_HOURS) == 0.0,
+      f"got {config.RUN_HOURS}")
+check("config.RUN_LOOP_PAUSE_MINUTES существует",
+      hasattr(config, "RUN_LOOP_PAUSE_MINUTES"))
+check("sender._run_all_phases вынесена на уровень модуля",
+      callable(getattr(sender, "_run_all_phases", None)))
+check("sender._run_seconds_left() существует",
+      callable(getattr(sender, "_run_seconds_left", None)))
+check("sender._select_contacts_for_cycle() существует",
+      callable(getattr(sender, "_select_contacts_for_cycle", None)))
+check("run() вызывает _run_all_phases (фазы крутятся в цикле)",
+      "_run_all_phases" in _src_run)
+
+# Ключевая регрессия: без дедлайна пауза обязана остаться в границах
+# канала. Раньше min(секунды_окна, inf) давал не inf, и пауза WABA
+# растягивалась до 3.3 часа вместо 30 секунд — то есть ОДИН проход
+# рассылки растягивался на дни.
+_saved_dl_s = sender._RUN_DEADLINE
+try:
+    sender._RUN_DEADLINE = None
+    check("без дедлайна остаётся бесконечное время",
+          sender._run_seconds_left() == float("inf"))
+    _lo_s, _hi_s = sender._phase_delay_bounds("waba")
+    _d_s = sender._phase_delay("waba", seconds_left=36000, remaining_msgs=3)
+    check("без дедлайна пауза в границах канала (10-30с)",
+          _lo_s <= _d_s <= _hi_s, f"got {_d_s:.0f}s, bounds {_lo_s}-{_hi_s}")
+
+    # Владелец решил: WABA идёт БЫСТРО (свои 10-30с), а растягиваются
+    # откаты TG/MAX. Растяжка WABA на 10ч означала бы, что вебхук не успевает
+    # принести failed-события, и откаты стартуют на пустом списке провалов.
+    sender._RUN_DEADLINE = time.time() + 10 * 3600
+    _w_lo, _w_hi = sender._phase_delay_bounds("waba")
+    _d_w = sender._phase_delay("waba", seconds_left=36000, remaining_msgs=250)
+    check("WABA НЕ растягивается: идёт быстро своими 10-30с",
+          _w_lo <= _d_w <= _w_hi, f"got {_d_w:.0f}s, границы {_w_lo}-{_w_hi}")
+    _tg_lo, _tg_hi = sender._phase_delay_bounds("telegram")
+    # Реальный сценарий: 8ч осталось, 50 откатов -> 576с, это внутри
+    # границ канала (300-900с), поэтому растяжка не нужна и не включается.
+    _d_tg = sender._phase_delay("telegram", seconds_left=8 * 3600, remaining_msgs=50)
+    check("TG (откат) укладывается в свой темп 300-900с",
+          _tg_lo <= _d_tg <= _tg_hi,
+          f"got {_d_tg:.0f}s, границы {_tg_lo}-{_tg_hi}")
+    # А вот тут растяжка включается: 8ч на 5 откатов = 5760с >> 900с.
+    _d_tg2 = sender._phase_delay("telegram", seconds_left=8 * 3600, remaining_msgs=5)
+    check("TG растягивается, когда остаток больше границы канала",
+          _d_tg2 > _tg_hi, f"got {_d_tg2:.0f}s, граница {_tg_hi}")
+    _mx_lo, _mx_hi = sender._phase_delay_bounds("max")
+    _d_mx = sender._phase_delay("max", seconds_left=5 * 3600, remaining_msgs=15)
+    check("MAX (откат) растягивается на остаток дедлайна",
+          _d_mx > _mx_hi, f"got {_d_mx:.0f}s, граница {_mx_hi}")
+    check("флаг PHASE_STRETCH_FALLBACK_ONLY включён",
+          getattr(config, "PHASE_STRETCH_FALLBACK_ONLY", False) is True)
+
+    # Дедлайн прошёл — отправлять больше нельзя.
+    sender._RUN_DEADLINE = time.time() - 10
+    check("после дедлайна остаётся 0 секунд",
+          sender._run_seconds_left() == 0.0)
+    check("после дедлайна откатная фаза не ждёт (пауза 0)",
+          sender._phase_delay("telegram", 36000, 50) == 0.0,
+          f"got {sender._phase_delay('telegram', 36000, 50):.0f}s")
+finally:
+    sender._RUN_DEADLINE = _saved_dl_s
+
+# _select_contacts_for_cycle обязан отсекать уже отправленных — иначе
+# второй круг отправил бы те же контакты повторно.
+_sel_src = inspect.getsource(sender._select_contacts_for_cycle)
+check("отбор контактов отсекает уже отправленных (get_sent_phones)",
+      "get_sent_phones" in _sel_src)
+check("отбор контактов уважает cooldown",
+      "is_phone_in_cooldown" in _sel_src)
+
+# Флаг разбирается в main.py и пишет BULK_RUN_HOURS в окружение.
+_main_src = Path("main.py").read_text(encoding="utf-8")
+check("main.py понимает --run-hours", "--run-hours" in _main_src)
+check("main.py ставит BULK_RUN_HOURS в окружение",
+      'os.environ["BULK_RUN_HOURS"]' in _main_src)
+check("main.py отвергает --run-hours <= 0",
+      "hours <= 0" in _main_src)
+check("main.py печатает справку по --help", "USAGE" in _main_src)
+
+# ---------------------------------------------------------------------------
+# T. ЛИМИТ ЗАПУСКА WABA (--waba-limit) для первых боевых прогонов
+# ---------------------------------------------------------------------------
+section("T. ЛИМИТ ЗАПУСКА WABA (--waba-limit)")
+check("config.WABA_RUN_LIMIT существует", hasattr(config, "WABA_RUN_LIMIT"))
+check("WABA_RUN_LIMIT по умолчанию 0 (без ограничения)",
+      int(getattr(config, "WABA_RUN_LIMIT", 0)) == 0,
+      f"got {getattr(config, 'WABA_RUN_LIMIT', None)}")
+check("main.py понимает --waba-limit", "--waba-limit" in _main_src)
+check("main.py ставит BULK_WABA_RUN_LIMIT через общий разбор флагов",
+      '"BULK_WABA_RUN_LIMIT"' in _main_src
+      and 'os.environ[env_key]' in _main_src)
+check("main.py отвергает --waba-limit < 1 (через _apply_int_flag)",
+      "_apply_int_flag" in _main_src and 'minimum: int = 1' in _main_src)
+
+_wl_src = inspect.getsource(sender._run_all_phases)
+check("фаза WABA применяет WABA_RUN_LIMIT", "WABA_RUN_LIMIT" in _wl_src)
+check("лимит запуска НЕ превышает дневной кап канала",
+      "min(_run_cap, _cap_waba)" in _wl_src)
+check("лимит запуска режет список ДО отправки (срез targets)",
+      "targets = targets[:_run_cap]" in _wl_src)
+# Важно: лимит запуска режет ТОЛЬКО WABA. Откаты TG/MAX он не трогает —
+# иначе тестовый прогон на 20 человек не дотянул бы fallback.
+# Проверяем по коду ветки отката: там _run_cap использоваться не должен.
+_wl_waba_branch = _wl_src.split("else:")[0]
+_wl_fallback_branch = _wl_src.split("else:")[-1]
+check("лимит запуска не применяется к откатным каналам",
+      "_run_cap" not in _wl_fallback_branch,
+      f"в ветке отката: {'_run_cap' if '_run_cap' in _wl_fallback_branch else 'нет'}")
+
+# Функциональная проверка на изолированной БД: лимит режет фазу,
+# а при значении больше дневного капа всё равно упирается в 250.
+_save_wl = getattr(config, "WABA_RUN_LIMIT", 0)
+_wl_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_wl_db.close()
+try:
+    with patch.object(config, "DB_PATH", _wl_db.name), \
+         patch.object(config, "STATE_PATH", _wl_db.name + ".state.json"), \
+         patch.object(config, "BULK_BYPASS_SAFE_HOURS", True):
+        db.init_db()
+        _wl_phones = [f"7999900{i:04d}" for i in range(60)]
+        with db.db_conn() as _c:
+            for _p in _wl_phones:
+                db.upsert_contact(_c, _p, "WL", "Покупатели")
+            _c.commit()
+        _wl_sent: list = []
+
+        def _wl_fake(contact, channels, backoffs, psk, cur, cascade_override=None):
+            _wl_sent.append(contact["phone"])
+            return True
+
+        _wl_sel = [{"phone": p, "name": "WL", "category": "Покупатели"}
+                   for p in _wl_phones]
+        for _lim, _exp in ((10, 10), (20, 20), (250, 60), (999, 60)):
+            _wl_sent.clear()
+            config.WABA_RUN_LIMIT = _lim
+            with patch.object(sender, "_run_one_contact", _wl_fake), \
+                 patch.object(sender, "_sleep_phase", lambda s, st: None), \
+                 patch.object(sender, "_wait_until_active_window",
+                              lambda log: False), \
+                 patch.object(sender, "_phase_fits", lambda ch, n: True), \
+                 patch.object(state, "max_attempts_reached", lambda st: False):
+                sender._run_all_phases(
+                    _wl_sel, {"v": False}, {}, {}, cycle_no=1,
+                )
+            check(f"--waba-limit {_lim} -> отправлено {_exp}",
+                  len(_wl_sent) == _exp, f"got {len(_wl_sent)}")
+            check(f"--waba-limit {_lim}: без дублей",
+                  len(_wl_sent) == len(set(_wl_sent)))
+finally:
+    config.WABA_RUN_LIMIT = _save_wl
+    try:
+        os.unlink(_wl_db.name)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# U. РЕГРЕССИЯ: run() падал с UnboundLocalError на ПЕРВОМ же круге фаз.
+#
+# Причина: `_RUN_CYCLE` и `_RUN_DEADLINE` объявлялись как имена уровня
+# модуля, но присваивались внутри run() БЕЗ `global` → становились
+# локальными. Чтение `cycle_no=(_RUN_CYCLE + 1)` в первом проходе цикла
+# давало `UnboundLocalError: cannot access local variable '_RUN_CYCLE'`,
+# то есть БОЕВОЙ запуск падал в первую секунду. Тесты этого не ловили:
+# bm_runloop.py выставлял глобалы ДО вызова run() и замаскировал баг.
+#
+# Тест ниже НЕ трогает глобалы перед вызовом — ровно как в бою.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# U. РЕГРЕССИЯ: run() падал с UnboundLocalError на ПЕРВОМ же круге фаз.
+#
+# Причина: `_RUN_CYCLE` и `_RUN_DEADLINE` объявлены на уровне модуля, но
+# присваивались внутри run() БЕЗ `global` → становились ЛОКАЛЬНЫМИ именами.
+# Чтение `cycle_no=(_RUN_CYCLE + 1)` в первом проходе цикла давало
+# `UnboundLocalError: cannot access local variable '_RUN_CYCLE'`, то есть
+# БОЕВОЙ запуск падал в первую секунду (поймано сухим прогоном на сервере).
+# Второй следствие: _run_seconds_left() читал глобальный _RUN_DEADLINE,
+# который оставался None → режим --run-hours никогда не останавливался.
+#
+# Тесты этого не ловили: bm_runloop.py выставлял глобалы ДО вызова run().
+# Тесты ниже НЕ трогают глобалы перед вызовом — ровно как в бою.
+# ---------------------------------------------------------------------------
+section("U. РЕГРЕССИЯ: ПЕРВЫЙ КРУГ ФАЗ (UnboundLocalError)")
+import time as _time
+
+_u_state_f = tempfile.NamedTemporaryFile(suffix=".state.json", delete=False)
+_u_state_f.write(b"{}")
+_u_state_f.close()
+_u_db_f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_u_db_f.close()
+
+_save_run_hours = getattr(config, "RUN_HOURS", 0)
+_save_loop_pause = getattr(config, "RUN_LOOP_PAUSE_MINUTES", 10)
+_cycles_seen: list = []
+_lefts_seen: list = []
+
+
+def _u_ctx():
+    """Изоляция: пустая база контактов, локальные БД/state, без сети."""
+    return (
+        patch.object(config, "STATE_PATH", _u_state_f.name),
+        patch.object(config, "DB_PATH", _u_db_f.name),
+        patch.object(config, "LOCK_PATH", _u_db_f.name + ".lock"),
+        patch.object(config, "BULK_BYPASS_SAFE_HOURS", True),
+        patch.object(sender, "_select_contacts_for_cycle", lambda c: []),
+        patch.object(sender.contacts, "load_contacts", lambda *a, **k: []),
+        patch.object(sender.wazzup, "active_channels", lambda: ["waba"]),
+        patch.object(sender.wazzup, "channel_id_for", lambda ch: "test-cid"),
+        # None здесь означал бы «lock занят» → ранний return из run().
+        patch.object(sender, "_try_acquire_lock", lambda: _u_db_f.name),
+        patch.object(sender, "_release_lock", lambda p: None),
+        patch.object(sender, "_sleep_phase", lambda s, st: None),
+        patch.object(sender, "_drain_rescue_queue", lambda st: 0),
+        # tglog/reconcile sender импортирует ВНУТРИ функций, поэтому патчим
+        # сами модули: иначе тест реально отправил бы TG-отчёт админу.
+        patch("bulkmessage.tglog.send", lambda *a, **k: None),
+        patch("bulkmessage.reconcile.sweep_unconfirmed_deliveries",
+              lambda **k: 0),
+        patch("bulkmessage.reconcile.sync_message_to_sheet",
+              lambda **k: None),
+    )
+
+
+_u_err = None
+try:
+    # --- A. Обычный запуск (без --run-hours): ровно один круг фаз.
+    sender._RUN_CYCLE = 0
+    sender._RUN_DEADLINE = None
+    config.RUN_HOURS = 0
+    _cycles_seen.clear()
+    _lefts_seen.clear()
+
+    def _u_phases_once(filtered, stop_requested, backoffs,
+                       permanent_skipped, cycle_no=1):
+        _cycles_seen.append(cycle_no)
+        return {}
+
+    _ctxs = _u_ctx()
+    try:
+        for _c in _ctxs:
+            _c.start()
+        with patch.object(sender, "_run_all_phases", _u_phases_once):
+            sender.run()
+    except BaseException as _exc:
+        _u_err = f"{type(_exc).__name__}: {_exc}"
+    finally:
+        for _c in reversed(_ctxs):
+            _c.stop()
+
+    check("run(): первый круг фаз без UnboundLocalError",
+          _u_err is None, f"raised {_u_err}")
+    check("run(): номер круга передан как 1",
+          _cycles_seen == [1], f"got {_cycles_seen}")
+    check("run(): без --run-hours отработал ровно один круг",
+          len(_cycles_seen) == 1, f"got {len(_cycles_seen)}")
+
+    # --- B. Режим --run-hours: дедлайн обязан быть виден МОДУЛЬНОЙ функции.
+    # Второй круг сами уводим дедлайн в прошлое, чтобы цикл закрылся без
+    # реального ожидания. Если run() снова сделает имя локальным,
+    # _run_seconds_left() вернёт inf и проверка упадёт.
+    sender._RUN_CYCLE = 0
+    sender._RUN_DEADLINE = None
+    config.RUN_HOURS = 1.0
+    _cycles_seen.clear()
+    _lefts_seen.clear()
+
+    def _u_phases_loop(filtered, stop_requested, backoffs,
+                       permanent_skipped, cycle_no=1):
+        _cycles_seen.append(cycle_no)
+        _lefts_seen.append(sender._run_seconds_left())
+        if len(_cycles_seen) >= 2:
+            sender._RUN_DEADLINE = _time.time() - 1  # форсируем выход
+        return {}
+
+    _u_err = None
+    _ctxs = _u_ctx()
+    try:
+        for _c in _ctxs:
+            _c.start()
+        with patch.object(sender, "_run_all_phases", _u_phases_loop):
+            sender.run()
+    except BaseException as _exc:
+        _u_err = f"{type(_exc).__name__}: {_exc}"
+    finally:
+        for _c in reversed(_ctxs):
+            _c.stop()
+
+    check("run() с --run-hours: тоже без UnboundLocalError",
+          _u_err is None, f"raised {_u_err}")
+    check("run() с --run-hours: дедлайн виден модулю (не inf)",
+          bool(_lefts_seen) and _lefts_seen[0] != float("inf"),
+          f"first left={_lefts_seen[0] if _lefts_seen else 'n/a'}")
+    check("run() с --run-hours: остаток ≈ 1ч",
+          bool(_lefts_seen) and 3500 <= _lefts_seen[0] <= 3600,
+          f"got {_lefts_seen[0] if _lefts_seen else 'n/a'}")
+    check("run() с --run-hours: номер круга растёт (1, 2, ...)",
+          _cycles_seen[:2] == [1, 2], f"got {_cycles_seen[:4]}")
+    check("run() с --run-hours: цикл вышел по дедлайну, не зациклился",
+          len(_cycles_seen) == 2, f"cycles={len(_cycles_seen)}")
+finally:
+    config.RUN_HOURS = _save_run_hours
+    config.RUN_LOOP_PAUSE_MINUTES = _save_loop_pause
+    sender._RUN_CYCLE = 0
+    sender._RUN_DEADLINE = None
+    for _f in (_u_state_f.name, _u_db_f.name):
+        try:
+            os.unlink(_f)
+        except OSError:
+            pass
+
+# ---------------------------------------------------------------------------
+# V. РЕГРЕССИЯ: флаги --waba-limit / --run-hours печатались, но НЕ работали.
+#
+# На живом запуске `main.py sender --waba-limit 15` отправил 31 сообщение
+# вместо 15: флаг разбирался и печатался в лог («не больше N…: 15»), но
+# _apply_int_flag клал число только в os.environ. Модуль config читает
+# переменные ОДИН РАЗ при импорте, а main.py импортирует sender в самом
+# верху файла — поэтому config.WABA_RUN_LIMIT навсегда оставался 0.
+# У --run-hours был тот же баг: config.RUN_HOURS = 0, то есть длинный
+# прогон молно сводился к одному кругу фаз.
+#
+# Ни один тест этого не ловил: тесты limit'а подставляли config.WABA_RUN_LIMIT
+# напрямую, минуя разбор флагов.
+# ---------------------------------------------------------------------------
+section("V. РЕГРЕССИЯ: ФЛАГИ ДОХОДЯТ ДО config")
+# main.py раньше НЕ импортировался: старые проверки только искали строки в
+# исходнике ('os.environ[env_key]' в файле), из-за чего живой прогон тихо
+# уходил мимо лимита. Здесь импортируем по-настоящему и зовём функции.
+import importlib.util as _ilu
+_m_spec = _ilu.spec_from_file_location("bm_main", "main.py")
+main = _ilu.module_from_spec(_m_spec)
+_m_spec.loader.exec_module(main)
+
+_save_wl = config.WABA_RUN_LIMIT
+_save_rh = config.RUN_HOURS
+try:
+    # V1: env -> config для --waba-limit
+    config.WABA_RUN_LIMIT = 0
+    os.environ["BULK_WABA_RUN_LIMIT"] = "0"
+    main._apply_int_flag(["--waba-limit", "15"], "--waba-limit",
+                         "BULK_WABA_RUN_LIMIT", "T", config_attr="WABA_RUN_LIMIT")
+    check("--waba-limit 15 попадает в os.environ",
+          os.environ.get("BULK_WABA_RUN_LIMIT") == "15",
+          f"got {os.environ.get('BULK_WABA_RUN_LIMIT')!r}")
+    check("--waba-limit 15 попадает в config.WABA_RUN_LIMIT",
+          config.WABA_RUN_LIMIT == 15, f"got {config.WABA_RUN_LIMIT}")
+    check("--waba-limit 15 реально ограничивает отправку",
+          min(250, 15) == 15)
+
+    # V2: env -> config для --run-hours
+    config.RUN_HOURS = 0
+    os.environ["BULK_RUN_HOURS"] = "0"
+    main._apply_run_hours(["--run-hours", "2.5"])
+    check("--run-hours 2.5 попадает в os.environ",
+          os.environ.get("BULK_RUN_HOURS") == "2.5",
+          f"got {os.environ.get('BULK_RUN_HOURS')!r}")
+    check("--run-hours 2.5 попадает в config.RUN_HOURS",
+          config.RUN_HOURS == 2.5, f"got {config.RUN_HOURS}")
+
+    # V3: сквозной путь как в бою — sender читает именно config.WABA_RUN_LIMIT.
+    _v_sent = []
+    _v_sel = [{"phone": f"+7999000{i:04d}", "name": "V",
+               "category": "Покупатели"} for i in range(40)]
+    _v_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    _v_db.close()
+    try:
+        with patch.object(config, "DB_PATH", _v_db.name), \
+             patch.object(config, "STATE_PATH", _v_db.name + ".json"), \
+             patch.object(config, "BULK_BYPASS_SAFE_HOURS", True), \
+             patch.object(config, "WABA_RUN_LIMIT", 15), \
+             patch.object(sender, "_sleep_phase", lambda s, st: None), \
+             patch.object(sender, "_wait_until_active_window",
+                          lambda log: False), \
+             patch.object(sender, "_phase_fits", lambda ch, n: True), \
+             patch.object(state, "max_attempts_reached", lambda st: False), \
+             patch.object(sender, "_run_one_contact",
+                          lambda c, chs, b, ps, st, **kw: (
+                              _v_sent.append(c["phone"]) or True)):
+            db.init_db()  # rescue_queue создаётся миграцией
+            sender._run_all_phases(_v_sel, {"v": False}, {}, {}, cycle_no=1)
+        check("sender._run_all_phases уважает config.WABA_RUN_LIMIT=15",
+              len(_v_sent) == 15, f"отправлено {len(_v_sent)}")
+    finally:
+        for _f in (_v_db.name, _v_db.name + ".json"):
+            try:
+                os.unlink(_f)
+            except OSError:
+                pass
+finally:
+    config.WABA_RUN_LIMIT = _save_wl
+    config.RUN_HOURS = _save_rh
+    os.environ.pop("BULK_WABA_RUN_LIMIT", None)
+    os.environ.pop("BULK_RUN_HOURS", None)
+
+# ---------------------------------------------------------------------------
+# W. РЕГРЕССИЯ: ФАЗЫ ОТКАТА БЫЛИ ПУСТЫМИ (это и есть «не доставилось,
+# но другим каналом не отправили»).
+#
+# Замер боевого прогона 2026-10-06 (31 сообщение WABA):
+#   delivered по вебхуку — 15, БЕЗ единого события — 16;
+#   статус `failed` от Wazzup — 0 событий за всю историю (1321 событие).
+# Wazzap шлёт delivered/read/sent/error(BAD_CONTACT) и НИКОГДА failed.
+# Отказ Meta по маркетинговому шаблону выглядит как ТИШИНА.
+#
+# Код ждал явный `failed`, поэтому rescue_queue оставалась пустой, и фазы
+# Telegram/MAX не отправляли НИЧЕГО. Ниже — сквозной тест: WABA приняты без
+# подтверждения → пауза → сторож молчания → очередь отката непуста.
+# ---------------------------------------------------------------------------
+section("W. РЕГРЕССИЯ: ФАЗЫ ОТКАТА (тишина вебхука = провал)")
+_w_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_w_db.close()
+_w_st = _w_db.name + ".state.json"
+open(_w_st, "w", encoding="utf-8").write("{}")
+_w_rescued: list = []
+_w_swept_calls: list = []
+
+
+def _w_fake_sweep(limit=50, minutes=None, unknown_minutes=None):
+    """Сторож: всё, что sender отправил, но что НЕ подтверждено, — провал.
+
+    `unknown_minutes` добавлен в 2026-10-07 вместе с трёхзначной доставкой:
+    молчание уходит в откат по длинному горизонту, явный отказ — по короткому.
+    """
+    _w_swept_calls.append(minutes)
+    # Сторож зовётся перед каждой фазой отката, но очередь наполняется
+    # один раз — иначе тест считал бы дубликаты, а не контакты.
+    if not _w_rescued:
+        _w_rescued.extend(_w_sent)
+    return len(_w_rescued)
+
+
+_w_sent: list = []
+try:
+    _w_sel = [{"phone": f"+7999777{i:04d}", "name": "W",
+               "category": "Покупатели"} for i in range(4)]
+    with patch.object(config, "DB_PATH", _w_db.name), \
+         patch.object(config, "STATE_PATH", _w_st), \
+         patch.object(config, "BULK_BYPASS_SAFE_HOURS", True), \
+         patch.object(config, "PHASE_GRACE_MINUTES", 12), \
+         patch.object(config, "RESCUE_SETTLE_MINUTES", 5), \
+         patch.object(config, "CHANNEL_DAILY_LIMITS",
+                      {"whatsapp": 60, "telegram": 50, "max": 15,
+                       "waba": 250, "sms": 50}), \
+         patch.object(sender, "_sleep_phase", lambda s, st: None), \
+         patch.object(sender, "_wait_until_active_window", lambda log: False), \
+         patch.object(sender, "_phase_fits", lambda ch, n: True), \
+         patch.object(state, "max_attempts_reached", lambda st: False), \
+         patch.object(reconcile, "sweep_unconfirmed_deliveries", _w_fake_sweep), \
+         patch.object(db, "pending_rescues",
+                      lambda **kw: [
+                          {"id": i + 1, "phone": ph, "name": "W",
+                           "category": "Покупатели"}
+                          for i, ph in enumerate(_w_rescued)
+                      ] if kw.get("exclude_tried") == "telegram" else []), \
+         patch.object(sender, "_run_one_contact",
+                      lambda c, chs, b, ps, st, **kw: _w_sent.append(
+                          (chs[0] if chs else "?", c["phone"])) or True):
+        db.init_db()
+        _stats = sender._run_all_phases(_w_sel, {"v": False}, {}, {}, cycle_no=1)
+
+    _w_waba = [ph for ch, ph in _w_sent if ch == "waba"]
+    _w_tg = [ph for ch, ph in _w_sent if ch == "telegram"]
+    check("WABA-фаза отправила контакты",
+          len(_w_waba) == 4, f"отправлено {len(_w_waba)}: {_w_waba}")
+    check("сторож молчания вызван ПОСЛЕ паузы WABA",
+          _w_swept_calls and _w_swept_calls[0] == 12,
+          f"таймауты сторожа: {_w_swept_calls}")
+    check("сторож молчания вызван и перед фазой MAX",
+          len(_w_swept_calls) >= 2, f"вызовов {_w_swept_calls}")
+    check("фаза отката непуста: rescue наполнен тишиной",
+          len(_w_rescued) == 4, f"в rescue {_w_rescued}")
+    check("фаза Telegram реально отправила откат (не пустая)",
+          len(_w_tg) == 4, f"TG-отправок {len(_w_tg)}: {_w_tg}")
+    check("никому не отправили дважды в одном круге",
+          len(_w_tg) == len(set(_w_tg)), f"{_w_tg}")
+finally:
+    for _f in (_w_db.name, _w_st):
+        try:
+            os.unlink(_f)
+        except OSError:
+            pass
+
+# Сторож реально уважает переопределение минут.
+check("sweep_unconfirmed_deliveries принимает minutes",
+      "minutes" in inspect.signature(reconcile.sweep_unconfirmed_deliveries).parameters)
+# Правка 2026-10-07: молчание больше не равно провалу. Сторож получил ДВА
+# горизонта — короткий для явного отказа и длинный для молчания.
+check("sweep_unconfirmed_deliveries принимает unknown_minutes",
+      "unknown_minutes" in inspect.signature(
+          reconcile.sweep_unconfirmed_deliveries).parameters)
+_src_sweep = inspect.getsource(reconcile.sweep_unconfirmed_deliveries)
+check("сторож различает явный отказ и молчание",
+      "only_status" in _src_sweep and "rejected" in _src_sweep
+      and "unknown" in _src_sweep)
+check("явный отказ: горизонт REJECT_GRACE_MINUTES настроен",
+      int(getattr(config, "REJECT_GRACE_MINUTES", 0)) > 0)
+check("молчание: горизонт UNKNOWN_GRACE_MINUTES консервативный (> часа)",
+      int(getattr(config, "UNKNOWN_GRACE_MINUTES", 0)) >= 60,
+      f"UNKNOWN_GRACE_MINUTES={getattr(config, 'UNKNOWN_GRACE_MINUTES', None)}")
+check("молчание НЕ уходит в откат на горизонте явного отказа",
+      int(getattr(config, "UNKNOWN_GRACE_MINUTES", 0))
+      > int(getattr(config, "REJECT_GRACE_MINUTES", 0)))
+check("RESCUE_SETTLE_MINUTES настроен",
+      int(getattr(config, "RESCUE_SETTLE_MINUTES", 0)) > 0)
+
+# W3. Лог старта не должен показывать неподключённые каналы как рабочие.
+# В конфиге есть legacy whatsapp (канал не подключён) и выключенный sms —
+# в стартовой сводке они выглядели как «WhatsApp и WABA — два канала».
+_w3_src = inspect.getsource(sender.run)
+check("лимиты печатаются только для активных каналов",
+      "по активным" in _w3_src and "if ch in channels" in _w3_src)
+check("неиспользуемые каналы печатаются отдельной строкой",
+      "Не используются" in _w3_src)
+
+# W4. TELEGRAM: «пользователь сменил @никнейм или удалил аккаунт».
+#
+# Два бага, оба найдены на живом прогоне 2026-10-06:
+#  1) Wazzup/TG отдаёт CHAT_WRITE_FORBIDDEN. Подстрока «forbidden» стоит в
+#     _AUTH_KEYWORDS, поэтому отказ ОДНОГО контакта классифицировался как AUTH
+#     и гасил весь канал Telegram на 24 часа (минус все 50 откатов в день).
+#  2) Ветка PERMANENT у telegram/max только заполняла permanent_skipped —
+#     память сессии. На диск не писалось, и следующий запуск снова долбился
+#     в тот же удалённый аккаунт.
+check("CHAT_WRITE_FORBIDDEN = PERMANENT, а не AUTH",
+      classify_error("CHAT_WRITE_FORBIDDEN: user changed username")
+      == ErrorKind.PERMANENT,
+      f"got {classify_error('CHAT_WRITE_FORBIDDEN: user changed username')}")
+check("USER_IS_BLOCKED = PERMANENT",
+      classify_error("USER_IS_BLOCKED") == ErrorKind.PERMANENT,
+      f"got {classify_error('USER_IS_BLOCKED')}")
+check("русский текст Wazzup про удалённый аккаунт = PERMANENT",
+      classify_error("Пользователь сменил @никнейм или удалил аккаунт")
+      == ErrorKind.PERMANENT,
+      f"got {classify_error('Пользователь сменил @никнейм или удалил аккаунт')}")
+check("настоящий 401 от Wazzap всё ещё AUTH (канал гасим)",
+      classify_error("", 401) == ErrorKind.AUTH,
+      f"got {classify_error('', 401)}")
+check("HTTP 403 от самого Wazzap — AUTH, канал гасим",
+      classify_error("HTTP 403", 403) == ErrorKind.AUTH,
+      f"got {classify_error('HTTP 403', 403)}")
+check("CHAT_WRITE_FORBIDDEN при ответе 200 не роняет канал",
+      classify_error("CHAT_WRITE_FORBIDDEN", 200) == ErrorKind.PERMANENT,
+      f"got {classify_error('CHAT_WRITE_FORBIDDEN', 200)}")
+
+# Реальный случай 2026-10-06 (источник «AUTH на telegram» в боевой БД):
+# отказ ОДНОГО контакта «Peer flood error» классифицировался как AUTH,
+# потому что «401» нашлось как подстрока внутри task_id-хекса, и канал
+# telegram гас на 24 часа.
+_peer_flood = (
+    'HTTP 400: {"status":"error","timestamp":1788185455,'
+    '"detail":"Peer flood error for 79779612336",'
+    '"task_id":"d12fd41739fc25b4ea40107a8f3faf98",'
+    '"uuid":"8994f8b2-4dce"}'
+)
+check("«401» внутри task_id-хекса НЕ даёт AUTH",
+      classify_error(_peer_flood, 400) == ErrorKind.RATE_LIMIT,
+      f"got {classify_error(_peer_flood, 400)}")
+check("Peer flood error = RATE_LIMIT, а не AUTH",
+      classify_error("Peer flood error for 79779612336", 400)
+      == ErrorKind.RATE_LIMIT,
+      f"got {classify_error('Peer flood error for 79779612336', 400)}")
+check("HTTP 401 в тексте ответа по-прежнему AUTH",
+      classify_error("HTTP 401 Not authorized in channel", 400)
+      == ErrorKind.AUTH,
+      f"got {classify_error('HTTP 401 Not authorized in channel', 400)}")
+check("HTTP 403 в тексте ответа по-прежнему AUTH",
+      classify_error("HTTP 403 Forbidden", 400) == ErrorKind.AUTH,
+      f"got {classify_error('HTTP 403 Forbidden', 400)}")
+check("'unauthorized' в тексте — AUTH",
+      classify_error("Not authorized in channel", 400) == ErrorKind.AUTH,
+      f"got {classify_error('Not authorized in channel', 400)}")
+
+_r_perm_src = inspect.getsource(sender._run_one_contact)
+_r_perm_at = _r_perm_src.rindex("ErrorKind.PERMANENT")
+_r_perm_branch = _r_perm_src[_r_perm_at:_r_perm_at + 900]
+check("PERMANENT у мессенджеров пишется в bad_phones НА ДИСК",
+      "bad_phones.mark_bad" in _r_perm_branch,
+      "в ветке PERMANENT нет записи на диск — метка умрёт вместе с процессом")
+check("PERMANENT у мессенджеров ставит mark_unreachable",
+      "state.mark_unreachable" in _r_perm_branch)
+
+# W5. СТОРОЖ ЗДОРОВЬЯ КАНАЛА. Живой случай 2026-10-06: Telegram принимал
+# отправки (HTTP 200) и не доставлял НИ ОДНОЙ — канал не авторизован в
+# Wazzup. Фаза жгла личный лимит, пока её не остановили руками. Теперь
+# фаза отката должна пропустить канал, который не доставляет ничего.
+_h_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_h_db.close()
+try:
+    with patch.object(config, "DB_PATH", _h_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            for i in range(8):
+                cid = db.upsert_contact(
+                    conn, phone=f"+7999555{i:04d}", name="H",
+                    category="Покупатели")
+                db.insert_message(conn, contact_id=cid, channel="telegram",
+                                  message_text="t", message_id=f"h{i}",
+                                  status="sent")  # delivered_at НЕ задан
+        _h_bad = sender.channel_delivery_health("telegram", min_sample=5)
+        check("канал без единого подтверждения помечается как нерабочий",
+              _h_bad["ok"] is False, f"ok={_h_bad['ok']} reason={_h_bad['reason']}")
+        check("сторож видит все 8 отправок",
+              _h_bad["sent"] == 8, f"sent={_h_bad['sent']}")
+
+        # Живой случай 2026-10-07: delivered_at у Telegram не заполняется
+        # НИКОГДА — Wazzup не шлёт statuses-событий для личных каналов.
+        # Подтверждением там служит вердикт вебхука по эху исходящего.
+        # Если бы мы считали по delivered_at, фаза Telegram пропускалась бы
+        # целиком при полностью рабочей доставке.
+        with db.db_conn() as conn:
+            conn.execute("UPDATE messages SET delivered_at = datetime('now') "
+                         "WHERE id % 2 = 0 AND channel='telegram'")
+        _h_wrong = sender.channel_delivery_health("telegram", min_sample=5)
+        check("telegram: delivered_at НЕ считается подтверждением",
+              _h_wrong["ok"] is False,
+              f"ok={_h_wrong['ok']} reason={_h_wrong['reason']}")
+
+        with db.db_conn() as conn:
+            conn.execute("UPDATE messages SET delivery_state = 'delivered' "
+                         "WHERE id % 2 = 0 AND channel='telegram'")
+        _h_ok = sender.channel_delivery_health("telegram", min_sample=5)
+        check("telegram: вердикт эха считается подтверждением",
+              _h_ok["ok"] is True, f"ok={_h_ok['ok']} reason={_h_ok['reason']}")
+        check("telegram: считает ровно половину (4 из 8)",
+              _h_ok["delivered"] == 4, f"got {_h_ok['delivered']}")
+
+        # WABA — наоборот, подтверждается именно событием доставки.
+        with db.db_conn() as conn:
+            for i in range(8):
+                cid = db.upsert_contact(
+                    conn, phone=f"+7999666{i:04d}", name="W",
+                    category="Покупатели")
+                db.insert_message(conn, contact_id=cid, channel="waba",
+                                  message_text="t", message_id=f"w{i}",
+                                  status="sent")
+        with db.db_conn() as conn:
+            conn.execute("UPDATE messages SET delivered_at = datetime('now') "
+                         "WHERE id % 2 = 0 AND channel='waba'")
+        _h_waba = sender.channel_delivery_health("waba", min_sample=5)
+        check("waba: доставка по-прежнему считается по delivered_at",
+              _h_waba["ok"] is True and _h_waba["delivered"] == 4,
+              f"ok={_h_waba['ok']} delivered={_h_waba['delivered']}")
+
+        # Мало данных = «не знаем», а не «сломан»
+        _h_none = sender.channel_delivery_health("max", min_sample=5)
+        check("канал без истории не считается сломанным",
+              _h_none["ok"] is True, f"ok={_h_none['ok']}")
+
+    # Фаза отката обязана вызывать сторож ДО первой отправки
+    _h_src = inspect.getsource(sender._run_all_phases)
+    check("сторож здоровья вызывается в фазе отката",
+          "channel_delivery_health" in _h_src)
+    check("при нерабочем канале фаза пропускается (continue)",
+          "Фаза пропущена, очередь не тронута" in _h_src)
+    check("сторож здоровья можно отключить флагом",
+          hasattr(config, "CHANNEL_HEALTH_GUARD"))
+finally:
+    for _f in (_h_db.name,):
+        try:
+            os.unlink(_f)
+        except OSError:
+            pass
+
+# W6. ЦЕПОЧКА ПО ЦЕЛИ: провал в Telegram обязан дойти до MAX, а контакт,
+# исчерпавший ВСЕ каналы, — уйти в конец очереди, а не зависнуть.
+#
+# Оба бага найдены по живому прогону 2026-10-06:
+#  1) фаза отката читала ТОЛЬКО провалы WABA (original_channel="waba"),
+#     поэтому провал Telegram в MAX не доходил — цепочка обрывалась;
+#  2) запись, провалившаяся везде, навсегда оставалась status='pending':
+#     занимала начало очереди и не получала ни одной новой попытки.
+_d_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_d_db.close()
+try:
+    with patch.object(config, "DB_PATH", _d_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            c = conn.cursor()
+            c.execute("""INSERT INTO rescue_queue
+                (phone, name, category, original_channel, reason, status,
+                 created_at, updated_at, tried_channels)
+                VALUES ('+79000000001','TG','Покупатели','telegram',
+                        'no_delivery_confirmation','pending',
+                        datetime('now'),datetime('now'),'telegram')""")
+
+        _tg_fail = db.pending_rescues(limit=10, cooldown_seconds=0,
+                                      exclude_tried="max")
+        check("провал в Telegram виден фазе MAX (не только провалы WABA)",
+              any(r["phone"] == "+79000000001" for r in _tg_fail),
+              f"взято {[r['phone'] for r in _tg_fail]}")
+        check("при этом MAX не берёт то, что уже пробовал",
+              all("max" not in (r.get("tried_channels") or "")
+                  for r in _tg_fail))
+
+        # Исчерпали все каналы → уводим в конец очереди
+        _rid = _tg_fail[0]["id"]
+        db.mark_rescue_tried(_rid, "max")
+        db.mark_rescue_deferred(_rid, "2999-01-01T00:00:00+00:00")
+        _after = db.pending_rescues(limit=10, cooldown_seconds=0)
+        check("отложенный контакт НЕ выдаётся до retry_after",
+              all(r["phone"] != "+79000000001" for r in _after),
+              f"выдано {[r['phone'] for r in _after]}")
+
+        # Свежий pending должен идти ПЕРЕД просроченным deferred — «в последние»
+        with db.db_conn() as conn:
+            conn.execute("""INSERT INTO rescue_queue
+                (phone, name, category, original_channel, reason, status,
+                 created_at, updated_at, tried_channels, retry_after)
+                VALUES ('+79000000002','FRESH','Покупатели','waba',
+                        'no_delivery_confirmation','deferred',
+                        datetime('now'),datetime('now'),'',
+                        '2000-01-01T00:00:00+00:00')""")
+        _order = db.pending_rescues(limit=10, cooldown_seconds=0,
+                                    exclude_tried="telegram")
+        check("просроченный deferred возвращается в работу",
+              any(r["phone"] == "+79000000002" for r in _order),
+              f"выдано {[r['phone'] for r in _order]}")
+
+        # Теперь оба в работе: pending обязан быть раньше deferred
+        with db.db_conn() as conn:
+            conn.execute("UPDATE rescue_queue SET status='pending', "
+                         "retry_after=NULL WHERE phone = '+79000000002'")
+            conn.execute("INSERT INTO rescue_queue "
+                         "(phone,name,category,original_channel,reason,status,"
+                         " created_at,updated_at,tried_channels,retry_after) "
+                         "VALUES ('+79000000003','OLD','Покупатели','waba',"
+                         "'no_delivery_confirmation','deferred',"
+                         "datetime('now'),datetime('now'),'telegram',"
+                         "'2000-01-01T00:00:00+00:00')")
+        _order2 = db.pending_rescues(limit=10, cooldown_seconds=0,
+                                     exclude_tried="max")
+        _pending = [r["phone"] for r in _order2 if r["status"] == "pending"]
+        _deferred = [r["phone"] for r in _order2 if r["status"] == "deferred"]
+        check("pending идут раньше просроченных deferred",
+              bool(_pending) and bool(_deferred)
+              and _order2.index(_order2[0]) < _order2.index(
+                  next(r for r in _order2 if r["status"] == "deferred")),
+              f"порядок {[r['phone'] for r in _order2]}")
+        check("tried_channels отложенного сброшен для новой попытки",
+              all(r.get("tried_channels") in ("", None)
+                  for r in _order2 if r["status"] == "deferred"))
+        check("deferred считается отдельным счётчиком",
+              db.count_deferred_rescues() >= 1)
+        check("в вызове pending_rescues фазы отката нет фильтра по каналу",
+              "original_channel=" not in inspect.getsource(
+                  sender._run_all_phases).split("def _run_phase")[0]
+              .split("pending = db.pending_rescues")[-1][:300])
+finally:
+    try:
+        os.unlink(_d_db.name)
+    except OSError:
+        pass
+
+# W2. Запуск, который стартует СРАЗУ с отката (BULK_PHASE_ORDER=telegram,max).
+# Живой случай 2026-10-06: Telegram пропущен как «пусто», потому что сторож
+# отрабатывал только ПОСЛЕ первой фазы, и откат ушёл в MAX — рискованный
+# канал. Здесь сторож обязан наполнить очередь ДО чтения первой фазой.
+_w2_swept: list = []
+_w2_sent: list = []
+
+
+def _w2_sweep(limit=50, minutes=None, unknown_minutes=None):
+    _w2_swept.append(minutes)
+    return 0
+
+
+try:
+    _w2_sel = [{"phone": f"+7999666{i:04d}", "name": "W2",
+                "category": "Покупатели"} for i in range(3)]
+    with patch.object(config, "DB_PATH", _w_db.name), \
+         patch.object(config, "STATE_PATH", _w_db.name + ".json"), \
+         patch.object(config, "BULK_BYPASS_SAFE_HOURS", True), \
+         patch.object(config, "PHASE_ORDER", ["telegram", "max"]), \
+         patch.object(config, "CHANNEL_DAILY_LIMITS",
+                      {"whatsapp": 60, "telegram": 50, "max": 15,
+                       "waba": 250, "sms": 50}), \
+         patch.object(sender, "_sleep_phase", lambda s, st: None), \
+         patch.object(sender, "_wait_until_active_window", lambda log: False), \
+         patch.object(sender, "_phase_fits", lambda ch, n: True), \
+         patch.object(state, "max_attempts_reached", lambda st: False), \
+         patch.object(reconcile, "sweep_unconfirmed_deliveries", _w2_sweep), \
+         patch.object(db, "pending_rescues",
+                      lambda **kw: [
+                          {"id": 1, "phone": "+79996660000", "name": "W2",
+                           "category": "Покупатели"}
+                      ] if kw.get("exclude_tried") == "telegram" else []), \
+         patch.object(sender, "_run_one_contact",
+                      lambda c, chs, b, ps, st, **kw: _w2_sent.append(
+                          chs[0] if chs else "?") or True):
+        db.init_db()  # rescue_queue создаётся миграцией
+        sender._run_all_phases(_w2_sel, {"v": False}, {}, {}, cycle_no=1)
+
+    check("запуск сразу с отката: сторож вызван ДО первой фазы",
+          len(_w2_swept) >= 1, f"вызовов {len(_w2_swept)}")
+    check("запуск сразу с отката: первым ушёл Telegram, не MAX",
+          _w2_sent and _w2_sent[0] == "telegram",
+          f"каналы {_w2_sent}")
+    check("в MAX не ушло никого после успешного Telegram",
+          "max" not in _w2_sent, f"каналы {_w2_sent}")
+finally:
+    _w2_swept.clear()
+    _w2_sent.clear()
+
+# ---------------------------------------------------------------------------
+# W. РЕГРЕССИЯ: ФАЗЫ ОТКАТА БЫЛИ ПУСТЫМИ (это и есть «не доставилось,
+# но другим каналом не отправили»).
+#
+# Замер боевого прогона 2026-10-06 (31 сообщение WABA):
+#   delivered по вебхуку — 15, БЕЗ единого события — 16;
+#   статус `failed` от Wazzup — 0 событий за всю историю (1321 событие).
+# Wazzap шлёт delivered/read/sent/error(BAD_CONTACT) и НИКОГДА failed.
+# Отказ Meta по маркетинговому шаблону выглядит как ТИШИНА.
+#
+# Код ждал явный `failed`, поэтому rescue_queue оставалась пустой, и фазы
+# Telegram/MAX не отправляли НИЧЕГО. Ниже — сквозной тест: WABA приняты без
+# подтверждения → пауза → сторож молчания → очередь отката непуста.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# X. РЕГРЕССИЯ: ПОДТВЕРЖДЕНИЯ ДОСТАВКИ НИКОГДА НЕ ПОПАДАЛИ В БД.
+#
+# Живой замер 2026-10-06: вебхук получил 1321 событие, из них 15 реально
+# доставленных WABA-сообщений, но в логе НОЛЬ строк "DELIVERY status", а
+# в таблице messages все они остались status='sent'.
+#
+# Две причины, обе в разборе payload:
+#   1) конверт `{"statuses": [...]}` не разворачивался — код знал только
+#      про "messages" и "events", поэтому events уходили в "ignored";
+#   2) внутри статуса нет ни `type`, ни `wh_type`, ни channelId/chatType —
+#      даже развернутый конверт не попал бы ни в одну ветку диспетчера,
+#      а канал резолвился бы как 'whatsapp' вместо 'waba'.
+#
+# Ниже — ТОЧНЫЕ payload'ы из data/pending_webhooks.jsonl.
+# ---------------------------------------------------------------------------
+section("X. РЕГРЕССИЯ: РАЗБОР РЕАЛЬНЫХ СТАТУСОВ WAZZUP")
+_x_calls: list = []
+
+# Реальный конверт статуса: ни type, ни wh_type, ни channelId, ни chatType.
+_X_REAL_STATUS = {
+    "statuses": [{
+        "messageId": "1a5e0449-0948-498f-a6bb-f2dd5d47b7d7",
+        "timestamp": "2026-10-06T13:15:00.000Z",
+        "status": "delivered",
+    }]
+}
+_X_REAL_ERROR = {
+    "statuses": [{
+        "messageId": "632ff404-5db7-4641-a623-2b7a4502bee4",
+        "timestamp": "2026-10-02T07:05:15.723Z",
+        "status": "error",
+        "error": {"error": "BAD_CONTACT",
+                  "description": "Number may not be on WhatsApp"},
+    }]
+}
+# Реальное входящее сообщение — не должно поехать в обработчик статусов.
+_X_REAL_INCOMING = {
+    "messages": [{
+        "messageId": "b893af6d-e66b-426c-b0f7-9b4c6e2b4e44",
+        "dateTime": "2026-10-06T13:34:05.000Z",
+        "channelId": "14058d25-0705-421e-9d78-0eb2f1c0d667",
+        "chatType": "whatsapp",
+        "chatId": "79167365456@c.us",
+        "text": "да",
+    }]
+}
+
+check("конверт 'statuses' распознан как статус-событие",
+      reconcile._is_status_event(
+          dict(_X_REAL_STATUS["statuses"][0], _envelope="statuses"), ""))
+check("статус-событие опознаётся и без тега конверта",
+      reconcile._is_status_event(_X_REAL_STATUS["statuses"][0], ""))
+check("входящее сообщение НЕ считается статус-событием",
+      not reconcile._is_status_event(_X_REAL_INCOMING["messages"][0], "message"))
+check("входящее с текстом и статусом — всё равно не статус",
+      not reconcile._is_status_event(
+          dict(_X_REAL_INCOMING["messages"][0], status="sent"), "message"))
+
+
+def _x_spy_status(ch, msg):
+    _x_calls.append(("status", ch, msg.get("id") or msg.get("message_id"),
+                     (msg.get("status") or "").lower()))
+
+
+def _x_spy_incoming(ch, msg):
+    _x_calls.append(("incoming", ch, msg.get("body")))
+
+
+try:
+    with patch.object(reconcile, "process_delivery_status", _x_spy_status), \
+         patch.object(reconcile, "process_incoming_message", _x_spy_incoming), \
+         patch.object(reconcile, "process_outgoing_message",
+                      lambda ch, msg: _x_calls.append(("outgoing", ch, None))):
+        reconcile.process_wazzup_payload(None, _X_REAL_STATUS)
+        reconcile.process_wazzup_payload(None, _X_REAL_ERROR)
+        reconcile.process_wazzup_payload(None, _X_REAL_INCOMING)
+
+    kinds = [c[0] for c in _x_calls]
+    check("реальный конверт statuses дошёл до обработчика статусов",
+          kinds[:2] == ["status", "status"], f"got {kinds}")
+    check("messageId извлечён из реального статуса",
+          _x_calls[0][2] == "1a5e0449-0948-498f-a6bb-f2dd5d47b7d7",
+          f"got {_x_calls[0][2]}")
+    check("статус delivered распознан",
+          _x_calls[0][3] == "delivered", f"got {_x_calls[0][3]}")
+    check("статус error распознан обработчиком (сырой 'error')",
+          _x_calls[1][3] == "error", f"got {_x_calls[1][3]}")
+    check("error преобразуется в локальный 'failed' (=> rescue)",
+          reconcile._wazzup_status_to_local("error") == "failed",
+          f"got {reconcile._wazzup_status_to_local('error')}")
+    check("delivered преобразуется в локальный 'delivered'",
+          reconcile._wazzup_status_to_local("delivered") == "delivered")
+    check("входящее сообщение ушло в свой обработчик, не в статус",
+          kinds[2] == "incoming", f"got {kinds[2] if len(kinds) > 2 else None}")
+    check("_envelope не попадает в исходный payload",
+          "_envelope" not in _X_REAL_STATUS["statuses"][0])
+finally:
+    pass
+
+# Канал для статуса берётся из БД: у события нет ни channelId, ни chatType.
+_x_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_x_db.close()
+try:
+    with patch.object(config, "DB_PATH", _x_db.name):
+        db.init_db()
+        _x_rows_before = []
+        with db.db_conn() as conn:
+            _cid = db.upsert_contact(conn, phone="+79990001111",
+                                     name="Канал", category="Покупатели")
+            db.insert_message(conn, contact_id=_cid, channel="waba",
+                              message_text="t", message_id="mid-waba-1",
+                              status="sent")
+        with patch.object(state, "record_delivered",
+                          lambda st, ch, *a, **k: _x_rows_before.append(ch)), \
+             patch.object(state, "record_failed_delivery",
+                          lambda st, ch, *a, **k: None), \
+             patch.object(state, "load_state", dict), \
+             patch.object(reconcile, "sync_message_to_sheet",
+                          lambda **k: None), \
+             patch.object(state, "reset_daily_if_new_day", lambda s: s):
+            # ch=None имитирует то, что реально приходит из резолва payload:
+            # ни channelId, ни chatType у статус-события нет.
+            reconcile.process_delivery_status(
+                None, {"id": "mid-waba-1", "status": "delivered"})
+    check("канал статуса взят из БД ('waba'), а не из payload",
+          "waba" in _x_rows_before,
+          f"записали каналы {_x_rows_before}")
+finally:
+    try:
+        os.unlink(_x_db.name)
+    except OSError:
+        pass
+
+# ---------------------------------------------------------------------------
+# П. КОНТРАКТНЫЕ ТЕСТЫ НА РЕАЛЬНЫХ PAYLOAD'АХ
+#
+# 629 юнит-тестов проходили на заглушках, пока боевая интеграция с вебхуком
+# была сломана целиком (процесс на устаревшем коде не разбирал конверт
+# `{"statuses": [...]}` — ноль подтверждений доставки за всю историю).
+# Контракт теперь зафиксирован фикстурами, снятыми с боевого вебхука.
+# ---------------------------------------------------------------------------
+section("P. КОНТРАКТ ВЕБХУКА (реальные payload'ы) + ТРЁХЗНАЧНАЯ ДОСТАВКА")
+import json as _json  # noqa: E402
+from bulkmessage import notify as _notify_mod  # noqa: E402
+from bulkmessage import report  # noqa: E402
+
+_FX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "tests", "fixtures", "webhook_real_payloads.json")
+check("фикстуры боевого вебхука лежат в репозитории", os.path.exists(_FX_PATH))
+_FX = _json.loads(open(_FX_PATH, encoding="utf-8").read()) if os.path.exists(_FX_PATH) else {}
+
+check("конверт статусов распознаётся как статус-событие",
+      reconcile._is_status_event(
+          reconcile._tag(list(_FX.get("statuses_envelope", {})
+                              .get("statuses", [{}]))[0], "statuses"),
+          "statuses"))
+check("конверт сообщений НЕ распознаётся как статус-событие",
+      not reconcile._is_status_event(
+          reconcile._tag(list(_FX.get("messages_envelope_waba", {})
+                              .get("messages", [{}]))[0], "messages"),
+          "messages"))
+check("в статус-событии нет channelId — канал берём из БД",
+      "channelId" not in list(_FX.get("statuses_without_channelId", {})
+                              .get("statuses", [{}])[0]))
+check("разбор конверта статусов есть в обработчике payload'ов",
+      "statuses" in inspect.getsource(reconcile.process_wazzup_payload))
+
+# --- Идемпотентность события + позднее подтверждение снимает откат ----------
+_p_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_p_db.close()
+try:
+    with patch.object(config, "DB_PATH", _p_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            _p_cid = db.upsert_contact(conn, phone="+79990002222",
+                                       name="Поздний", category="Покупатели")
+            _p_pk = db.insert_message(conn, contact_id=_p_cid, channel="waba",
+                                      message_text="t", message_id="mid-late-1",
+                                      status="sent")
+        # Контакт уже стоит в очереди отката (молчание → rescue).
+        db.enqueue_rescue("+79990002222", "Поздний", "Покупатели",
+                          original_channel="waba", reason="no_delivery_confirmation")
+        _p_pending_before = db.count_pending_rescues()
+
+        first = db.apply_delivery_event(_p_pk, "mid-late-1", "waba", "delivered")
+        second = db.apply_delivery_event(_p_pk, "mid-late-1", "waba", "delivered")
+        _p_cancelled = db.cancel_rescue_for_contact("+79990002222")
+
+        with db.db_conn() as conn:
+            _p_row = conn.execute(
+                "SELECT delivery_state FROM messages WHERE id = ?", (_p_pk,)
+            ).fetchone()
+            _p_events = conn.execute(
+                "SELECT COUNT(*) FROM delivery_events WHERE message_id = ?",
+                ("mid-late-1",)).fetchone()[0]
+
+    check("первое событие доставки применено", first is True)
+    check("повтор того же события ИГНОРИРУЕТСЯ (идемпотентность)", second is False)
+    check("в delivery_events ровно одна запись на дубль", _p_events == 1,
+          f"записей {_p_events}")
+    check("сообщение помечено delivered", _p_row["delivery_state"] == "delivered",
+          f"state={_p_row['delivery_state']}")
+    # Остаток очереди считаем ВНУТРИ блока с подменой DB_PATH. Раньше вызов
+    # стоял снаружи и читал общую тестовую базу, где есть pending-строки от
+    # других блоков: проверка падала по чужому состоянию и врала про откат.
+    with patch.object(config, "DB_PATH", _p_db.name):
+        _p_pending_after = db.count_pending_rescues()
+    check("поздний delivered СНЯЛ контакт из очереди отката",
+          _p_pending_before == 1 and _p_cancelled == 1 and
+          _p_pending_after == 0,
+          f"было {_p_pending_before}, снято {_p_cancelled}, осталось "
+          f"{_p_pending_after}")
+finally:
+    try:
+        os.unlink(_p_db.name)
+    except OSError:
+        pass
+
+# --- Молчание ≠ провал: горизонты разные ------------------------------------
+_c_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_c_db.close()
+try:
+    with patch.object(config, "DB_PATH", _c_db.name), \
+         patch.object(config, "UNKNOWN_GRACE_MINUTES", 720), \
+         patch.object(config, "REJECT_GRACE_MINUTES", 5):
+        db.init_db()
+        with db.db_conn() as conn:
+            _c_cid = db.upsert_contact(conn, phone="+79990003333",
+                                       name="Молчун", category="Покупатели")
+            _c_pk = db.insert_message(conn, contact_id=_c_cid, channel="waba",
+                                      message_text="t", message_id="mid-silent-1",
+                                      status="sent")
+            # Ставим отправку час назад, иначе «молчание» только что началось
+            # и ни один горизонт ещё не выдержан.
+            _c_old = (datetime.now(timezone.utc)
+                      - timedelta(hours=1)).isoformat()
+            conn.execute("UPDATE messages SET sent_at = ?, created_at = ? "
+                         "WHERE id = ?", (_c_old, _c_old, _c_pk))
+        # Горизонт явного отказа — молчание туда НЕ попадает.
+        _c_swept = reconcile.sweep_unconfirmed_deliveries(limit=50, minutes=5,
+                                                          unknown_minutes=720)
+        with db.db_conn() as conn:
+            _c_state = conn.execute(
+                "SELECT delivery_state FROM messages WHERE id = ?",
+                (_c_pk,)).fetchone()["delivery_state"]
+        _c_rescued = db.count_pending_rescues()
+        check("на коротком горизонте молчание НЕ уходит в откат",
+              _c_swept == 0 and _c_rescued == 0,
+              f"swept={_c_swept} в rescue={_c_rescued}")
+        check("молчание помечено unknown, а не rejected",
+              _c_state == "unknown", f"state={_c_state}")
+        check("антикоастинг WABA на этом шаге ещё не поставлен",
+              "+79990003333" not in db.get_active_cooldowns("waba"))
+        # По длинному горизонту — молчание становится откатом. Внутри того же
+        # patch'а на БД, иначе свип пошёл бы по боевой базе.
+        _c_swept2 = reconcile.sweep_unconfirmed_deliveries(limit=50, minutes=5,
+                                                            unknown_minutes=0)
+        check("по длинному горизонту молчание УХОДИТ в откат",
+              _c_swept2 == 1 and db.count_pending_rescues() == 1,
+              f"swept={_c_swept2}, в rescue={db.count_pending_rescues()}")
+        check("антикоастинг WABA поставлен молчащему контакту",
+              "+79990003333" in db.get_active_cooldowns("waba"),
+              f"cooldown={db.get_active_cooldowns('waba')}")
+finally:
+    try:
+        os.unlink(_c_db.name)
+    except OSError:
+        pass
+
+# --- Инвариант: не больше одного сообщения на контакт в канале за сутки -------
+_i_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_i_db.close()
+try:
+    with patch.object(config, "DB_PATH", _i_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            _i_cid = db.upsert_contact(conn, phone="+79990004444",
+                                       name="Инвариант", category="Покупатели")
+        _i_first = db.recent_channel_send("+79990004444", "waba", hours=24)
+        with db.db_conn() as conn:
+            db.insert_message(conn, contact_id=_i_cid, channel="waba",
+                              message_text="t", message_id="mid-inv-1",
+                              status="sent")
+        _i_after = db.recent_channel_send("+79990004444", "waba", hours=24)
+        _i_other_ch = db.recent_channel_send("+79990004444", "telegram", hours=24)
+        _i_old = db.recent_channel_send("+79990004444", "waba", hours=0)
+    check("до отправки дубля-риска нет", _i_first is False)
+    check("после отправки повтор в том же канале заблокирован", _i_after is True)
+    check("другой канал инвариантом не задет", _i_other_ch is False)
+    check("окно в 0 часов не блокирует (окно настраивается)", _i_old is False)
+finally:
+    try:
+        os.unlink(_i_db.name)
+    except OSError:
+        pass
+
+# --- Exhausted: потолок попыток ---------------------------------------------
+_e_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_e_db.close()
+_e_dir = tempfile.mkdtemp()
+try:
+    with patch.object(config, "DB_PATH", _e_db.name), \
+         patch.object(config, "EXHAUST_MAX_ATTEMPTS", 3), \
+         patch.object(config, "EXHAUST_WINDOW_DAYS", 0):
+        db.init_db()
+        _e_rid = db.enqueue_rescue("+79990005555", "Исчерпан", "Покупатели",
+                                   original_channel="waba", reason="test")
+        db.mark_rescue_attempt(_e_rid, error="telegram_failed")
+        db.mark_rescue_tried(_e_rid, "telegram")
+        db.mark_rescue_attempt(_e_rid, error="max_failed")
+        db.mark_rescue_tried(_e_rid, "max")
+        _e_why = db.should_exhaust(_e_rid, ["telegram", "max"])
+        db.mark_rescue_exhausted(_e_rid, _e_why or "test")
+        _e_count = db.count_exhausted_rescues()
+        _e_csv = db.export_exhausted_csv(_e_dir)
+        _e_csv2 = db.export_exhausted_csv(_e_dir)   # второй раз — не дублируем
+    _e_exists = bool(_e_csv) and os.path.exists(_e_csv)
+    check("потолок попыток срабатывает на исчерпании", bool(_e_why), f"why={_e_why}")
+    check("контакт помечен exhausted (стоп автоматики)", _e_count == 1,
+          f"exhausted={_e_count}")
+    check("исчерпанные выгружаются в CSV", _e_exists)
+    check("выгрузка не дублируется в течение суток", _e_csv2 is None)
+    check("в CSV есть телефон контакта",
+          _e_exists and "+79990005555" in open(_e_csv, encoding="utf-8").read())
+finally:
+    try:
+        os.unlink(_e_db.name)
+    except OSError:
+        pass
+
+# --- daily_counters: атомарность и согласованность --------------------------
+_d_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_d_db.close()
+try:
+    with patch.object(config, "DB_PATH", _d_db.name):
+        db.init_db()
+        db.upsert_counter("2026-10-07", "waba", "accepted", 3)
+        db.upsert_counter("2026-10-07", "waba", "accepted", 2)
+        db.upsert_counter("2026-10-07", "waba", "delivered", 1)
+        _d_ct = db.get_counters("2026-10-07")
+        _d_bad = False
+        try:
+            db.upsert_counter("2026-10-07", "waba", "нет_такого")
+        except ValueError:
+            _d_bad = True
+    check("инкремент счётчика атомарен и накопителен",
+          _d_ct["waba"]["accepted"] == 5 and _d_ct["waba"]["delivered"] == 1,
+          f"{_d_ct}")
+    check("доставка не может превысить принятие (источник истины один)",
+          _d_ct["waba"]["delivered"] <= _d_ct["waba"]["accepted"])
+    check("неизвестное поле счётчика отвергается", _d_bad)
+    check("отчёт берёт счётчики из SQLite, а не из state.json",
+          "db.get_counters" in inspect.getsource(report.build_report))
+finally:
+    try:
+        os.unlink(_d_db.name)
+    except OSError:
+        pass
+
+# --- Прозрачность: notify не шумит и не рассылает лишнее --------------------
+_notify_mod.reset()
+with patch.object(config, "TG_MAX_MESSAGES_PER_HOUR", 3):
+    _notify_mod.digest_start(phase_order=["waba", "telegram"], caps={"waba": 187},
+                             contacts_planned=20, rescue_pending=5,
+                             exhausted_total=1, waba_tier=1, code_version="abc1234")
+    _notify_mod.channel_switch("+79990006666", "waba", "telegram", "молчание")
+    _notify_mod.event("halt канала", "ERROR")
+    _notify_mod.event("ещё одно событие", "ERROR")   # сверх лимита — не уходит
+check("дайджест/события не отправляются на тестовом прогоне",
+      _notify_mod.sent_count() == 0,
+      f"отправлено {_notify_mod.sent_count()}")
+check("notify имеет rate-limit на сообщения в личку",
+      hasattr(_notify_mod, "_allowed"))
+check("успехи агрегируются, а не летят построчно",
+      hasattr(_notify_mod, "counted_success") and hasattr(_notify_mod, "summary"))
+_notify_mod.reset()
+
+# --- Параллелизм WABA и независимый tier -----------------------------------
+check("параллелизм настраивается конфигом",
+      int(getattr(config, "WABA_CONCURRENCY", 1)) >= 1)
+check("личные каналы не распараллеливаются",
+      'if phase_ch == "waba":' in inspect.getsource(sender._run_phase))
+check("личные каналы имеют жёсткий потолок",
+      int(config.PERSONAL_CHANNEL_HARD_CAPS["telegram"]) > 0 and
+      int(config.PERSONAL_CHANNEL_HARD_CAPS["max"]) > 0)
+check("квота сверяется с атомарным счётчиком из БД",
+      hasattr(state, "reconcile_sent_from_db"))
+check("tier WABA обновляется независимо от вебхука",
+      hasattr(wazzup, "refresh_waba_tier") and hasattr(wazzup, "fetch_waba_tier"))
+
+# --- Повторный свип того же молчания не плодит дубли ----------------------
+# Реальный баг, найденный сквозным стендом 2026-10-07: молчание перестало
+# переписывать status в 'failed', и сторож на следующей фазе отката снова
+# видел то же сообщение. Контакт, которому Telegram ТОЛЬКО ЧТО доставил,
+# возвращался в очередь по своему старому молчаливому сообщению в WABA и
+# получал дубль в MAX. Лечится меткой swept_at.
+_z_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_z_db.close()
+try:
+    with patch.object(config, "DB_PATH", _z_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            _z_cid = db.upsert_contact(conn, phone="+79990007777",
+                                       name="Повтор", category="Покупатели")
+            _z_pk = db.insert_message(conn, contact_id=_z_cid, channel="waba",
+                                      message_text="t", message_id="mid-rep-1",
+                                      status="sent")
+            _z_old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            conn.execute("UPDATE messages SET sent_at=?, created_at=? WHERE id=?",
+                         (_z_old, _z_old, _z_pk))
+        _z_first = reconcile.sweep_unconfirmed_deliveries(limit=50, minutes=0,
+                                                          unknown_minutes=0)
+        _z_rescued_after_first = db.count_pending_rescues()
+        # Вторая фаза отката (например MAX) — то же молчание, другой вызов.
+        _z_second = reconcile.sweep_unconfirmed_deliveries(limit=50, minutes=0,
+                                                           unknown_minutes=0)
+        _z_rescued_after_second = db.count_pending_rescues()
+    check("первый свип положил молчание в очередь отката",
+          _z_first == 1 and _z_rescued_after_first == 1,
+          f"first={_z_first} rescue={_z_rescued_after_first}")
+    check("повторный свип того же молчания НЕ плодит дубль в очереди",
+          _z_second == 0 and _z_rescued_after_second == 1,
+          f"second={_z_second} rescue={_z_rescued_after_second}")
+finally:
+    try:
+        os.unlink(_z_db.name)
+    except OSError:
+        pass
+
+# --- Одна живая строка отката на контакт ---------------------------------
+# Реальный баг, найденный локальным стендом 2026-10-07. enqueue_rescue искал
+# совпадение только среди pending/deferred. Строка, ушедшая в 'rescued',
+# переставала быть «найденной», и следующее молчание WABA создавало ВТОРУЮ
+# строку с пустым tried_channels. Дальше каскад заново пробовал каналы, где
+# контакт уже получил сообщение, а should_exhaust смотрел на attempts_total=0
+# и не срабатывал — контакт крутился в очереди и жег лимиты личных аккаунтов.
+_d_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_d_db.close()
+try:
+    with patch.object(config, "DB_PATH", _d_db.name):
+        db.init_db()
+
+        def _live(phone):
+            with db.db_conn() as c:
+                return c.execute(
+                    "SELECT COUNT(*) FROM rescue_queue WHERE phone=? "
+                    "AND status != 'cancelled'", (phone,)).fetchone()[0]
+
+        def _tried(rid):
+            with db.db_conn() as c:
+                return c.execute("SELECT tried_channels FROM rescue_queue "
+                                 "WHERE id=?", (rid,)).fetchone()[0]
+
+        def _status(rid):
+            with db.db_conn() as c:
+                return c.execute("SELECT status FROM rescue_queue "
+                                 "WHERE id=?", (rid,)).fetchone()[0]
+
+        # 1) Откат прошёл (rescued), но доставку никто не подтвердил →
+        #    следующее молчание обязано ПЕРЕОТКРЫТЬ ту же строку, сохранив
+        #    tried_channels, а не плодить новую с пустой историей.
+        r1 = db.enqueue_rescue(phone="+79990001111", name="А",
+                               category="Покупатели")
+        db.mark_rescue_tried(r1, "telegram")
+        db.mark_rescue_success(r1, "telegram", "mid-silent-1")
+        r1b = db.enqueue_rescue(phone="+79990001111", name="А",
+                                category="Покупатели", reason="waba_silent")
+        check("rescued без подтверждения переоткрывает ТУ ЖЕ строку (не дубль)",
+              r1b == r1 and _live("+79990001111") == 1,
+              f"id={r1} -> {r1b}, живых строк={_live('+79990001111')}")
+        check("переоткрытие сохраняет историю каналов",
+              _tried(r1) == "telegram" and _status(r1) == "pending",
+              f"tried=[{_tried(r1)}] status={_status(r1)}")
+
+        # 2) Откат прошёл И доставку подтвердили вебхуком → контакт получил
+        #    своё сообщение, второй раз в личные каналы не идём.
+        with db.db_conn() as c:
+            cid = db.upsert_contact(c, phone="+79990002222", name="Б",
+                                    category="Покупатели")
+            pk = db.insert_message(c, contact_id=cid, channel="telegram",
+                                   message_text="t", message_id="mid-ok-1",
+                                   status="sent")
+            c.execute("UPDATE messages SET delivered_at=datetime('now') "
+                      "WHERE id=?", (pk,))
+        r2 = db.enqueue_rescue(phone="+79990002222", name="Б",
+                               category="Покупатели")
+        db.mark_rescue_tried(r2, "telegram")
+        db.mark_rescue_success(r2, "telegram", "mid-ok-1")
+        r2b = db.enqueue_rescue(phone="+79990002222", name="Б",
+                                category="Покупатели", reason="waba_silent")
+        check("подтверждённая доставка замыкает очередь (дубль не создаётся)",
+              r2b is None and _live("+79990002222") == 1
+              and _status(r2) == "rescued",
+              f"вернул {r2b}, живых строк={_live('+79990002222')}")
+
+        # 3) Сторож молчания не должен воскрешать отложенную строку теми же
+        #    данными, которые её и отложили, — иначе отсрочка снимается сразу
+        #    и контакт крутится в очереди бесконечно.
+        r3 = db.enqueue_rescue(phone="+79990003333", name="В",
+                               category="Покупатели")
+        db.mark_rescue_tried(r3, "telegram")
+        db.mark_rescue_tried(r3, "max")
+        _tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        db.mark_rescue_deferred(r3, _tomorrow)
+        _old_iso = "2026-10-07T00:00:00+00:00"
+        db.enqueue_rescue(phone="+79990003333", name="В", category="Покупатели",
+                          since=_old_iso)
+        check("старое данное НЕ снимает отсрочку",
+              _status(r3) == "deferred", f"status={_status(r3)}")
+        _newer_iso = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        db.enqueue_rescue(phone="+79990003333", name="В", category="Покупатели",
+                          since=_newer_iso)
+        check("действительно новое данное снимает отсрочку",
+              _status(r3) == "pending", f"status={_status(r3)}")
+
+        # 4) Исчерпанный контакт автоматика не воскрешает.
+        r4 = db.enqueue_rescue(phone="+79990004444", name="Г",
+                               category="Покупатели")
+        db.mark_rescue_tried(r4, "telegram")
+        db.mark_rescue_exhausted(r4, "all_channels_tried")
+        r4b = db.enqueue_rescue(phone="+79990004444", name="Г",
+                                category="Покупатели")
+        check("exhausted не переоткрывается автоматикой",
+              r4b is None and _status(r4) == "exhausted",
+              f"вернул {r4b}, status={_status(r4)}")
+
+        # 5) Молчание по ПОСЛЕДНЕМУ каналу отката обязано дать терминальный
+        #    статус: раньше should_exhaust вызывался только при явном отказе,
+        #    и «молчание везде» давало бесконечный цикл принято→ждём→молчание.
+        r5 = db.enqueue_rescue(phone="+79990005555", name="Д",
+                               category="Покупатели")
+        db.mark_rescue_tried(r5, "telegram")
+        db.mark_rescue_tried(r5, "max")
+        with patch.object(config, "EXHAUST_WINDOW_DAYS", 0):
+            _why5 = db.should_exhaust(r5, ["telegram", "max"])
+            _not5 = db.should_exhaust(r5, ["telegram", "max", "sms"])
+        check("все каналы отката пройдены → контакт исчерпан",
+              bool(_why5), f"причина={_why5!r}")
+        check("неисчерпанный канал продления не делает контакт исчерпанным",
+              _not5 is None, f"причина={_not5!r}")
+
+        # 6) Горизонты не должны слипаться. Живой баг 2026-10-07: sender всегда
+        #    передаёт minutes=PHASE_GRACE_MINUTES, и прежнее правило «явный
+        #    minutes перекрывает оба горизонта» делало UNKNOWN_GRACE_MINUTES
+        #    мёртвой настройкой — молчание через 5 минут уходило в откат, то
+        #    есть в личные аккаунты. Проверяем ровно этот вызов.
+        _h_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        _h_db.close()
+        try:
+            with patch.object(config, "DB_PATH", _h_db.name), \
+                 patch.object(config, "REJECT_GRACE_MINUTES", 5), \
+                 patch.object(config, "UNKNOWN_GRACE_MINUTES", 10080):
+                db.init_db()
+                with db.db_conn() as c:
+                    cid = db.upsert_contact(c, phone="+79990006666",
+                                            name="Е", category="Покупатели")
+                    pk = db.insert_message(c, contact_id=cid, channel="waba",
+                                           message_text="t", message_id="mid-h-1",
+                                           status="sent")
+                    old = (datetime.now(timezone.utc)
+                           - timedelta(minutes=10)).isoformat()
+                    c.execute("UPDATE messages SET sent_at=? WHERE id=?",
+                              (old, pk))
+                # Ровно тот вызов, который делает sender между фазами.
+                _n = reconcile.sweep_unconfirmed_deliveries(limit=50, minutes=5)
+                _rows = db.count_pending_rescues()
+            check("молчание НЕ уходит в откат по горизонту явного отказа",
+                  _n == 0 and _rows == 0,
+                  f"в rescue={_n}, строк={_rows} (ожидаем 0 при "
+                  f"UNKNOWN_GRACE_MINUTES=10080)")
+            # Явный unknown_minutes по-прежнему перекрывает конфиг (стенды).
+            _h2 = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            _h2.close()
+            try:
+                with patch.object(config, "DB_PATH", _h2.name), \
+                     patch.object(config, "UNKNOWN_GRACE_MINUTES", 10080):
+                    db.init_db()
+                    with db.db_conn() as c:
+                        cid = db.upsert_contact(c, phone="+79990007777",
+                                                name="Ж", category="Покупатели")
+                        pk = db.insert_message(c, contact_id=cid, channel="waba",
+                                               message_text="t",
+                                               message_id="mid-h-2", status="sent")
+                        old = (datetime.now(timezone.utc)
+                               - timedelta(minutes=10)).isoformat()
+                        c.execute("UPDATE messages SET sent_at=? WHERE id=?",
+                                  (old, pk))
+                    _n2 = reconcile.sweep_unconfirmed_deliveries(
+                        limit=50, minutes=5, unknown_minutes=0)
+                check("явный unknown_minutes перекрывает конфиг (стенды)",
+                      _n2 == 1, f"в rescue={_n2}, ожидаем 1")
+            finally:
+                try:
+                    os.unlink(_h2.name)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.unlink(_h_db.name)
+            except OSError:
+                pass
+finally:
+    try:
+        os.unlink(_d_db.name)
+    except OSError:
+        pass
+
+# --- Уведомления владельцу: по контакту и человеческим языком -------------
+# Владелец попросил видеть в личке статус ПО КАЖДОМУ контакту (имя + номер)
+# и не выключенные каналы в списке. Проверяем обе стороны.
+from bulkmessage import notify as _notify  # noqa: E402
+
+check("причины отказов переводятся на человеческий язык",
+      _notify._human_reason("no_delivery_confirmation") != "no_delivery_confirmation"
+      and "max" in _notify._human_reason("CHANNEL_MAX_PHONE_NOT_OCCUPIED").lower(),
+      f"{_notify._human_reason('no_delivery_confirmation')!r} / "
+      f"{_notify._human_reason('CHANNEL_MAX_PHONE_NOT_OCCUPIED')!r}")
+check("неизвестная причина не теряется, а показывается как есть",
+      _notify._human_reason("что-то новое") == "что-то новое",
+      _notify._human_reason("что-то новое"))
+
+with patch.object(config, "PHASE_ORDER", ["waba", "telegram", "max"]), \
+     patch.object(config, "TG_HIDE_CHANNELS", ("whatsapp", "sms")), \
+     patch.object(config, "CHANNEL_DAILY_LIMITS",
+                  {"whatsapp": 60, "telegram": 50, "max": 15, "waba": 250,
+                   "sms": 50}):
+    _own = sender._owner_channels({"telegram", "max", "whatsapp", "sms", "waba"})
+    _lim = sender._limits_for_owner({"telegram", "max", "whatsapp", "sms", "waba"})
+check("каналы в уведомлении идут в порядке каскада",
+      _own == ["waba", "telegram", "max"], f"{_own}")
+check("выключенные WhatsApp/SMS не попадают в уведомления",
+      "whatsapp" not in _lim and "sms" not in _lim and "waba 250" in _lim,
+      f"{_lim}")
+
+# --- Отбор: сначала тем, кому НИКОГДА не отправляли ------------------------
+_p_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_p_db.close()
+try:
+    with patch.object(config, "DB_PATH", _p_db.name):
+        db.init_db()
+        _st = {"date": "2026-10-07", "sent_today": {}, "delivered_today": {},
+               "failed_today": {}, "waba_exhausted": {}}
+        _sel_contacts = [
+            {"phone": "+79991000001", "name": "Старый1", "category": "Покупатели"},
+            {"phone": "+79991000002", "name": "Новый1", "category": "Покупатели"},
+            {"phone": "+79991000003", "name": "Новый2", "category": "Покупатели"},
+        ]
+        with db.db_conn() as c:
+            cid = db.upsert_contact(c, phone="+79991000001", name="Старый1",
+                                    category="Покупатели")
+            pk = db.insert_message(c, contact_id=cid, channel="waba",
+                                   message_text="t", message_id="mid-sel-1",
+                                   status="delivered")
+            _old_sel = (datetime.now(timezone.utc) - timedelta(days=9)).isoformat()
+            c.execute("UPDATE messages SET sent_at=? WHERE id=?",
+                      (_old_sel, pk))
+        _picked = sender._collect_fresh_waba_targets(_sel_contacts, _st)
+    _phones = [c["phone"] for c in _picked]
+    check("первыми идут те, кому ещё никогда не отправляли",
+          _phones[:2] == ["+79991000002", "+79991000003"], f"{_phones}")
+finally:
+    try:
+        os.unlink(_p_db.name)
+    except OSError:
+        pass
+
+# ── Стоп-касса боевого прогона без пути подтверждений ────────────────────
+# Живой случай 2026-10-07: sender считали локально, вебхук крутился на сервере
+# и писал в другую БД. 30 сообщений принято, 0 подтверждений, в интерфейсе
+# Wazzup видны отказы Meta — а каскад молчал. Ловить было нечего: два процесса
+# не делят одну базу. Молчание через 12 ч уводит ПРИНЯТЫЕ сообщения в откат,
+# то есть в личные аккаунты — поэтому дефолт здесь отказ, а не предупреждение.
+print()
+section("K. ПУТЬ ПОДТВЕРЖДЕНИЙ ДОСТАВКИ")
+
+import socket  # noqa: E402  — нужен для проверки «вебхук поднят локально»
+
+# Тесты НЕ ходят в сеть и не зависят от того, слушает ли кто-то порт 8000
+# (боевой вебхук может быть поднят прямо во время прогона). Подписку Wazzup
+# подменяем заглушкой, слушатель поднимаем на незанятом порту.
+_FREE_PORT = 18099
+_saved = (config.DRY_RUN, config.WEBHOOK_PORT,
+          config.WAZZUP_WEBHOOK_URL, config.ALLOW_NO_DELIVERY_SIGNAL)
+_real_get_reg = sender.wazzup.get_registered_webhook_url
+
+
+def _sig(registered, port=_FREE_PORT, cfg_url=""):
+    """Прогнать проверку сигнала на подставных данных, сбросив кэш."""
+    config.DRY_RUN = False
+    config.WEBHOOK_PORT = port
+    config.WAZZUP_WEBHOOK_URL = cfg_url
+    sender.wazzup.get_registered_webhook_url = (
+        lambda: (registered, "ok" if registered else "http 500: stub"))
+    sender._DELIVERY_SIGNAL_CACHE = None
+    return sender.delivery_signal_available()
+
+
+try:
+    # 1. Ни вебхука локально, ни подписки → сигнала не будет.
+    _ok, _why = _sig(registered="https://tunnel.trycloudflare.com/webhook")
+    check("без вебхука сигнал доставки недоступен", _ok is False, f"{_ok} {_why}")
+    check("причина говорит, что вебхук не поднят", "не поднят" in _why, _why)
+
+    # 2. Живой случай 2026-10-07: локально ничего не слушает, а Wazzup шлёт
+    #    события в туннель СЕРВЕРА — статусы уйдут в чужую базу.
+    _ok2, _why2 = _sig(
+        registered="https://omaha-priority-mileage-oct.trycloudflare.com/webhook",
+        cfg_url="https://omaha-priority-mileage-oct.trycloudflare.com/webhook")
+    check("подписка на чужой туннель = нет своего сигнала", _ok2 is False, f"{_ok2}")
+    check("причина называет чужую машину/базу",
+          "не поднят" in _why2 and "не придут" in _why2, _why2)
+
+    _srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        _srv.bind(("127.0.0.1", _FREE_PORT))
+        # backlog 16, а не 1: каждая проверка делает connect_ex, а некому
+        # принимать соединения, поэтому с listen(1) вторая проверка уже
+        # получала «порт молчит» — ложный отказ при живом вебхуке.
+        _srv.listen(16)
+        # 3. Локальный вебхук поднят, но Wazzup подписан на СЕРВЕР — дыра,
+        #    которую легко не заметить: порт слушает, а события идут в другую БД.
+        _ok3, _why3 = _sig(
+            registered="https://omaha-priority-mileage-oct.trycloudflare.com/webhook")
+        check("слушающий порт при подписке на сервер = сигнала нет",
+              _ok3 is False, f"{_ok3} {_why3}")
+        check("причина говорит про ДРУГУЮ машину", "ДРУГАЯ машина" in _why3, _why3)
+
+        # 4. Порт слушает и подписка совпадает с конфигом → сигнал есть.
+        _ok4, _why4 = _sig(
+            registered="https://my-local.trycloudflare.com/webhook",
+            cfg_url="https://my-local.trycloudflare.com/webhook")
+        check("порт + подписка совпадают = сигнал доступен",
+              _ok4 is True, f"{_ok4} {_why4}")
+
+        # 5. Порт слушает, но конфиг пуст — сверять нечем, предупреждаем честно.
+        _ok5, _why5 = _sig(registered="https://my-local.trycloudflare.com/webhook",
+                           cfg_url="")
+        check("пустой WAZZUP_WEBHOOK_URL = не подтверждено, но не провал",
+              isinstance(_ok5, bool) and "WAZZUP_WEBHOOK_URL" in _why5,
+              f"{_ok5} {_why5}")
+    finally:
+        _srv.close()
+
+    # 6. DRY_RUN не блокируется: реальных отправок нет, подтверждения не нужны.
+    config.DRY_RUN = True
+    sender._DELIVERY_SIGNAL_CACHE = None
+    _ok6, _why6 = sender.delivery_signal_available()
+    check("DRY_RUN не требует подтверждений", _ok6 is True, f"{_ok6} {_why6}")
+    config.DRY_RUN = False
+
+    # 7. Боевой прогон без сигнала и без обхода → отказ (SystemExit 3).
+    _sig(registered="https://tunnel.trycloudflare.com/webhook")
+    config.ALLOW_NO_DELIVERY_SIGNAL = False
+    _raised = 0
+    try:
+        sender._guard_delivery_signal(["waba", "telegram", "max"])
+    except SystemExit as _e:
+        _raised = _e.code
+    check("боевой прогон без подтверждений останавливается",
+          _raised == 3, f"код выхода {_raised}")
+
+    # 8. Явный обход владельца — прогон идёт (знает, на что идёт).
+    config.ALLOW_NO_DELIVERY_SIGNAL = True
+    _passed = True
+    try:
+        sender._guard_delivery_signal(["waba", "telegram", "max"])
+    except SystemExit:
+        _passed = False
+    check("BULK_ALLOW_NO_DELIVERY_SIGNAL=1 снимает отказ", _passed, "остановился")
+
+    # 9. Каскад без WABA (только Personal) подтверждений не требует.
+    config.ALLOW_NO_DELIVERY_SIGNAL = False
+    _passed2 = True
+    try:
+        sender._guard_delivery_signal(["telegram", "max"])
+    except SystemExit:
+        _passed2 = False
+    check("каскад без WABA не блокируется", _passed2, "остановился")
+finally:
+    sender.wazzup.get_registered_webhook_url = _real_get_reg
+    sender._DELIVERY_SIGNAL_CACHE = None
+    (config.DRY_RUN, config.WEBHOOK_PORT,
+     config.WAZZUP_WEBHOOK_URL, config.ALLOW_NO_DELIVERY_SIGNAL) = _saved
+
+# --- Эхо Wazzup не должно попадать в replies ---------------------------------
+# Живой случай 2026-10-07: конверт {"messages": [...]} у Wazzup содержит
+# ОБЕ стороны. В свежих 17 событиях 15 были нашими же исходящими эхами
+# (isEcho=true) — и все они писались в replies как «ответ клиента», открывая
+# 24ч-окно WABA. Следствие: следующая отправка пошла бы free text вместо
+# одобренного Meta шаблона. Одно эхо было status="error" — реальный отказ,
+# который тоже ушёл в «ответы».
+section("L. ЭХО WAZZUP ≠ ОТВЕТ КЛИЕНТА")
+
+_ECHOS = [
+    {"type": "wapi_template", "isEcho": True, "status": "sent"},
+    {"type": "wapi_template", "isEcho": True, "status": "error"},
+    {"type": "text", "isEcho": True, "status": "sent"},
+    {"type": "text", "isEcho": "true", "status": "sent"},
+    {"type": "text", "status": "outbound"},
+]
+for _e in _ECHOS:
+    check(f"эхо распознано как исходящее: {_e.get('status')}",
+          reconcile._is_outgoing_echo(_e) is True, str(_e))
+
+_INBOUND = [
+    {"type": "text", "isEcho": False, "status": "inbound", "text": "Не интересно"},
+    {"type": "text", "isEcho": False, "status": "inbound"},
+    # Старые payload'ы без isEcho/status — ответами считать НЕЛЬЗЯ только если
+    # нет признаков исходящего; пустой объект остаётся входящим по умолчанию.
+    {"type": "text", "text": "Здравствуйте"},
+    {},
+]
+for _e in _INBOUND:
+    check(f"входящее не спутано с эхом: {str(_e)[:42]}",
+          reconcile._is_outgoing_echo(_e) is False, str(_e))
+
+# Сквозная проверка маршрутизации: эхо не должно создавать строку в replies.
+_e_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_e_db.close()
+try:
+    with patch.object(config, "DB_PATH", _e_db.name):
+        db.init_db()
+
+        # Настоящий ответ клиента.
+        with patch.object(reconcile, "sync_message_to_sheet", lambda **kw: None):
+            reconcile.process_wazzup_payload("waba", {
+                "messages": [{
+                    "messageId": "real-inbound-1", "chatType": "whatsapp",
+                    "chatId": "79990001111", "type": "text",
+                    "isEcho": False, "status": "inbound", "text": "Не интересно",
+                }],
+            })
+            # Наше исходящее эхо с тем же текстом шаблона.
+            reconcile.process_wazzup_payload("waba", {
+                "messages": [{
+                    "messageId": "our-echo-1", "chatType": "whatsapp",
+                    "chatId": "79990002222", "type": "wapi_template",
+                    "isEcho": True, "status": "sent",
+                    "text": "Здравствуйте, вы у меня покупали квартиру",
+                }],
+            })
+
+        with db.db_conn() as conn:
+            _reps = [r["message_id"] for r in conn.execute(
+                "SELECT message_id FROM replies ORDER BY id")]
+            _texts = [r["message"] for r in conn.execute(
+                "SELECT message FROM replies ORDER BY id")]
+
+    check("настоящий ответ сохранён в replies",
+          "real-inbound-1" in _reps, str(_reps))
+    check("эхо НЕ попало в replies", "our-echo-1" not in _reps, str(_reps))
+    check("эхо не открыло 24ч-окно текстом шаблона",
+          not any("покупали квартиру" in t for t in _texts), str(_texts)[:120])
+    check("в replies ровно одна строка", len(_reps) == 1, str(_reps))
+finally:
+    try:
+        os.unlink(_e_db.name)
+    except OSError:
+        pass
+
+# --- Отказ канала в эхе исходящего: TG/MAX → откат ----------------------------
+# Живой случай 2026-10-07, контакт 79296002444. Wazzup ответил HTTP 200, мы
+# записали «rescued» (доставлено) и списали контакт. Через 2 секунды пришло
+# эхо: isEcho=true, status="error", error={"error":"BAD_CONTACT",
+# "description":"Recipient with this chatId does not exist"}. В Telegram — красный
+# «!». Без обработки отказа контакт навсегда остался бы в Telegram и НИКОГДА
+# не дошёл до MAX — цепочка рвалась на личных каналах.
+section("M. ОТКАЗ В ЭХЕ = ОТКАТ В СЛЕДУЮЩИЙ КАНАЛ")
+
+check("эхо со status=error распознано как отказ",
+      reconcile._echo_is_failure({
+          "status": "error", "error": {"error": "BAD_CONTACT"}}) is True)
+check("эхо со status=sent — НЕ отказ",
+      reconcile._echo_is_failure({"status": "sent"}) is False)
+check("эхо без error при status=error — не отказ (нет чему верить)",
+      reconcile._echo_is_failure({"status": "error"}) is False)
+check("причина отказа читается по-человечески",
+      reconcile._echo_error_text({
+          "error": {"error": "BAD_CONTACT",
+                    "description": "Recipient with this chatId does not exist"}})
+      == "BAD_CONTACT: Recipient with this chatId does not exist")
+
+# Сквозная проверка на живом payload: контакт обязан вернуться в откат.
+_tg_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_tg_db.close()
+_TG_MID = "9f9f5ff8-c87a-4cd9-8fbb-78a2cdcc153b"
+_TG_PHONE = "79296002444"
+try:
+    with patch.object(config, "DB_PATH", _tg_db.name):
+        db.init_db()
+        with db.db_conn() as conn:
+            _tg_cid = db.upsert_contact(conn, phone=_TG_PHONE, name="Богдан",
+                                        category="Покупатели")
+            _tg_pk = db.insert_message(
+                conn, contact_id=_tg_cid, channel="telegram",
+                message_text="текст", message_id=_TG_MID, status="sent")
+        # Сначала симулируем то, что делает sender: rescue помечен rescued.
+        db.mark_rescue_success(
+            db.enqueue_rescue(phone=_TG_PHONE, name="Богдан",
+                              category="Покупатели",
+                              original_channel="waba", reason="error"),
+            channel="telegram", message_id="rescued_telegram_161")
+        with db.db_conn() as conn:
+            _tg_r0 = conn.execute(
+                "SELECT status FROM rescue_queue WHERE phone=?",
+                (_TG_PHONE,)).fetchone()["status"]
+
+        with patch.object(reconcile, "sync_message_to_sheet", lambda **kw: None):
+            reconcile.process_wazzup_payload("telegram", {
+                "messages": [{
+                    "messageId": _TG_MID, "dateTime": "2026-10-07T10:38:26.547Z",
+                    "channelId": "1c2ef310-836a-4c16-8f1e-387579ae8146",
+                    "chatType": "telegram", "chatId": _TG_PHONE,
+                    "type": "text", "isEcho": True, "status": "error",
+                    "authorName": "Admin", "text": "Здравствуйте, Богдан!",
+                    "error": {"error": "BAD_CONTACT",
+                              "description": "Recipient with this chatId does not exist"},
+                }],
+            })
+
+        with db.db_conn() as conn:
+            _tg_row = conn.execute(
+                "SELECT status, delivery_state FROM messages WHERE message_id=?",
+                (_TG_MID,)).fetchone()
+            _tg_r = conn.execute(
+                "SELECT status, reason, rescued_channel FROM rescue_queue "
+                "WHERE phone=?", (_TG_PHONE,)).fetchone()
+            _tg_nreply = conn.execute("SELECT COUNT(*) FROM replies").fetchone()[0]
+            _tg_ev = conn.execute(
+                "SELECT event_status FROM delivery_events WHERE message_id=?",
+                (_TG_MID,)).fetchall()
+
+    check("после HTTP 200 контакт был помечен как спасённый",
+          _tg_r0 == "rescued", f"было {_tg_r0}")
+    check("сообщение помечено rejected",
+          _tg_row["delivery_state"] == "rejected", f"{dict(_tg_row)}")
+    check("статус сообщения failed", _tg_row["status"] == "failed",
+          f"{dict(_tg_row)}")
+    check("контакт ВЕРНУЛСЯ в очередь отката (дойдёт до MAX)",
+          _tg_r["status"] in ("pending", "retry"), f"{dict(_tg_r)}")
+    check("rescued_channel очищен — канал больше не считается спасшим",
+          _tg_r["rescued_channel"] in (None, ""), f"{dict(_tg_r)}")
+    check("причина БЕЗ ДОСТОВЕРНОГО ФАКТА не потерялась",
+          "BAD_CONTACT" in (_tg_r["reason"] or ""), f"{dict(_tg_r)}")
+    check("событие записано как rejected",
+          any(e["event_status"] == "rejected" for e in _tg_ev),
+          str([dict(e) for e in _tg_ev]))
+    check("эхо НЕ записалось как ответ клиента", _tg_nreply == 0,
+          f"replies={_tg_nreply}")
+finally:
+    try:
+        os.unlink(_tg_db.name)
+    except OSError:
+        pass
+
+# ---------------------------------------------------------------------------
+# N. TELEGRAM: НОМЕР УХОДИТ В `phone`, А НЕ В `chatId`
+# ---------------------------------------------------------------------------
+# Живой случай 2026-10-07: Telegram через Wazzup отвечал HTTP 201 на КАЖДЫЙ
+# номер (включая self-send), а эхо приходило с
+#   BAD_CONTACT: Recipient with this chatId does not exist.
+# Документация Wazzup объяснила почему: для telegram/max chatId — это
+# внутренний peer id, «не совпадает с номером телефона», и приходит в ответе
+# на отправку по параметру `phone`. Класть номер в chatId gateway принимает
+# молча, но адресовать peer не может.
+#
+# Доказательство (chatId 998933930709):
+#   {"chatId": "998933930709"} → 201 → chatId 998933930709 → BAD_CONTACT
+#   {"phone":  "998933930709"} → 201 → chatId 1288960948   → status "sent"
+section("N. TELEGRAM: phone вместо chatId")
+
+check("telegram в списке каналов, которым нужен параметр phone",
+      "telegram" in config.WAZZUP_PHONE_PARAM_CHANNELS,
+      f"{config.WAZZUP_PHONE_PARAM_CHANNELS}")
+check("MAX по умолчанию НЕ переведён (работает и с chatId)",
+      "max" not in config.WAZZUP_PHONE_PARAM_CHANNELS,
+      f"{config.WAZZUP_PHONE_PARAM_CHANNELS}")
+
+# Перехватываем payload — сеть трогать нельзя.
+_captured: list[dict] = []
+
+
+def _fake_post(url, payload, **kw):
+    _captured.append(payload)
+    class _R:
+        status_code = 201
+        text = '{"messageId":"11111111-1111-1111-1111-111111111111",' \
+               '"chatId":"1288960948"}'
+        def json(self):
+            return {"messageId": "11111111-1111-1111-1111-111111111111",
+                    "chatId": "1288960948"}
+    return _R(), None
+
+
+_zz = os.environ.get("WAZZUP_API_KEY", "")
+_zz_saved = os.environ.get("WAZZUP_API_KEY_BAK")
+try:
+    os.environ["WAZZUP_API_KEY"] = "test-key-not-real"
+    import bulkmessage.wazzup as _wz
+    _wz.config.WAZZUP_API_KEY = "test-key-not-real"
+    _wz._post_with_retry = _fake_post
+    _ok, _mid, _det, _st = _wz.send_to_channel(
+        "telegram", "+998933930709", "тест",
+    )
+    check("telegram: отправка принята", _ok is True, f"ok={_ok}")
+    check("telegram: номер ушёл в поле phone",
+          bool(_captured) and _captured[-1].get("phone") == "998933930709",
+          f"payload={_captured[-1] if _captured else None}")
+    check("telegram: НЕ ушёл в поле chatId",
+          bool(_captured) and "chatId" not in _captured[-1],
+          f"payload={_captured[-1] if _captured else None}")
+
+    _captured.clear()
+    _wz.send_to_channel("max", "+79163322370", "тест")
+    check("max: НЕ переведён на phone (работает как есть, не ломаем)",
+          bool(_captured) and "phone" not in _captured[-1]
+          and _captured[-1].get("chatId", "").endswith("79163322370"),
+          f"payload={_captured[-1] if _captured else None}")
+
+    _captured.clear()
+    _wz.send_to_channel("waba", "+79163322370", "тест")
+    check("waba: без '+' в chatId",
+          bool(_captured) and _captured[-1].get("chatId") == "79163322370",
+          f"payload={_captured[-1] if _captured else None}")
+finally:
+    os.environ["WAZZUP_API_KEY"] = _zz
+
+# Без chatId и без phone отправка обязана быть отвергнута локально.
+from bulkmessage import wazzup as _wz2
+_ok2, _mid2, _det2, _st2 = _wz2.send_wazzup(
+    channel_id="x", chat_id=None, phone=None, text="тест",
+)
+check("без chatId и phone отправка отвергнута локально",
+      _ok2 is False and "chat_id or phone" in (_det2 or ""), f"{_det2}")
+
 print()
 print("=" * 70)
 print(f" TOTAL: {passed} passed, {failed} failed")

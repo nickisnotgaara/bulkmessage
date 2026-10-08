@@ -211,3 +211,91 @@ def build_message(
     raw = _expand_spintax(raw, variant_index=variant_index)
 
     return _clean_greeting(_format_template(raw, name))
+
+
+# ---------------------------------------------------------------------------
+# SMS-шаблоны (короткие, отдельный файл Message_script_sms.md)
+# ---------------------------------------------------------------------------
+# SMS тарифицируется ПО СЕГМЕНТАМ: 70 символов = 1 сегмент (~8.4-8.5 ₽).
+# Мессенджерные тексты (330-380 символов) = 5-6 сегментов = 42-51 ₽,
+# поэтому SMS-канал ОБЯЗАН использовать собственный короткий источник.
+
+
+def load_sms_templates(path: Optional[str] = None) -> dict[str, list[str]]:
+    """Парсит Message_script_sms.md в {категория: [вариант, ...]}.
+
+    Формат — тот же, что у load_all_variants (## Категория + строки "1) ..."):
+    строки внутри одной категории склеиваются в один вариант, категория может
+    содержать несколько блоков, разделённых пустой строкой-заголовком.
+    В SMS длинные тексты недопустимы, поэтому на практике на категорию
+    приходится один короткий блок "1) ...". Длина проверяется бюджетом
+    сегментов в sms_ru.exceeds_segment_budget().
+    """
+    p = Path(path or config.SMSRU_TEMPLATES_PATH)
+    if not p.exists():
+        return {}
+    text = p.read_text(encoding="utf-8")
+    by_cat: dict[str, list[str]] = {}
+    current_category: Optional[str] = None
+    current_lines: list[str] = []
+
+    def _commit():
+        nonlocal current_lines
+        if current_category and current_lines:
+            txt = " ".join(current_lines).strip()
+            if txt:
+                by_cat.setdefault(current_category, []).append(txt)
+            current_lines = []
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        cat_name = stripped.lstrip("#").strip()
+        if cat_name in config.TEMPLATE_MAP:
+            _commit()
+            current_category = cat_name
+        elif current_category and stripped.startswith("1)"):
+            clean = re.sub(r"^1\)\s*", "", stripped)
+            current_lines.append(clean)
+    _commit()
+    return by_cat
+
+
+def build_sms_message(
+    contact: dict,
+    sms_templates: dict[str, list[str]],
+    variant_index: Optional[int] = None,
+) -> str:
+    """Строит короткий SMS-текст для контакта.
+
+    Отличается от build_message тем, что:
+    - берёт вариант из списка (round-robin по variant_index), а не склеивает всё;
+    - чистит приветствие аккуратнее: без имени строка вида
+      "Здравствуйте, ! Проект..." схлопывается в "Здравствуйте! Проект...";
+    - НЕ подставляет «коллега» для агентов — в 70 символах каждый символ
+      на счету, а «коллега» занимает 7.
+    """
+    category = contact.get("category", "")
+    raw_name = _safe_name(contact.get("name", ""))
+    normalized = normalize_category(category)
+
+    variants = sms_templates.get(normalized) or []
+    if not variants:
+        # Фолбэк на тот же источник, что и мессенджеры, — чтобы каскад не
+        # терял контакт из-за отсутствия SMS-файла. Бюджет сегментов всё
+        # равно проверит sms_ru.exceeds_segment_budget() перед отправкой.
+        fallback = build_message(contact, {}, variant_index=variant_index)
+        return fallback
+
+    idx = 0 if variant_index is None else variant_index % len(variants)
+    raw = variants[idx]
+    raw = _expand_spintax(raw, variant_index=variant_index)
+    text = _format_template(raw, raw_name)
+
+    # Убираем висячие знаки препинания, когда имени нет: "Здравствуйте, !" -> "Здравствуйте!"
+    if not raw_name:
+        text = re.sub(r"([,;:!])\s*([!,.])", r"\2", text)
+        text = re.sub(r"Здравствуйте,\s*", "Здравствуйте! ", text)
+        text = re.sub(r"Добрый день,\s*", "Добрый день! ", text)
+    return re.sub(r"\s{2,}", " ", text).strip()

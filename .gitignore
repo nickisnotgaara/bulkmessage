@@ -121,3 +121,18 @@ sender.lock
 deploy_server.ps1
 deploy_*.ps1
 deploy_*.sh
+
+# Локальные бинари (cloudflared 52 МБ — качается через
+# `py start_webhook.py --install` в ./tools, в репозитории ему не место)
+tools/
+*.exe
+
+# Артефакты арены (промпты, решения, scratch субагентов)
+.arena/
+
+# Диагностика
+diag.sh
+_check_sheets_server.py
+
+# Логи прогонов стендов/тестов (пересоздаются при каждом запуске)
+*.out

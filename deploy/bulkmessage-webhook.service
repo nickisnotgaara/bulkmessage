@@ -1,0 +1,30 @@
+[Unit]
+# Вебхук Wazzup24: сервер + cloudflared quick-tunnel + автоподписка Wazzup.
+# Живёт как сервис, чтобы процесс НЕ МОГ молча остаться на старом коде:
+# после раскладки deploy.sh делает systemctl restart и сверяет code_version
+# в /health с локальным git sha.
+Description=bulkmessage Wazzup24 webhook receiver
+Documentation=file:/opt/bulkmessage/AGENTS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/bulkmessage
+Environment=BULK_WEBHOOK_PORT=8010
+# --keep-url: quick-tunnel URL живёт ровно пока живёт процесс, поэтому по
+# умолчанию start_webhook.py откатывает WAZZUP_WEBHOOK_URL в .env.local при
+# выходе. Здесь это неправильное поведение: sender и preflight — отдельные
+# процессы, они читают .env.local и должны видеть текущий URL. С
+# --keep-url URL остаётся в .env.local после остановки сервиса.
+ExecStart=/usr/bin/python3 /opt/bulkmessage/start_webhook.py --keep-url
+# Restart=always: после рестарта подписка Wazzup пересоздаётся на новый
+# quick-tunnel URL, и события не должны теряться, если процесс упал.
+Restart=always
+RestartSec=10
+StandardOutput=append:/tmp/webhook_new.log
+StandardError=append:/tmp/webhook_new.log
+
+[Install]
+WantedBy=multi-user.target
