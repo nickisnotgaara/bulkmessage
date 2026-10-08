@@ -4854,7 +4854,7 @@ class _FakeSheetMgr:
     def ensure_header(self):
         return True
     def build_row_payload(self, **kw):
-        return [""] * 13
+        return [""] * len(_sh_cfg.GSHEET_HEADERS)
     def append_or_update(self, **kw):
         _sheets_logged.append(kw.get("message_id"))
         return True
@@ -4892,8 +4892,14 @@ check("Sheets: индекс строки НЕ вычисляется как len(
       "вычисление индекса по позиции возвращает индекс чужой строки")
 check("Sheets: индекс берётся у самой таблицы (ws.row_count)",
       "ws.row_count" in _src_sheets)
-check("Sheets: find_row пропускает строки без message_id",
-      "if not message_id:" in inspect.getsource(
+# Раньше здесь стояло «find_row пропускает строки без message_id» — тест на
+# СТАРУЮ семантику «строка = попытка». После перехода схемы на «строка = человек»
+# проверять message_id нельзя: у строки человека он один (последний), и второе
+# событие вебхука дописало бы ему ещё одну строку вместо обновления этой.
+check("Sheets: find_row ищет строку по телефону, игнорируя message_id",
+      "if not message_id:" not in inspect.getsource(
+          _sheets_mod.SheetsManager.find_row)
+      and "if not phone:" in inspect.getsource(
           _sheets_mod.SheetsManager.find_row))
 
 # --- S12: отчёт даёт честные числа, а не «попытки» ------------------------
@@ -5369,7 +5375,7 @@ from bulkmessage import export_sheets as _exp  # noqa: E402
 _base = dict(
     phone="+79001000000", name="Тест", category="Покупатели", channel="telegram",
     cascade="waba:rejected → telegram:sent",
-    has_whatsapp="yes", has_telegram="yes", has_max="no", reached=False,
+    has_whatsapp="yes", has_telegram="yes", has_max="no", reached="No",
     message="текст", sent_at="2026-01-02T03:04:05+00:00", delivered_at=None,
     read_at=None, answered_at=None,
     last_error="", reply="", last_activity=None, message_id="wazz-x1",
@@ -5378,7 +5384,7 @@ _row = _sh.SHEETS.build_row_payload(**_base)
 check("строка листа совпадает по длине с заголовком",
       len(_row) == len(_sh.config.GSHEET_HEADERS),
       f"{len(_row)} vs {len(_sh.config.GSHEET_HEADERS)}")
-check("Reached=No, когда нет ни доставки, ни прочтения, ни ответа",
+check("Reached=No, когда ни один канал не сработал",
       _row[_sh.config.GSHEET_COL["Reached"]] == "No")
 check("Channel хранит успешный канал, а не ошибку каскада",
       _row[_sh.config.GSHEET_COL["Channel"]] == "telegram")
@@ -5392,9 +5398,9 @@ check("есть колонки доступности по каждому кан
 # Прочитать можно только доставленное, поэтому read доказывает доставку
 # сильнее её отсутствия. На этом стояли 78 человек, которые без этой логики
 # выпадали из статистики как «не доставлено».
-check("Reached=Yes по прочтению, даже без подтверждения доставки",
-      _sh.SHEETS.build_row_payload(**{**_base, "reached": True})[
-          _sh.config.GSHEET_COL["Reached"]] == "Yes")
+check("Reached трёхзначный: Yes/Likely/No проходят как есть",
+      _sh.SHEETS.build_row_payload(**{**_base, "reached": "Likely"})[
+          _sh.config.GSHEET_COL["Reached"]] == "Likely")
 check("Answered хранит ВРЕМЯ ответа, а не Yes/нет",
       _sh.SHEETS.build_row_payload(
           **{**_base, "answered_at": "2026-01-03T06:07:08+00:00"})[
@@ -5449,7 +5455,7 @@ check("Channel = канал, которым дошли, а не отказавш
 check("Cascade сохраняет, где именно сломалось",
       _p[0]["cascade"] == "waba:rejected → telegram:delivered",
       _p[0]["cascade"])
-check("Reached=Yes, если дошёл хотя бы один канал", _p[0]["reached"] is True)
+check("Reached=Yes, если дошёл хотя бы один канал", _p[0]["reached"] == "Yes", _p[0]["reached"])
 
 # Все каналы дали отказ — честное «ни один», а не последний неудачный канал.
 _p2 = _agg([_att("waba", "rejected", status="failed"),
@@ -5457,7 +5463,7 @@ _p2 = _agg([_att("waba", "rejected", status="failed"),
 check("Channel = none of them, когда не сработал ни один канал",
       _p2[0]["channel"] == "none of them", _p2[0]["channel"])
 check("Reached=No, когда ни один канал не доставил",
-      _p2[0]["reached"] is False)
+      _p2[0]["reached"] == "No", _p2[0]["reached"])
 
 # Вердикты доступности приходят из contact_channel_state.
 _p3 = _agg([_att("waba", "delivered", delivered_at="2026-10-01T10:01:00+00:00")],
@@ -5468,6 +5474,24 @@ check("Has Telegram=no при вердикте absent",
       _p3[0]["has_telegram"] == "no", _p3[0]["has_telegram"])
 check("Has MAX=unknown, если вердикта нет",
       _p3[0]["has_max"] == "unknown", _p3[0]["has_max"])
+
+# --- T14: живое обновление листа не разошлось с выгрузкой ------------------
+# Регрессия, внесённая при переходе на «строка = человек»: sync_message_to_sheet
+# продолжал собирать payload ПОПЫТКИ (delivery_state/status/contact_id/consent),
+# а build_row_payload после смены схемы требует cascade/has_*/reached. Вызов
+# падал в TypeError, sender ловил его в except — и тихо переставал писать в
+# таблицу, пока отчёт продолжал показывать прошлую выгрузку.
+import inspect as _insp14  # noqa: E402
+_sync_src = _insp14.getsource(_sh.sync_message_to_sheet)
+check("живая синхронизация зовёт агрегатор, а не собирает payload попытки",
+      "aggregate_contact(" in _sync_src
+      and "contact_id=" not in _sync_src.split("aggregate_contact(")[0][-200:])
+check("поиск строки листа идёт по телефону, а не по (телефон, канал, id)",
+      "find_row(self, phone: str)" in
+      _insp14.getsource(_sh.SheetsManager.find_row).replace("        ", ""))
+check("в ключе кеша больше нет message_id — иначе одна строка на попытку",
+      "_row_cache.get(phone)" in
+      _insp14.getsource(_sh.SheetsManager.cached_row))
 
 # --- cleanup --------------------------------------------------------------
 with db.db_conn() as _c:

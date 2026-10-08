@@ -187,7 +187,7 @@ class SheetsManager:
             has_whatsapp,
             has_telegram,
             has_max,
-            "Yes" if reached else "No",
+            reached if reached in ("Yes", "Likely", "No") else "No",
             message,
             self._format_dt(sent_at),
             self._format_dt(delivered_at),
@@ -199,23 +199,24 @@ class SheetsManager:
             message_id or "",
         ]
 
-    def find_row(self, phone: str, channel: str, message_id: str) -> Optional[int]:
-        """Индекс строки в таблице для конкретной ОТПРАВКИ.
+    def find_row(self, phone: str) -> Optional[int]:
+        """Индекс строки в таблице для этого ЧЕЛОВЕКА.
 
-        Ключ — (phone, channel, message_id). message_id уникален на каждую
-        отправку, поэтому вторая отправка тому же человеку принципиально не
-        может совпасть с первой строкой: это не баг поиска, а семантика
-        «строка = попытка отправки».
+        Ключ — только телефон. Раньше ключом был (phone, channel, message_id),
+        то есть «строка = попытка отправки», и один человек занимал в таблице
+        три строки: WABA отказ, Telegram успех, MAX отказ. Схема листа теперь
+        «строка = человек», поэтому и поиск обязан быть по одному ключу —
+        иначе каждое событие вебхука дописывало бы ещё одну строку тому же
+        человеку вместо обновления существующей.
 
         Кеш в памяти работает только как ускоритель; источник истины — сама
         таблица. Сканирование идёт по ЛОКАЛЬНЫМ значениям, без повторных
         сетевых запросов на каждую строку.
         """
-        if not message_id:
+        if not phone:
             return None
-        cache_key = (phone, channel, message_id)
-        if cache_key in self._row_cache:
-            return self._row_cache[cache_key]
+        if phone in self._row_cache:
+            return self._row_cache[phone]
         ws = self._get_worksheet()
         if ws is None:
             return None
@@ -234,22 +235,17 @@ class SheetsManager:
         header = all_values[0]
         try:
             i_phone = header.index("Phone")
-            i_channel = header.index("Channel")
-            i_msg_id = header.index("Message ID")
         except ValueError:
             self._log().error(
-                "Google Sheets: в заголовке нет Phone/Channel/Message ID — "
-                "строка не найдена"
+                "Google Sheets: в заголовке нет Phone — строка не найдена"
             )
             return None
 
-        need = max(i_phone, i_channel, i_msg_id)
         for idx, row in enumerate(all_values[1:], start=2):
-            if len(row) <= need:
+            if len(row) <= i_phone:
                 continue
-            if (row[i_phone] == phone and row[i_channel] == channel
-                    and row[i_msg_id] == message_id):
-                self._row_cache[cache_key] = idx
+            if row[i_phone] == phone:
+                self._row_cache[phone] = idx
                 return idx
         return None
 
@@ -270,14 +266,11 @@ class SheetsManager:
             if ws is None:
                 return False
             try:
-                existing = self.find_row(phone, channel, message_id)
+                existing = self.find_row(phone)
                 if existing:
                     ws.update(f"A{existing}", [row_data])
-                    self._row_cache[(phone, channel, message_id)] = existing
-                    self._log().info(
-                        f"Google updated row {existing} for {phone}/{channel} "
-                        f"(msg_id={message_id})"
-                    )
+                    self._row_cache[phone] = existing
+                    self._log().info(f"Google updated row {existing} for {phone}")
                     return True
 
                 ws.append_row(row_data, value_input_option="USER_ENTERED")
@@ -288,19 +281,17 @@ class SheetsManager:
                 # Именно это наблюдалось: gsheet_row 43 был назначен трём разным
                 # сообщениям.
                 new_idx = int(ws.row_count)
-                self._row_cache[(phone, channel, message_id)] = new_idx
-                self._log().info(
-                    f"Google appended row {new_idx} for {phone}/{channel} "
-                    f"(msg_id={message_id})"
-                )
+                self._row_cache[phone] = new_idx
+                self._log().info(f"Google appended row {new_idx} for {phone}")
                 return True
             except Exception as e:
                 self._log().error(f"Google Sheets: append_or_update ошибка: {e}")
                 self._last_error = str(e)
                 return False
 
-    def cached_row(self, phone: str, channel: str, message_id: str) -> Optional[int]:
-        return self._row_cache.get((phone, channel, message_id))
+    def cached_row(self, phone: str, channel: str = "",
+                   message_id: str = "") -> Optional[int]:
+        return self._row_cache.get(phone)
 
 
 SHEETS = SheetsManager()
@@ -374,30 +365,23 @@ def sync_message_to_sheet(
         if r and r["mx"] and (not last_activity or r["mx"] > last_activity):
             last_activity = r["mx"]
 
-        payload = {
-            "phone": row["phone"],
-            "name": row["name"] or "",
-            "category": row["category"] or "",
-            "channel": channel,
-            "message": row["message_text"] or "",
-            "sent_at": row["sent_at"],
-            "delivered_at": row["delivered_at"],
-            "read_at": row["read_at"],
-            "answered_at": row["answered_at"],
-            "delivery_state": row["delivery_state"] or "unknown",
-            "status": status,
-            "last_error": row["last_error"] or "",
-            "reply": reply,
-            "last_activity": last_activity,
-            "message_id": row["message_id"] or "",
-            "contact_id": row["contact_id"],
-            "consent": row["consent"] or "unknown",
-        }
+        payload = None
         message_pk_resolved = row["id"]
 
     if not SHEETS.enabled:
         return False
 
+    # Живое обновление строит ту же свёртку по человеку, что и выгрузка.
+    # Раньше здесь собиралась строка ПОПЫТКИ (delivery_state/status/contact_id),
+    # и после перехода схемы листа на «строка = человек» это давало TypeError
+    # на каждой отправке: sender ловил его в except и тихо переставал писать
+    # в таблицу, а отчёт продолжал с прошлой выгрузки.
+    from .export_sheets import aggregate_contact
+
+    person = aggregate_contact(row["contact_id"])
+    if person is None:
+        return False
+    payload = person
     row_data = SHEETS.build_row_payload(**payload)
     ok = SHEETS.append_or_update(
         row_data=row_data,

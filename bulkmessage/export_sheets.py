@@ -157,11 +157,7 @@ def aggregate_people(records: list[dict], verdicts: dict) -> list[dict]:
             "has_whatsapp": _verdict_cell(wa),
             "has_telegram": _verdict_cell(tg),
             "has_max": _verdict_cell(mx),
-            "reached": any(
-                a["delivered_at"] or a["read_at"] or a["answered_at"]
-                or a["delivery_state"] == "delivered"
-                for a in attempts
-            ),
+            "reached": _reached_level(attempts),
             "message": best["message_text"] or "",
             "sent_at": best["sent_at"],
             "delivered_at": next(
@@ -178,6 +174,58 @@ def aggregate_people(records: list[dict], verdicts: dict) -> list[dict]:
         })
     people.sort(key=lambda p: p["phone"])
     return people
+
+
+def aggregate_contact(contact_id: int) -> Optional[dict]:
+    """Свёрнутая запись по ОДНОМУ контакту — для живого обновления листа.
+
+    Живой sender дописывает лист по мере отправки, а ``export_sheets`` пишет
+    его целиком. Оба обязаны считать одинаково, иначе первый же ответ вебхука
+    после выгрузки вернёт в таблицу старую модель «строка = попытка» и размножит
+    человека на три строки. Поэтому обе точки зовут один и тот же агрегатор.
+    """
+    from .db import db_conn
+
+    with db_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        attempts = [dict(r) for r in conn.execute(
+            _EXPORT_SQL + " AND m.contact_id = ?", (contact_id,)).fetchall()]
+        verdict_row = conn.execute(
+            "SELECT MAX(CASE WHEN channel IN ('waba','whatsapp') THEN verdict END) AS wa,"
+            "       MAX(CASE WHEN channel='telegram' THEN verdict END) AS tg,"
+            "       MAX(CASE WHEN channel='max' THEN verdict END) AS mx"
+            "  FROM contact_channel_state WHERE contact_id = ?",
+            (contact_id,)).fetchone()
+    if not attempts:
+        return None
+    verdicts = {contact_id: (verdict_row["wa"], verdict_row["tg"],
+                             verdict_row["mx"])}
+    return aggregate_people(attempts, verdicts)[0]
+
+
+def _reached_level(attempts: list[dict]) -> str:
+    """«Дошло ли до человека» — в трёх значениях, а не в двух.
+
+    Двоичный Yes/No здесь врёт. Wazzup НЕ шлёт ``statuses``-событий для
+    telegram/max: их единственный сигнал — эхо исходящего, и при успехе оно
+    сообщает ``status: sent``, а не ``delivered``. Подтверждение приходит
+    только когда человек прочитал или ответил. Поэтому у реально доставленного
+    сообщения в Telegram стояло Reached=No — то есть колонка врала ровно о том,
+    ради чего её и делали.
+
+    Значения:
+      Yes    — подтверждено: delivered_at / read_at / answered_at / delivered.
+      Likely — принято транспортом, отрицательного вердикта нет. Для WABA это
+               ожидаемое промежуточное состояние (подтверждение приходит за
+               секунды), для Telegram/MAX — единственное доступное утверждение.
+      No     — все попытки явно отклонены.
+    """
+    if any(a["delivered_at"] or a["read_at"] or a["answered_at"]
+           or a["delivery_state"] == "delivered" for a in attempts):
+        return "Yes"
+    if any(_RANK.get(_outcome(a), 1) < 2 for a in attempts):
+        return "Likely"
+    return "No"
 
 
 def build_rows(people: list[dict]) -> list[list[str]]:
@@ -218,11 +266,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     people_rows = aggregate_people(records, collect_verdicts())
     rows = build_rows(people_rows)
 
-    reached = sum(1 for p in people_rows if p["reached"])
+    _levels: dict = {}
+    for p in people_rows:
+        _levels[p["reached"]] = _levels.get(p["reached"], 0) + 1
     print(f"Лист: {config.GOOGLE_WORKSHEET_NAME}")
     print(f"Попыток в базе: {len(records)}")
     print(f"Строк в листе (каждая = один человек): {len(people_rows)}")
-    print(f"Дошло до человека: {reached}")
+    print("Reached: "
+          + ", ".join(f"{k}={v}" for k, v in sorted(_levels.items())))
+    print(f"  из них подтверждено доставкой/прочтением: {_levels.get('Yes', 0)}")
     by_channel: dict = {}
     for p in people_rows:
         by_channel[p["channel"]] = by_channel.get(p["channel"], 0) + 1

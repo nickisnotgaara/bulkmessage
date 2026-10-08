@@ -1187,7 +1187,24 @@ def reconcile_sheets_queue() -> None:
             continue
         try:
             payload = json.loads(row["payload"])
-            row_data = sheets.SHEETS.build_row_payload(**payload)
+            try:
+                row_data = sheets.SHEETS.build_row_payload(**payload)
+            except TypeError:
+                # payload в старом формате (схема листа менялась). БД —
+                # источник истины, поэтому строка пересобирается заново,
+                # а не повторяется вечно в попытке вызвать TypeError.
+                from .export_sheets import aggregate_contact
+                with db.db_conn() as _c2:
+                    _pid = row["message_pk"] if "message_pk" in row.keys() else None
+                    _r = (_c2.execute(
+                        "SELECT contact_id FROM messages WHERE id = ?", (_pid,)
+                    ).fetchone() if _pid else None)
+                    _cid = _r[0] if _r else None
+                _person = aggregate_contact(_cid) if _cid else None
+                if _person is None:
+                    raise
+                row_data = sheets.SHEETS.build_row_payload(**_person)
+                payload = _person
             ok = sheets.SHEETS.append_or_update(
                 row_data=row_data,
                 phone=payload.get("phone", ""),
