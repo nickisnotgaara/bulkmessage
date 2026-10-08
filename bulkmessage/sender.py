@@ -304,13 +304,18 @@ def _persist_success(phone: str, name: str, category: str, channel: str,
             )
         if sheets.SHEETS.enabled:
             try:
-                sync_message_to_sheet(
+                _synced = sync_message_to_sheet(
                     contact_id=contact_id,
                     channel=channel,
                     status="sent",
                     message_pk=message_pk,
                 )
-                log.info(f"Google Sheets синхронизирован (pk={message_pk})")
+                # Раньше здесь стоял log.info безусловно, и в DRY_RUN он писал
+                # «синхронизировано» для каждого контакта, хотя sync вернул False:
+                # sheets.py отбрасывает dryrun_* как нереальную отправку. Строка
+                # врала ровно тогда, когда её читали, чтобы верить.
+                if _synced:
+                    log.info(f"Google Sheets синхронизирован (pk={message_pk})")
             except Exception as e:
                 log.error(f"sync_message_to_sheet error: {e}")
         # Владельцу нужен статус ПО КАЖДОМУ контакту: кто, какой номер, какой
