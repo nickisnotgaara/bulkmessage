@@ -848,6 +848,16 @@ def _run_one_contact(
             log.info(
                 f"WABA [{ch_count_sent + 1}/{limit}] отправляем {phone} ({name})…"
             )
+            try:
+                from . import tglog as _tg
+                _tg.send(
+                    f"Отправка #{ch_count_sent + 1}/{limit} · канал WABA · Wazzup\n"
+                    f"Кому: {phone} ({name})\n"
+                    f"Категория: {category or '—'}",
+                    "INFO",
+                )
+            except Exception:
+                pass
             # Решаем: template или free text (24ч-окно).
             # Окно открывает ОТВЕТ КОНТАКТА, а не наша отправка.
             in_24h_window = state.is_waba_in_24h_window(current_state, phone)
@@ -1133,6 +1143,21 @@ def _run_one_contact(
             f"{channel.upper()} [{ch_attempt}/{limit}] "
             f"отправляем {phone} ({name}) через {transport_label}…"
         )
+        # Прозрачность прогона: каждое отправленное сообщение уходит в Telegram
+        # отдельной строкой с каналом и транспортом. Раньше в Telegram приходили
+        # только агрегаты («принято 15»), а по ним невозможно понять, кому
+        # именно ушло и по какой дороге.
+        try:
+            from . import tglog as _tg
+            _tg.send(
+                f"Отправка #{ch_attempt}/{limit} · канал {channel.upper()} · "
+                f"{transport_label}\n"
+                f"Кому: {phone} ({name})\n"
+                f"Категория: {category or '—'}",
+                "INFO",
+            )
+        except Exception:
+            pass
 
         # DRY-RUN: пропускаем реальный вызов, только имитируем успех
         if config.DRY_RUN:
@@ -1398,7 +1423,7 @@ def _filter_by_presence(pending: list[dict], channel: str) -> list[dict]:
     а отправка вслепую — это и есть та трата личного лимита, ради которой
     затевалась проба.
     """
-    kept, dropped = [], 0
+    kept, dropped_phones = [], []
     with db.db_conn() as conn:
         cur = conn.cursor()
         for row in pending:
@@ -1417,12 +1442,25 @@ def _filter_by_presence(pending: list[dict], channel: str) -> list[dict]:
             if found and found["verdict"] == "present":
                 kept.append(row)
             else:
-                dropped += 1
-    if dropped:
+                dropped_phones.append(phone)
+    if dropped_phones:
         log.info(
             f"Фильтр наличия аккаунта ({channel}): "
-            f"пропущено {dropped} контактов без подтверждённого аккаунта"
+            f"пропущено {len(dropped_phones)} контактов без подтверждённого аккаунта"
         )
+        # Каждый пропущенный номер уходит в Telegram отдельной строкой: иначе
+        # «пропущено 9 контактов» не отвечает на вопрос «кого именно мы не
+        # смогли тронуть и на каком канале». Именно этого не хватало, чтобы
+        # понимать, куда вообще можно достучаться.
+        try:
+            from . import tglog as _tg
+            _head = f"Нет канала {channel} у {len(dropped_phones)} контактов — отправка невозможна:\n"
+            _body = "\n".join(f"  {_p}" for _p in dropped_phones[:15])
+            if len(dropped_phones) > 15:
+                _body += f"\n  … и ещё {len(dropped_phones) - 15}"
+            _tg.send(_head + _body, "WARNING")
+        except Exception:
+            pass
     return kept
 
 
