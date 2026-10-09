@@ -165,20 +165,25 @@ WABA_TIER_LIMITS = {
 MAX_PERSONAL_DAILY_HARD_CAP = 30  # legacy-значение, ниже не используется
 
 # Жёсткие потолки для личных аккаунтов: env НЕ может их превысить.
+#
+# ВНИМАНИЕ (решение владельца 2026-10-08): MAX поднят 15 → 20.
+# Это ОСОЗНАННЫЙ РИСК: 3-5 жалоб = перманентный бан ЛИЧНОГО номера MAX.
+# Защита — COMPLAINT_HALT_THRESHOLD_MAX (2 жалобы за 24ч → halt канала),
+# она срабатывает независимо от дневного капа.
 PERSONAL_CHANNEL_HARD_CAPS = {
     "telegram": 50,
-    "max": 15,
+    "max": 20,
 }
 
 ORIGINAL_ACCOUNT_DAILY_HARD_CAPS = {
     "waba": 250,
     "telegram": 50,
-    "max": 15,
+    "max": 20,
 }
 
 # --- Daily limits ---
 # WABA — отдельный ключ (BULK_LIMIT_WABA) или авто из tier.
-# Personal-каналы ограничены PERSONAL_CHANNEL_HARD_CAPS (TG 50, MAX 15).
+# Personal-каналы ограничены PERSONAL_CHANNEL_HARD_CAPS (TG 50, MAX 20).
 def _safe_limit(ch: str, default: int, hard_cap: int = 10**9) -> int:
     val = int(os.environ.get(f"BULK_LIMIT_{ch.upper()}", str(default)))
     return min(val, hard_cap)
@@ -186,9 +191,9 @@ def _safe_limit(ch: str, default: int, hard_cap: int = 10**9) -> int:
 CHANNEL_DAILY_LIMITS = {
     "whatsapp": _safe_limit("whatsapp", 60),
     "telegram": _safe_limit(
-        "telegram", 40, hard_cap=PERSONAL_CHANNEL_HARD_CAPS["telegram"]),
+        "telegram", 50, hard_cap=PERSONAL_CHANNEL_HARD_CAPS["telegram"]),
     "max": _safe_limit(
-        "max", 15, hard_cap=PERSONAL_CHANNEL_HARD_CAPS["max"]),
+        "max", 20, hard_cap=PERSONAL_CHANNEL_HARD_CAPS["max"]),
     "waba": _safe_limit("waba", 250),
     # SMS — fallback последней надежды. НЕ ограничен MAX_PERSONAL_DAILY_HARD_CAP:
     # SMS идёт через агрегатор с зарегистрированным именем отправителя, а не через
@@ -416,22 +421,61 @@ GOOGLE_SHEET_ID = os.environ.get("BULK_GOOGLE_SHEET_ID", "")
 GOOGLE_CREDENTIALS_JSON = os.environ.get(
     "BULK_GOOGLE_CREDENTIALS_JSON", str(DATA_DIR / "credentials.json")
 )
-GOOGLE_WORKSHEET_NAME = os.environ.get("BULK_GOOGLE_WORKSHEET", "Messages")
+GOOGLE_WORKSHEET_NAME = os.environ.get("BULK_GOOGLE_WORKSHEET", "new_messages")
+
+# Схема листа отправок — ОДНА СТРОКА НА ЧЕЛОВЕКА.
+#
+# Прежняя схема была построена вокруг строки на ПОПЫТКУ, и это было главным
+# источником путаницы: один и тот же человек попадал в таблицу трижды
+# (WABA отказ → Telegram → MAX), и чтобы понять «достучались мы или нет»,
+# приходилось складывать три строки вручную.
+#
+# Теперь строка = человек, а канал, каким до него дошли, пишется в Channel.
+# Решение владельца: в Channel кладётся ТОЛЬКО успешный канал, а если не
+# сработал ни один — честное `none of them`. Читать таблицу можно сверху вниз,
+# не группируя ничего.
+#
+#   Channel       — канал, которым сообщение доставлено/достав��тся. Либо
+#                   `none of them`, если все каналы дали отказ. Без «ошибки» в
+#                   самой ячейке: отказ WABA при успешном Telegram — это НЕ
+#                   ошибка доставки, это нормальная работа каскада.
+#   Cascade       — след попыток по каналам: `waba:rejected → telegram:sent`.
+#                   Column выше отвечает на вопрос «достучались ли», эта — на
+#                   вопрос «где именно сломалось». Без неё отказ Meta был бы
+#                   невидим: тот же `telegram` в Channel означает и «WABA
+#                   доставил с первой попытки», и «WABA отрезали, спасает TG».
+#   Has WhatsApp / Has Telegram / Has MAX — есть ли у человека аккаунт в канале,
+#                   по вердикту contact_channel_state. Это то, что позволяет
+#                   оценить, куда вообще можно достучаться, ДО отправки.
+#
+# Что удалено: Contact ID и Consent. Первое — техническая связь, в отчёте для
+# человека она ничего не значит (БД рядом). Второе ушло вместе с решением не
+# выдумывать согласие: 847 контактов имеют `unknown`, и колонка из одних
+# unknown только мешала увидеть реальные `granted`/`denied`.
 GSHEET_HEADERS = [
     "Phone",
     "Name",
     "Category",
     "Channel",
+    "Cascade",
+    "Has WhatsApp",
+    "Has Telegram",
+    "Has MAX",
+    "Reached",
     "Message",
     "Sent At",
-    "Delivered",
-    "Read",
-    "Answered",
+    "Delivered At",
+    "Read At",
+    "Answered At",
     "Reply",
     "Last Activity",
-    "Status",
+    "Last Error",
     "Message ID",
 ]
+
+# Индексы колонок для поиска строки. Считаются от заголовка, а не числами
+# в коде: перестановка столбца больше не ломает поиск молча.
+GSHEET_COL = {name: i for i, name in enumerate(GSHEET_HEADERS)}
 
 # --- Webhook ---
 WEBHOOK_HOST = os.environ.get("BULK_WEBHOOK_HOST", "0.0.0.0")
@@ -540,6 +584,37 @@ PHASE_ORDER = [
     if ch.strip()
 ]
 
+# ============================================================================
+# PROBE — фаза проверки наличия аккаунта в канале
+# ============================================================================
+# Механика: у Wazzup НЕТ эндпоинта «есть ли у номера аккаунт в Telegram».
+# Единственный способ — отправить запрос с `phone`. Отрицательный вердикт
+# приходит СИНХРОННЫМ HTTP 400 (CHANNEL_TGAPI_PHONE_NOT_OCCUPIED) на самом
+# запросе, а не эхом вебхука, и квоту при этом НЕ списывает
+# (increment_channel_sent вызывается только в _persist_success).
+#
+# Цена: если аккаунт ЕСТЬ — придёт 201 и человеку реально уйдёт сообщение.
+# Поэтому проба обязана слать РАБОЧИЙ текст, а успех — немедленно учитываться
+# как реальная отправка, иначе контакт получит дубль в фазе отката.
+PROBE_ENABLED = bool(
+    os.environ.get("BULK_PROBE_ENABLED", "1",).strip().lower()
+    in ("1", "true", "yes", "on")
+)
+# Предохранитель от шторма проб за один прогон.
+PROBE_MAX_PER_RUN = int(os.environ.get("BULK_PROBE_MAX_PER_RUN", "400") or 400)
+# Пауза между пробами, сек. Вежливость к API Wazzup.
+PROBE_INTERVAL_MIN = int(os.environ.get("BULK_PROBE_INTERVAL_MIN", "2") or 2)
+# Повторно не пробивать тот же (контакт, канал) в течение TTL часов.
+PROBE_TTL_HOURS = int(os.environ.get("BULK_PROBE_TTL_HOURS", "24") or 24)
+# Каналы, на которых проба имеет смысл (личные аккаунты).
+PROBE_CHANNELS = [
+    ch.strip()
+    for ch in os.environ.get("BULK_PROBE_CHANNELS", "telegram,max").split(",")
+    if ch.strip()
+]
+# Canary-номер для проверки механики на живом канале (не входит в боевой пул).
+TEST_CONTACT = os.environ.get("BULK_TEST_CONTACT", "").strip()
+
 # --- Режим «длинный прогон»: сколько ЧАСОВ работает один запуск sender'а ---
 # 0 = выключен (по умолчанию): один проход по фазам и выход, как раньше.
 #
@@ -594,7 +669,26 @@ REJECT_GRACE_MINUTES = int(
                    os.environ.get("BULK_RESCUE_SETTLE_MINUTES", "5"))
     or "5"
 )
-UNKNOWN_GRACE_MINUTES = int(os.environ.get("BULK_UNKNOWN_GRACE_MINUTES", "720"))
+# Горизонт молчания: сколько ждать подтверждения доставки, прежде чем считать
+# сообщение провалившимся и отправить контакт в следующий канал.
+#
+# Прежний дефолт — 720 минут (12 часов). Замерен�� на реальных данных WABA
+# (59 подтверждений, сентябрь–октябрь 2026):
+#
+#   минимум 12 сек · медиана 45 сек · 90-й процентиль 5 мин · максимум 38 мин
+#
+# 12 часов — это не «осторожность», а пустой шкаф: контакт, которому WhatsApp
+# подтвердится через час, всё это время лежал мёртвым. 60 минут перекрывают
+# наблюдаемый максимум в 38 минут с запасом.
+#
+# Почему нельзя «мгновенно, любой отказ и unknown → следующий канал»: подтверждение
+# WABA приходит с задержкой (медиана 45 сек, хвост до 38 минут). Уйти в Telegram
+# сразу после `unknown` — значит с огромной вероятностью отправить человеку
+# ВТОРОЕ сообщение, причём первое ещё не подтверждено. Дубль в личном канале =
+# жалоба = перманентный бан личного номера. Грейс — это не задержка ради
+# аккуратности, это единственное, что различает «не доставлено» и «ещё не
+# подтверждено».
+UNKNOWN_GRACE_MINUTES = int(os.environ.get("BULK_UNKNOWN_GRACE_MINUTES", "60"))
 
 # Боевой прогон без работающего вебхука: подтверждений доставки не будет, и
 # каскад откатов превратится в таймер — через UNKNOWN_GRACE_MINUTES принятые
