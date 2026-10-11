@@ -17,6 +17,17 @@ from .store.enums import DeliveryState
 log = config.get_logger("reconcile")
 
 
+# Маркеры «у номера нет аккаунта в этом канале». Берутся из probe._ABSENT_MARKERS,
+# чтобы правило жило в одном месте: проба и вебхук обязаны понимать отказы
+# одинаково, иначе вердикты в таблице расходятся с тем, что реально сказал API.
+def _is_no_account_error(text: str) -> bool:
+    """True если отказ означает «аккаунта нет», а не «сбой адресации/канала»."""
+    from .probe import _ABSENT_MARKERS
+
+    low = (text or "").lower()
+    return any(m in low for m in _ABSENT_MARKERS)
+
+
 # ============================================================
 # Webhook payload processing
 # ============================================================
@@ -327,6 +338,27 @@ def process_delivery_status(channel: str, msg: dict) -> None:
                     cur_state, _failed_phone,
                     (msg.get("detail") or msg.get("error") or "failed")[:200],
                 )
+                # Тот же отказ обязан лечь в contact_channel_state, а не только
+                # в state.json: WABA-пул отбирает контакты по вердиктам таблицы,
+                # поэтому номер без метки absent продолжал занимать слоты квоты.
+                # Живой случай 2026-10-10: 36 BAD_CONTACT, absent стоял лишь у 11.
+                # Важно отличать отказ «номера нет в канале» от отказа адресации
+                # TG/MAX (Recipient with this chatId does not exist) — это разные
+                # вещи, и второе не значит, что аккаунта нет.
+                _err_text = msg.get("detail") or msg.get("error") or ""
+                if contact_id and _is_no_account_error(_err_text):
+                    try:
+                        from .store import channel_state as _cs
+                        _cs.set_verdict(
+                            contact_id, channel, "absent",
+                            source="webhook_echo",
+                        )
+                        log.info(
+                            f"   verdict absent записан: контакт {contact_id} "
+                            f"не имеет аккаунта в {channel} — исключён из пула"
+                        )
+                    except Exception as e:
+                        log.warning(f"не удалось записать verdict absent: {e}")
                 log.info(
                     f"   🚫 WABA исчерпан: {_failed_phone} исключён из "
                     f"WABA-пула на "

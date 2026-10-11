@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Optional
 
 from . import config
 
@@ -97,14 +98,47 @@ def reset_daily_if_new_day(state: dict) -> dict:
         state["accepted_today"] = {}
         state["delivered_today"] = {}
         state["failed_today"] = {}
+        # Проверки проб — тоже суточная величина: потолок MAX (10/день) обязан
+        # обнуляться вместе с остальными счётчиками, иначе на следующие сутки
+        # разведка в MAX не запустится вовсе.
+        state["probe_checks_today"] = {}
     return state
 
 
 def channel_sent_today(state: dict, channel: str) -> int:
-    return state.get("sent_today", {}).get(channel, 0)
+    """Сколько отправок сделано в канале сегодня.
+
+    Источник истины — ``channel_daily`` в SQLite, куда пишет
+    :func:`increment_channel_sent` атомарным UPSERT. JSON в state.json
+    остаётся запасным источником для данных, собранных до перехода: у него
+    есть гонка при параллельной отправке WABA (несколько воркеров пишут файл),
+    и из-за неё квота занижалась.
+
+    Расхождение берётся как МАКСИМУМ из обоих, а не из одного: иначе
+    рассинхрон уменьшит счёт и канал отправит сверх лимита.
+    """
+    from_file = int(state.get("sent_today", {}).get(channel, 0))
+    try:
+        from .store import quota as _quota
+        from_db = int(_quota.sent_today(channel))
+    except Exception:
+        return from_file
+    return max(from_file, from_db)
 
 
 def increment_channel_sent(state: dict, channel: str) -> None:
+    """Списывает одну отправку канала: в БД (атомарно) и в state.json.
+
+    БД идёт первым и в своём try: инкремент там атомарный, тогда как запись
+    state.json переписывает файл целиком и может потеряться. Если бы порядок
+    был обратный, падение между шагами оставило бы квоту не списанной и канал
+    отправил бы сверх лимита.
+    """
+    try:
+        from .store import quota as _quota
+        _quota.record_sent(channel)
+    except Exception:
+        pass
     st = state.setdefault("sent_today", {})
     st[channel] = st.get(channel, 0) + 1
 
@@ -114,21 +148,25 @@ def channel_has_quota(state: dict, channel: str) -> bool:
 
 
 def reconcile_sent_from_db(state: dict, channel: str) -> dict:
-    """Сверяет sent_today с атомарным счётчиком принятого в SQLite.
+    """Подтягивает sent_today к атомарному счётчику из ``channel_daily``.
 
-    При параллельной отправке WABA несколько потоков пишут state.json, и
-    часть обновлений теряется — квота занижается. Источник истины теперь
-    daily_counters (инкремент через UPSERT, гонки нет), поэтому после
-    каждой отправки берём максимум из файла и БД.
+    При параллельной отправке WABA несколько воркеров пишут state.json, и часть
+    обновлений теряется — квота занижается. Счётчик в SQLite инкрементируется
+    атомарным UPSERT, поэтому после отправки берётся максимум из файла и БД.
+
+    Раньше здесь читалась таблица ``daily_counters`` (``accepted``). Она
+    считает попытки, а не отправки, и на живых данных разошлась с фактом:
+    waba accepted=111 при 86 уникальных message_id. Подставлять такое число в
+    квоту значит занижать лимит и отправлять меньше, чем можно. Источник —
+    ``channel_daily``, там ровно отправки.
     """
     try:
-        from . import db as _db
-        counters = _db.get_counters()
-        accepted = int((counters.get(channel) or {}).get("accepted", 0))
+        from .store import quota as _quota
+        from_db = int(_quota.sent_today(channel))
     except Exception:
         return state
-    if accepted > channel_sent_today(state, channel):
-        state.setdefault("sent_today", {})[channel] = accepted
+    if from_db > channel_sent_today(state, channel):
+        state.setdefault("sent_today", {})[channel] = from_db
     return state
 
 
@@ -226,6 +264,33 @@ def contacts_processed_today(state: dict) -> int:
 
 def increment_contacts_processed(state: dict) -> None:
     state["contacts_today"] = contacts_processed_today(state) + 1
+
+
+# ── Счётчик ПРОВЕРок проб по каналам ─────────────────────────────────
+# Отдельный от квоты сообщений: у MAX проверка номера считается отдельной
+# активностью со своим потолком (1–10/день safe, 20/день потолок, массовые
+# запросы → бан). Вердикт 'absent' не тратит квоту сообщений, но обращение
+# к чекеру всё равно состоялось — без счётчика потолок нечем удержать.
+def probe_checks_today(state: dict, channel: str) -> int:
+    return int((state.get("probe_checks_today") or {}).get(channel, 0))
+
+
+def increment_probe_check(state: dict, channel: str) -> int:
+    per = state.setdefault("probe_checks_today", {})
+    per[channel] = probe_checks_today(state, channel) + 1
+    return per[channel]
+
+
+def probe_budget_left(state: dict, channel: str) -> Optional[int]:
+    """Сколько проверок этого канала ещё можно сделать сегодня.
+
+    None — потолка на канал не задано (Telegram: отдельного лимита на
+    проверку номера в отраслевых данных нет).
+    """
+    limit = getattr(config, f"PROBE_{channel.upper()}_DAILY_LIMIT", 0)
+    if not limit or int(limit) <= 0:
+        return None
+    return max(0, int(limit) - probe_checks_today(state, channel))
 
 
 # ============================================================

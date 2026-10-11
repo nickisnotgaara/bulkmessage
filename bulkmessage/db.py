@@ -217,6 +217,21 @@ def get_sent_phones(conn: sqlite3.Connection | None = None) -> set[str]:
     return _messages.contacted_phones()
 
 
+def count_pool_contacts(conn: sqlite3.Connection | None = None) -> int:
+    """Сколько контактов вообще доступно для рассылки.
+
+    Живёт здесь, а не в вызывающем коде, потому что критерий «доступен»
+    (не тест, не невалид) обязан быть ОДНИМ во всех местах: иначе отчёт
+    «пуск 4465, в работе 250» начинает расходиться с «из чего выбирали».
+    """
+    from .store import contacts as _contacts
+
+    try:
+        return _contacts.pool_size()
+    except Exception:  # noqa: BLE001 — план не должен ронять старт прогона
+        return 0
+
+
 def get_sent_phone_channels(conn: sqlite3.Connection) -> set[tuple[str, str]]:
     """Пары (phone, channel), по которым сообщение реально ушло через Wazzup24
     (status sent/delivered/read/answered). Используется для per-channel скипа:

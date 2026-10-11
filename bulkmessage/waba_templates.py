@@ -49,6 +49,30 @@ def is_valid_template_id(tid: Optional[str]) -> bool:
     return bool(_UUID_PATTERN.match(tid.strip()))
 
 
+def _unless_restricted(category: str, template_id: str) -> Optional[str]:
+    """Возвращает шаблон, либо None если Meta его ограничила.
+
+    Живой случай 2026-10-09: шаблон «Агенты» 2dc406ba получил от Meta
+    ``TEMPLATE_REJECTED``. Категория «Риэлтор» — около 1072 контактов — при
+    этом уходила в отказы, и КАЖДАЯ такая попытка съедала часть дневной квоты
+    в 250 попыток. То есть гарантированный мусор оплачивался реальной квотой.
+
+    Отдавать None — значит контакт вообще не попадает в фазу WABA
+    (skipped_no_template). Это правильно: отправка заведомо обречена, а
+    контакт при этом остаётся в пуле и уходит в pending_sms.
+    """
+    restricted = {t.strip().lower() for t in config.WABA_RESTRICTED_TEMPLATES}
+    if template_id.strip().lower() in restricted:
+        log.error(
+            f"Шаблон {template_id} для категории {category!r} ОГРАНИЧЕН Meta "
+            f"(BULK_WABA_RESTRICTED_TEMPLATES). Попытки WABA по этой категории "
+            f"были бы чистым расходом квоты — контакты уходят в pending_sms. "
+            f"Замени шаблон в Meta Business Manager и убери UUID из списка."
+        )
+        return None
+    return template_id
+
+
 def pick_waba_template(category: str) -> Optional[str]:
     """Возвращает template_id для категории, или None если не настроен.
 
@@ -84,11 +108,11 @@ def pick_waba_template(category: str) -> Optional[str]:
         log.warning(f"pick_waba_template: db lookup failed: {e}")
 
     if template_id_db:
-        return template_id_db
+        return _unless_restricted(category, template_id_db)
 
     # Env fallback, но только если это UUID
     if is_valid_template_id(template_id_env):
-        return template_id_env
+        return _unless_restricted(category, template_id_env)
     if template_id_env:
         log.warning(
             f"pick_waba_template: env WABA template for {category!r} is not a UUID "

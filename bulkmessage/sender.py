@@ -13,8 +13,9 @@ import csv
 import os
 import random
 import signal
+import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -289,6 +290,13 @@ def _persist_success(phone: str, name: str, category: str, channel: str,
     следующий запуск re-sent → дубль у получателя (НЕПРИЕМЛЕМО).
     """
     state.increment_channel_sent(current_state, channel)
+    # Попытка считается по РЕАЛЬНОЙ отправке, а не по проходу цикла фазы.
+    # Живой случай 2026-10-09: счётчик стоял в теле цикла, и 400 проходов дали
+    # 99 реальных сообщений — SAFETY CAP съел фазы Telegram и MAX целиком, а
+    # лимит WABA 250 остался выбранным на треть. Контакт, отброшенный фильтром
+    # наличия аккаунта, попытку теперь не расходует — это правильно: попытка
+    # означает сообщение, дошедшее до транспорта.
+    state.increment_attempts(current_state)
     state.save_state(current_state)
     # NOTE: increment_successful() вызывается в _run_one_contact, не здесь
     try:
@@ -1381,6 +1389,84 @@ _RUN_STARTED_AT = 0.0
 # Проба аккаунтов выполняется ОДИН раз за прогон: она тратит время (и при
 # успехе — реальные сообщения), а вердикты не меняются в пределах суток.
 _PROBE_DONE = False
+# Разведка MAX идёт ОТДЕЛЬНОЙ фазой в конце круга, поэтому и флаг свой:
+# за круг MAX проверяется один раз, независимо от числа фаз личных
+# каналов (их две — разведка и добор слотов).
+_MAX_PROBE_DONE = False
+
+
+def _max_probe_done_for_run() -> bool:
+    return _MAX_PROBE_DONE
+
+
+def _mark_max_probe_done_for_run() -> None:
+    global _MAX_PROBE_DONE
+    _MAX_PROBE_DONE = True
+
+
+def delivered_today_total() -> int:
+    """Сколько сообщений РЕАЛЬНО доставлено сегодня по всем каналам.
+
+    Источник — ``daily_counters`` в SQLite: там доставку помечает вебхук
+    (delivery_state='delivered'), то есть это единственное число, отвечающее
+    на вопрос «сколько человек получило», а не «сколько запросов принял
+    транспорт». Именно эта разница объясняет, почему 250 принятых WABA
+    дают ~100 живых доставок.
+    """
+    try:
+        counters = db.get_counters()
+        return sum(int(c.get("delivered") or 0) for c in counters.values())
+    except Exception as e:
+        log.debug(f"подсчёт доставок не удался: {e}")
+        return 0
+
+
+def delivery_target_reached() -> bool:
+    """Достигнута ли цель по доставкам за сутки."""
+    target = int(getattr(config, "TARGET_DELIVERED_PER_DAY", 0) or 0)
+    if target <= 0:
+        return False
+    return delivered_today_total() >= target
+
+
+def _contacts_messaged_this_run() -> int:
+    """Сколько РАЗНЫХ контактов получили сообщение в этом прогоне.
+
+    Считается по БД от метки старта прогона, а не по state.json: счётчики
+    state живут read-modify-write и теряются, когда sender и вебхук пишут
+    в один файл. COUNT(DISTINCT) — потому что один контакт в каскад может
+    получить пробу и откат, но человек он один.
+    """
+    if not _RUN_STARTED_AT:
+        return 0
+    since = datetime.fromtimestamp(
+        _RUN_STARTED_AT, tz=timezone.utc
+    ).isoformat()
+    try:
+        with db.db_conn() as conn:
+            n = conn.execute(
+                "SELECT COUNT(DISTINCT contact_id) FROM messages "
+                "WHERE sent_at >= ? AND message_id IS NOT NULL "
+                "  AND message_id NOT LIKE 'dryrun%'",
+                (since,),
+            ).fetchone()[0]
+        return int(n or 0)
+    except Exception as e:
+        log.debug(f"подсчёт контактов прогона не удался: {e}")
+        return 0
+
+
+def contacts_budget_left() -> Optional[int]:
+    """Сколько контактов ещё можно тронуть. None = потолка нет.
+
+    Ровно ограничивает, а не «до ограничения»: бюджет режется по всему
+    прогону (проба → WABA → добор личных слотов), и каждый следующий шаг
+    получает остаток, а не исходную цифру.
+    """
+    limit = int(getattr(config, "RUN_CONTACTS_LIMIT", 0) or 0)
+    if limit <= 0:
+        return None
+    return max(0, limit - _contacts_messaged_this_run())
 
 
 def _probe_channels() -> set:
@@ -1464,52 +1550,155 @@ def _filter_by_presence(pending: list[dict], channel: str) -> list[dict]:
     return kept
 
 
-def _run_probe_phase(
-    stop_requested: dict, phase_stats: dict,
-) -> None:
-    """Проверяет наличие аккаунтов у контактов, которым не зашла WABA.
+def select_probe_candidates(
+    limit: Optional[int] = None,
+    channel: Optional[str] = None,
+    skip_first: Optional[int] = None,
+) -> list[dict]:
+    """Кандидаты на ПРОБУ по конкретному каналу.
 
-    Кандидаты берутся из rescue_queue (там лежат неподтверждённые WABA), плюс
-    учитываются уже известные вердикты: пробиваются только те, у кого нет
-    свежего ответа, поэтому повторно сеть не дёргается.
+    Живой случай 2026-10-10 (повторы): кандидаты брались из ``rescue_queue``,
+    то есть из людей, которым WABA УЖЕ ушёл. Проба при успехе сама
+    отправляет сообщение, поэтому семь человек получили по второму
+    сообщению в личный канал — двое уже прочитали первое.
+
+    Живой случай 2026-10-10 (бан MAX): MAX считает ПРОВЕРКУ НОМЕРА
+    отдельной активностью со своим потолком (1–10/день, потолок 20/день,
+    массовые запросы → бан). Поэтому правила отбора у каналов РАЗНЫЕ:
+
+    * ``telegram`` — любой неотправленный контакт без свежего вердикта;
+      отдельного лимита на проверку номера нет.
+    * ``max`` — только те, у кого НЕТ ни Telegram, ни WhatsApp. Платить
+      риском бана аккаунта владельца за 399 ответов «номера нет» ради
+      одного «есть» невыгодно: достижимых в MAX ~20 контактов из 4448.
+
+    Общее для обоих: контакт ещё ни разу не получал сообщение, номер
+    валиден, согласие не отклонено.
+    """
+    limit = int(limit or getattr(config, "PROBE_MAX_PER_RUN", 400) or 400)
+    ttl_hours = int(getattr(config, "PROBE_TTL_HOURS", 24) or 24)
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+    ).isoformat()
+
+    # Доп. условие для MAX: нет подтверждённого мессенджера и нет WhatsApp.
+    max_extra = ""
+    if channel == "max":
+        max_extra = """
+          AND NOT EXISTS (
+                SELECT 1 FROM contact_channel_state s
+                WHERE s.contact_id = c.id
+                  AND s.channel IN ('telegram','waba','whatsapp')
+                  AND s.verdict IN ('present','delivered')
+          )
+        """
+
+    sql = f"""
+        SELECT c.id AS contact_id, c.phone, c.name, c.category
+        FROM contacts c
+        WHERE COALESCE(c.is_test, 0) = 0
+          AND COALESCE(c.is_invalid, 0) = 0
+          AND COALESCE(c.consent, 'unknown') != 'denied'
+          AND NOT EXISTS (
+                SELECT 1 FROM messages m
+                WHERE m.contact_id = c.id
+                  AND m.status IN ('sent','delivered','read','answered')
+          )
+          -- Живой случай 2026-10-11: проба отправила ВТОРОЕ сообщение
+          -- контакту, у которого было 5 попыток, все со status='failed'
+          -- и delivery='rejected'. Фильтр по status их пропускал, потому
+          -- что «успешного» статуса у них не было НИКОГДА.
+          -- Транспорт при этом сообщение принимал (message_id был).
+          -- Требование владельца: исключать всех, кому что-то уходило
+          -- через ЛЮБОЙ канал, независимо от того, дошло оно или нет.
+          -- Нельзя назвать человека «не получали» только потому, что у
+          -- него в таблице нет зелёной галочки.
+          AND NOT EXISTS (
+                SELECT 1 FROM messages m
+                WHERE m.contact_id = c.id
+                  AND m.message_id IS NOT NULL
+                  AND m.message_id NOT LIKE 'dryrun%'
+          )
+          AND NOT EXISTS (
+                SELECT 1 FROM contact_channel_state s
+                WHERE s.contact_id = c.id
+                  AND s.channel = ?
+                  AND s.verdict IN ('present','delivered','absent','blocked')
+                  AND COALESCE(s.last_probe_at, s.updated_at, '') >= ?
+          )
+          {max_extra}
+        ORDER BY c.id
+        LIMIT ? OFFSET ?
+    """
+    # Пропуск первых N — страховка владельца перед боевым прогоном по свежей
+    # базе (2026-10-11). Смещение НЕ замена фильтру: оно лишь сдвигает окно,
+    # чтобы тест не лёг в самый верх списка, где исторически скапливались
+    # самые старые и самые «обстрелянные» номера.
+    _skip = int(skip_first if skip_first is not None
+                else getattr(config, "PROBE_SKIP_FIRST", 0) or 0)
+    params: tuple = (channel or "telegram", cutoff, limit, max(0, _skip))
+    try:
+        with db.db_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception as e:
+        log.warning(f"PROBE: не удалось отобрать кандидатов: {e}")
+        return []
+
+    return [
+        {
+            "contact_id": r["contact_id"],
+            "phone": r["phone"],
+            "name": r["name"] or "",
+            "category": r["category"] or "",
+        }
+        for r in rows
+        if r["phone"]
+    ]
+
+
+def _run_probe_phase(
+    stop_requested: dict, phase_stats: dict, channel: str = "telegram",
+) -> None:
+    """Проверяет наличие аккаунта в ОДНОМ канале у свежих контактов.
+
+    Кандидаты — из неотправленного пула (см. select_probe_candidates), а НЕ из
+    rescue_queue: там лежат те, кому WABA уже ушёл, и проба при успехе
+    отправила бы им ВТОРОЕ сообщение.
+
+    Проба и есть отправка: при вердикте 'present' сообщение уходит человеку.
+    При 'absent' квота сообщений не списывается — но у MAX это НЕ значит
+    «бесплатно»: проверка номера там считается отдельной активностью, и
+    потолок держится через state.probe_checks_today.
     """
     from . import probe as _probe
 
-    candidates = []
-    seen: set = set()
-    try:
-        rows = db.pending_rescues(limit=config.PROBE_MAX_PER_RUN,
-                                  cooldown_seconds=0)
-    except Exception as e:
-        log.warning(f"PROBE: не удалось прочитать очередь отката: {e}")
+    # Дневной потолок проверок этого канала. Для Telegram его нет (None),
+    # для MAX — жёсткие 10/день.
+    _cur = state.load_state()
+    _budget = state.probe_budget_left(_cur, channel)
+    if _budget == 0:
+        log.info(
+            f"PROBE {channel}: дневной потолок проверок исчерпан "
+            f"({state.probe_checks_today(_cur, channel)} сегодня) — "
+            "фаза пропущена"
+        )
         return
+    _budget = _budget if _budget is not None else (
+        int(getattr(config, "PROBE_MAX_PER_RUN", 400) or 400)
+    )
 
-    with db.db_conn() as conn:
-        for row in rows:
-            phone = row.get("phone")
-            if not phone or phone in seen:
-                continue
-            seen.add(phone)
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id FROM contacts WHERE phone = ? "
-                "AND COALESCE(is_test,0)=0 AND COALESCE(is_invalid,0)=0",
-                (phone,),
-            )
-            found = cur.fetchone()
-            if not found:
-                # Контакт помечен как тестовый/не-телефон либо вообще не
-                # заведён в contacts — в боевой пул он не идёт.
-                continue
-            candidates.append({
-                "contact_id": found["id"],
-                "phone": phone,
-                "name": row.get("name") or "—",
-                "category": row.get("category") or "—",
-            })
+    # Бюджет контактов на прогон: 15 контактов означает ровно 15.
+    _cbudget = contacts_budget_left()
+    if _cbudget == 0:
+        log.info(f"PROBE {channel}: бюджет контактов исчерпан — пропускаю")
+        return
+    _take = _budget
+    if _cbudget is not None:
+        _take = min(_take, _cbudget)
 
+    candidates = select_probe_candidates(limit=_take, channel=channel)
     if not candidates:
-        log.info("PROBE: нет кандидатов для проверки")
+        log.info(f"PROBE {channel}: нет кандидатов для проверки")
         return
 
     stats = _probe.run_phase(candidates, log_fn=log,
@@ -1520,6 +1709,98 @@ def _run_probe_phase(
         f"аккаунт есть {stats['present']}, нет {stats['absent']}, "
         f"неясно {stats['unknown']} — в откат пойдут только 'есть'"
     )
+
+
+def _personal_slots_in_window() -> int:
+    """Сколько личных отправок РЕАЛЬНО влезает в окно при паузе 15+ мин.
+
+    ⚠️ Не путать с ``_personal_slot_count()``: та отдаёт сумму лимитов
+    каналов (TG 50 + MAX 10 = 60), а отправить 60 за 10 часов при паузе
+    15 минут физически нельзя — нужно 15 часов. В плане прогона должно
+    стоять фактическое число, иначе отчёт покажет «было 60 → стало 30»
+    и владелец будет искать пропавших 30, которых никто не обещал.
+
+    Локальный импорт `schedule` обязателен: на уровне модуля его нет
+    (он импортируется внутри фазы личных каналов). Без этого NameError
+    проглатывался except'ом и возвращал 60 — правдоподобное число,
+    из-за которого ошибка не видна в логе вообще.
+    """
+    from . import schedule as _sched
+
+    try:
+        # Окно закрыто → в этом запуске личных отправок НЕ будет.
+        # ⚠️ Без этой проверки план врал бы: _phase_seconds_left при закрытом
+        # окне переносит дедлайн на ЗАВТРА (end_dt += 1 день) и отдаёт ~23
+        # часа. Планировщик построил бы 60 слотов на ночь вперёд, а
+        # сравнение «план → факт» показало бы «было 60 → стало 0» и
+        # заставило бы искать несуществующую потерю.
+        if not (_within_safe_hours("telegram") and _within_safe_hours("max")):
+            return 0
+        _sec = min(_phase_seconds_left("max"), _phase_seconds_left("telegram"))
+        if _sec <= 0:
+            return 0
+        _gap = int(getattr(config, "PERSONAL_MIN_GAP_SEC", 0) or 0)
+        if _gap <= 0:
+            return _personal_slot_count()
+        return len(_sched.build_slot_schedule(
+            _personal_slot_count(), _sec,
+            min_gap_seconds=_gap,
+            jitter_max=float(getattr(config, "PERSONAL_JITTER_MAX", 1.0) or 1.0),
+        ))
+    except Exception as e:  # noqa: BLE001 — план не должен ронять старт
+        # ⚠️ Возвращаем 0, а не _personal_slot_count(): правдоподобное
+        # «план 60» выглядит как правда и прячет ошибку от владельца.
+        # Лучше честное «не посчитали», чем уверенное враньё в отчёте.
+        log.warning(f"слоты личных каналов НЕ посчитаны ({type(e).__name__}: "
+                    f"{e}) — в плане будет 0, это не значит «отправок не будет»")
+        return 0
+
+
+def _build_run_plan(cur: dict, waba_planned: int) -> dict:
+    """Что этот запуск СОБИРАЕТСЯ сделать. Уходит в дайджест на старте и
+    потом в отчёт как «план», с которым сравнивается факт.
+
+    Требование владельца 2026-10-11: «в начале уточнить, каким контактам
+    отправляет этот запуск». Без этого отчёт в финале показывает только
+    факты, а по фактам не видно, что именно прогон собирался делать и
+    сколько контактов по дороге потерялось.
+
+    Каждое число здесь — ЧТО-ТО ДЕЛАЕТ, а не украшение: пул и уже
+    отправленные объясняют, почему в работе столько контактов; слоты
+    личных каналов — результат арифметики окна и паузы, а не «кап канала».
+    """
+    plan: dict = {
+        "waba_planned": waba_planned,
+        "personal_planned": _personal_slots_in_window(),
+        "personal_window_h": (
+            int(getattr(config, "PERSONAL_SAFE_HOURS_END", 0))
+            - int(getattr(config, "PERSONAL_SAFE_HOURS_START", 0))
+        ),
+        "min_gap_min": int(getattr(config, "PERSONAL_MIN_GAP_SEC", 0) or 0) // 60,
+        "max_gap_min": int(
+            (int(getattr(config, "PERSONAL_MIN_GAP_SEC", 0) or 0)
+             * float(getattr(config, "PERSONAL_JITTER_MAX", 1.0) or 1.0)) // 60
+        ),
+        "rescue_planned": db.count_pending_rescues(),
+    }
+    try:
+        cbudget = contacts_budget_left()
+        if cbudget is not None:
+            plan["contacts_budget"] = (
+                int(getattr(config, "RUN_CONTACTS_LIMIT", 0) or 0)
+            )
+        _sec = min(_phase_seconds_left("max"), _phase_seconds_left("telegram"))
+        if _sec > 0:
+            plan["probe_planned"] = int(_sec // max(
+                1, int(getattr(config, "PROBE_INTERVAL_MIN", 0) or 0) * 60))
+    except Exception:  # noqa: BLE001 — план не должен ронять старт прогона
+        pass
+    try:
+        plan["pool_total"] = db.count_pool_contacts()
+        plan["already_sent"] = len(db.get_sent_phones())
+    except Exception as e:  # noqa: BLE001
+        log.debug(f"план прогона посчитан частично: {e}")
+    return plan
 
 
 def _run_deadline() -> Optional[float]:
@@ -1543,7 +1824,22 @@ def _phase_delay_bounds(channel: str) -> tuple[int, int]:
         return (config.WABA_DELAY_MIN, config.WABA_DELAY_MAX)
     if channel == "sms":
         return (config.SMS_DELAY_MIN, config.SMS_DELAY_MAX)
-    return (config.PERSONAL_DELAY_MIN, config.PERSONAL_DELAY_MAX)
+
+    # Личные каналы: env НЕ имеет права опустить паузу ниже решения владельца
+    # «меньше 15 минут между отправленными сообщениями не бывает»
+    # (2026-10-10). Раньше PERSONAL_DELAY_MIN=300 (5 мин) позволял каскаду
+    # отката слать в личный канал с паузой вчетверо меньше заявленной.
+    # Логика та же, что у _safe_limit по дневным капам: env урезается,
+    # но не расширяет защиту.
+    _gap = int(getattr(config, "PERSONAL_MIN_GAP_SEC", 0) or 0)
+    _jit = float(getattr(config, "PERSONAL_JITTER_MAX", 1.0) or 1.0)
+    _lo = max(int(config.PERSONAL_DELAY_MIN), _gap)
+    _hi = max(int(config.PERSONAL_DELAY_MAX), _lo)
+    if _gap > 0:
+        # Потолок = минимум × разброс: пауза остаётся живой (15–21 мин),
+        # а не превращается в ровные 15 минут подряд — это сигнал бота.
+        _hi = max(_hi, int(_gap * max(1.0, _jit)))
+    return (_lo, _hi)
 
 
 def _phase_delay(channel: str, seconds_left: float, remaining_msgs: int) -> float:
@@ -1631,10 +1927,59 @@ def _collect_fresh_waba_targets(
     fresh: list[dict] = []
     skipped_queued = skipped_exhausted = skipped_cooldown = skipped_bad = 0
     skipped_no_template = 0
+    skipped_personal = 0
+    skipped_waste = 0
+    # Контакты, которым личный канал подходит лучше, резервируем под фазы
+    # MAX/Telegram (решение владельца 2026-10-09). Приоритет на контакт:
+    # есть оба аккаунта → MAX, только Telegram → Telegram. Отдавать такому
+    # человеку шаблон Meta вместо личного канала — значит потратить один из
+    # 20/50 дефицитных слотов личного аккаунта на отправку туда, где
+    # вероятность доставки ниже.
+    reserved_phones: set[str] = set()
+    # Контакты, у которых УЖЕ доказано отсутствие WhatsApp (вердикт absent
+    # по waba/whatsapp). Попытка WABA по ним не может быть доставлена в
+    # принципе — это чистый расход дневной квоты в 250 попыток. На 09.10
+    # таких было 118, и каждая из них гарантированно съедала попытку.
+    # Повторная попытка по известно-негодному номеру — то же самое, что
+    # повторная отправка человеку, которому уже отказали.
+    waste_phones: set[str] = set()
+    try:
+        for r in db._query_rows(
+            "SELECT DISTINCT ct.phone AS phone, s.channel AS channel, "
+            "       s.verdict AS verdict "
+            "FROM contact_channel_state s "
+            "JOIN contacts ct ON ct.id = s.contact_id "
+            "WHERE (s.channel IN ('max', 'telegram') AND s.verdict = 'present') "
+            "   OR (s.channel IN ('waba', 'whatsapp') AND s.verdict = 'absent')"
+        ):
+            if not r["phone"]:
+                continue
+            if r["channel"] in ("max", "telegram"):
+                reserved_phones.add(r["phone"])
+            else:
+                waste_phones.add(r["phone"])
+    except Exception as e:  # pragma: no cover - defensive
+        log.warning(f"резерв личных каналов не прочитан: {e}")
+
+    # Индекс вердиктов для отсева «нет ни одного мессенджера» при разведке.
+    log.info(
+        f"Резерв WABA: под личные каналы {len(reserved_phones)}, "
+        f"без WhatsApp {len(waste_phones)} (повторная попытка бессмысленна)"
+    )
+
     for c in contacts:
         phone = c.get("phone")
         if not phone or phone in queued:
             skipped_queued += 1
+            continue
+        if phone in reserved_phones:
+            skipped_personal += 1
+            continue
+        if phone in waste_phones:
+            # Доказанный absent по WhatsApp: доставка невозможна, квота
+            # потратится впустую. Такие контакты живут дальше — они попадут
+            # в pending_sms, когда владелец решит отправлять по SMS.
+            skipped_waste += 1
             continue
         if state.is_waba_exhausted(current_state, phone):
             skipped_exhausted += 1
@@ -1677,6 +2022,8 @@ def _collect_fresh_waba_targets(
     log.info(f"Отбор свежих для WABA: {len(fresh)} из {len(contacts)}")
     log.info(
         f"исключено: в очереди {skipped_queued}, "
+        f"резерв под личные каналы {skipped_personal}, "
+        f"WhatsApp доказанно нет {skipped_waste}, "
         f"WABA-исчерпан {skipped_exhausted}, "
         f"cooldown {skipped_cooldown}, bad {skipped_bad}, "
         f"без шаблона Meta {skipped_no_template}"
@@ -1828,12 +2175,103 @@ def report_delivery_by_contact(channel: str, to_tg: bool = True) -> dict:
     return stats
 
 
+def delivery_vs_attempts(day: Optional[str] = None) -> dict:
+    """ГЛАВНАЯ метрика дня: сколько ДОСТАВЛЕНО, а не сколько принято.
+
+    Почему именно так. 09.10 WABA принял 86 сообщений и доставил 46 — 53%.
+    Число «принято» почти всегда радует, потому что HTTP 201 означает лишь
+    «запрос принят», а настоящий вердикт приходит эхом вебхука через секунды
+    и может оказаться отказом. Считать попытки — значит хвалить себя за
+    мусор: 35 из 86 ушли в отказ, и каждый занял часть квоты в 250.
+
+    Считаем по messages: accepted = строки с message_id, delivered = из них
+    с подтверждённой доставкой (delivered_at либо статус read/answered).
+    """
+    out: dict[str, dict] = {}
+    try:
+        with db.db_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT channel,
+                       COUNT(*) AS accepted,
+                       SUM(CASE WHEN delivered_at IS NOT NULL
+                                 OR status IN ('delivered','read','answered')
+                                THEN 1 ELSE 0 END) AS delivered,
+                       SUM(CASE WHEN status = 'failed'
+                                  OR delivery_state = 'rejected'
+                                THEN 1 ELSE 0 END) AS rejected
+                FROM messages
+                WHERE substr(COALESCE(sent_at, created_at),1,10) = ?
+                  AND message_id IS NOT NULL
+                GROUP BY channel
+                """,
+                (day or config.now_tz().strftime("%Y-%m-%d"),),
+            ).fetchall()
+    except Exception as e:
+        log.warning(f"метрика доставки не собрана: {e}")
+        return out
+
+    for r in rows:
+        acc = int(r["accepted"] or 0)
+        dl = int(r["delivered"] or 0)
+        out[r["channel"]] = {
+            "accepted": acc,
+            "delivered": dl,
+            "rejected": int(r["rejected"] or 0),
+            "rate": (dl / acc * 100) if acc else 0.0,
+        }
+    return out
+
+
+def _report_delivery_ratio() -> None:
+    """Печатает и отправляет в Telegram доставку против попыток."""
+    stats = delivery_vs_attempts()
+    if not stats:
+        return
+    total_acc = sum(s["accepted"] for s in stats.values())
+    total_dl = sum(s["delivered"] for s in stats.values())
+    log.info("─" * 70)
+    log.info("ДОСТАВЛЕНО (а не принято!) — главная метрика дня:")
+    for ch in ("waba", "telegram", "max", "sms"):
+        s = stats.get(ch)
+        if not s:
+            continue
+        log.info(
+            f"   {ch:<10} доставлено {s['delivered']:>4} из {s['accepted']:>4} "
+            f"принятых ({s['rate']:.0f}%), отказов {s['rejected']}"
+        )
+    log.info(
+        f"   ИТОГО      доставлено {total_dl} из {total_acc} принятых "
+        f"({(total_dl / total_acc * 100) if total_acc else 0:.0f}%)"
+    )
+    log.info("─" * 70)
+    try:
+        from . import notify as _notify
+        lines = [" ДОСТАВЛЕНО сегодня (не принято!):"]
+        for ch in ("waba", "telegram", "max", "sms"):
+            s = stats.get(ch)
+            if s:
+                lines.append(
+                    f"  {ch:<10} {s['delivered']:>4} / {s['accepted']:>4} "
+                    f"({s['rate']:.0f}%), отказов {s['rejected']}"
+                )
+        lines.append(f"  ИТОГО      {total_dl} / {total_acc}")
+        _notify.event("\n".join(lines), "INFO")
+    except Exception as e:
+        log.debug(f"tg-метрика доставки не ушла: {e}")
+
+
 def _report_all_channels_delivery() -> None:
     for _ch in _phase_order_channels():
         try:
             report_delivery_by_contact(_ch)
         except Exception:
             pass
+    try:
+        _report_delivery_ratio()
+    except Exception:
+        pass
 
 
 def _limits_for_owner(channels) -> str:
@@ -2056,6 +2494,308 @@ def channel_delivery_health(channel: str, min_sample: int = 5,
             "reason": f"{_what}: {delivered} из {sent}"}
 
 
+def _personal_slot_count() -> int:
+    """Сколько персональных отправок вообще можно сделать сегодня.
+
+    Это не «сколько хочется», а сумма потолков каналов: MAX 20 + Telegram 50.
+    Планировать больше бессмысленно — лишние слоты всё равно не заполнятся, а
+    окно будет поделено на них, и каждая реальная отправка станет реже.
+    """
+    cur = state.reset_daily_if_new_day(state.load_state())
+    total = 0
+    for ch in ("max", "telegram"):
+        if state.is_channel_halted(cur, ch):
+            continue
+        cap = int(state.channel_effective_cap(cur, ch))
+        left = cap - int(state.channel_sent_today(cur, ch))
+        total += max(0, left)
+    return total
+
+
+def _run_personal_slot_phase(
+    filtered: list,
+    stop_requested: dict,
+    phase_stats: dict,
+    label: str = "разведка",
+    contacts_limit: Optional[int] = None,
+) -> None:
+    """Личные каналы по расписанию: MAX и Telegram одним таймлайном.
+
+    ``contacts_limit`` — сколько контактов этой фазе ещё разрешено тронуть.
+    Потолок ставится на СЛОТЫ расписания, а не на уже отправленные: иначе
+    фаза нарезала бы 70 слотов, а «15 контактов» молча превращалось в 70.
+    None = потолка нет (обычный длинный прогон).
+
+    Запускается ДВАЖДЫ за круг. Первый проход — разведка: он идёт ДО WABA,
+    чтобы личные каналы забирали людей раньше, чем на них потратит квоту
+    WhatsApp. Второй проход — добор слотов в остаток окна; если лимит уже
+    выбран, он отрабатывает за миллисекунды и просто выходит.
+
+    Почему нельзя просто инвертировать фазы
+    ---------------------------------------
+    Если разведка не ограничена бюджетом, она съедает всё окно (70 отправок
+    × 300 с ≈ 5.8 часа) и WABA не получит ни минуты. Если ограничить её
+    слишком сильно — недобор личных каналов. Поэтому бюджет явный и
+    настраиваемый, а доля успеха попыток докладывается владельцу: решение
+    «сколько разведывать» должно приниматься по факту, а не вслепую.
+
+    Почему не две отдельные фазы
+    ---------------------------
+    Наивный порядок «фаза MAX целиком, потом фаза Telegram целиком» не
+    выполняет задачу владельца. Каждая фаза растягивается на остаток окна,
+    MAX из 20 сообщений съедает окно один, и до Telegram не доходит ничего.
+    Живой случай 09.10 — фазы TG и MAX не отправили НИЧЕГО: личное окно
+    начиналось в 11:00, а фаза стартовала в 10:42.
+
+    Что делает эта функция
+    ---------------------
+    Строит одно расписание на оба канала (schedule.build_slot_schedule):
+    N случайных моментов, размазанных по остатку окна. В каждый момент
+    отправляется ОДНО сообщение в тот канал, который ещё не исчерпал квоту и
+    в котором у контакта есть аккаунт (MAX приоритетнее — он самый дефицитный).
+    Между отправками ничего не происходит: контакт либо уже известен как
+    подходящий, либо выявляется пробой.
+
+    Ограничение, о котором честно пишем в лог: если у контакта нет аккаунта
+    ни в MAX, ни в Telegram, слот потратится впустую. Разведка и отправка для
+    личных каналов неразделимы — проба на ``present`` САМА отправляет сообщение
+    (см. probe.py), поэтому «сначала выяснить, потом отправить по расписанию»
+    для этих каналов физически невозможно.
+    """
+    from . import schedule
+
+    n_slots = _personal_slot_count()
+    # Потолок контактов режет СЛОТЫ. Без этого «прогон на 15» нарезал 70
+    # слотов по лимиту каналов и уходил на 3+ часа (живой случай 2026-10-10).
+    if contacts_limit is not None:
+        if contacts_limit <= 0:
+            log.info("Личные каналы: бюджет контактов исчерпан — расписание "
+                     "не строится")
+            return
+        if n_slots > contacts_limit:
+            log.info(
+                f"Личные каналы: режу слоты с {n_slots} до {contacts_limit} "
+                "(потолок контактов на прогон)"
+            )
+            n_slots = contacts_limit
+    if n_slots <= 0:
+        log.info(
+            "Личные каналы: дневные лимиты исчерпаны или каналы в halt — "
+            "расписание не строится"
+        )
+        return
+
+    seconds_left = min(_phase_seconds_left("max"), _phase_seconds_left("telegram"))
+    if seconds_left <= 0:
+        log.info("Личные каналы: окно закрыто — расписание не строится")
+        return
+
+    # Минимум между отправками — пол, а не среднее (решение владельца
+    # 2026-10-10: не меньше 15 минут). Если окно не вмещает нужное число
+    # слотов с таким минимумом, расписание строится на максимально возможном
+    # числе — и это пишется в лог, иначе «60 личных сообщений» тихо
+    # превратились бы в 40.
+    _gap = int(getattr(config, "PERSONAL_MIN_GAP_SEC", 0) or 0)
+    _jitter = float(getattr(config, "PERSONAL_JITTER_MAX", 1.0) or 1.0)
+    _fits = int(seconds_left // _gap) if _gap > 0 else n_slots
+    if _fits < n_slots:
+        log.info(
+            f"Личные каналы: в окне {int(seconds_left/60)} мин при минимуме "
+            f"{_gap//60} мин помещается {_fits} отправок, а лимиты каналов "
+            f"дают {n_slots} — строю расписание на {_fits}"
+        )
+        n_slots = _fits
+
+    slots = schedule.build_slot_schedule(
+        n_slots, seconds_left, min_gap_seconds=_gap, jitter_max=_jitter
+    )
+    if slots and len(slots) < n_slots:
+        # Слоты урезались не минимумом, а запасом под разброс: ровный шаг в
+        # 15 минут — это сигнал бота, поэтому интервалы идут 15–21 мин и
+        # средняя пауза больше минимума. Молча урезать нельзя: владелец
+        # видит в логе «режу слоты с N на M» и должен понимать, почему.
+        log.info(
+            f"Личные каналы: с разбросом {_gap//60}–"
+            f"{int(_gap*_jitter)//60} мин в окно влезло {len(slots)} из "
+            f"{n_slots} — строю расписание на {len(slots)}"
+        )
+    log.info("=" * 70)
+    log.info(f"РАСПИСАНИЕ ЛИЧНЫХ КАНАЛОВ: {schedule.describe(slots)}")
+    log.info(
+        f"Каналы в порядке приоритета: "
+        f"{' → '.join(_owner_channels(_probe_channels()) or ['telegram', 'max'])}"
+    )
+    log.info("=" * 70)
+
+    candidates = _personal_candidates(filtered)
+    if not candidates:
+        log.info("Личные каналы: нет кандидатов на отбор — фаза пропущена")
+        return
+
+    from . import probe as _probe
+
+    sent = {"max": 0, "telegram": 0}
+    filled = 0
+    cursor = 0
+    started_at = time.time()
+    budget = max(1, int(getattr(config, "DISCOVERY_MAX_PROBES",
+                                  config.PROBE_MAX_PER_RUN)))
+    probed = 0
+    present_hits = 0
+
+    for slot_i, slot_at in enumerate(slots, start=1):
+        if stop_requested["v"]:
+            log.info(f"Личные каналы ({label}): остановка по сигналу")
+            break
+        if probed >= budget:
+            log.info(
+                f"Личные каналы ({label}): исчерпан бюджет разведки "
+                f"{budget} проб — остаток окна уходит в WABA"
+            )
+            break
+
+        wait = (started_at + slot_at) - time.time()
+        if wait > 0:
+            _sleep_phase(wait, stop_requested)
+        if stop_requested["v"]:
+            break
+
+        cur = state.reset_daily_if_new_day(state.load_state())
+        # К моменту слота квота могла кончиться сама (жалобы, halt) — тогда
+        # слот пропускаем, а не тратим на заведомо неотправляемый канал.
+        usable = [
+            ch for ch in ("max", "telegram")
+            if not state.is_channel_halted(cur, ch)
+            and state.channel_has_quota_with_headroom(cur, ch)
+        ]
+        if not usable:
+            log.info(
+                f"Слот {slot_i}/{len(slots)}: оба личных канала недоступны — "
+                f"оставшиеся слоты пропускаются"
+            )
+            break
+
+        if cursor >= len(candidates):
+            log.info(
+                f"Слот {slot_i}/{len(slots)}: кандидаты кончились "
+                f"(проба может дать вердикт unknown — он не считается успехом)"
+            )
+            break
+
+        contact = candidates[cursor]
+        cursor += 1
+        probed += 1
+
+        results = _probe.probe_contact_channels(contact)
+        hit = next((r for r in results if r.delivered), None)
+        if hit is None:
+            # Слот не закрыт: аккаунта не оказалось ни там, ни там. Контакт
+            # уходит в WABA обычным путём — он не попал ни в резерв, ни в
+            # отчёт о персональных отправках.
+            verdicts = ",".join(
+                f"{r.channel}:{r.verdict}" for r in results
+            ) or "нет вердиктов"
+            log.info(
+                f"Слот {slot_i}/{len(slots)}: {contact['phone']} — "
+                f"личного аккаунта нет ({verdicts}), контакт уходит в WABA"
+            )
+            # То же самое в бот: владелец 2026-10-11 требует видеть в Telegram
+            # не только кому отправили, но и у кого каналов нет. Раньше эта
+            # строка жила только в терминале — на уровне INFO в бот не шло.
+            _probe.report_miss(contact, results)
+            continue
+
+        filled += 1
+        present_hits += 1
+        sent[hit.channel] = sent.get(hit.channel, 0) + 1
+        phase_stats[hit.channel] = phase_stats.get(hit.channel, 0) + 1
+        log.info(
+            f"Слот {slot_i}/{len(slots)}: ✅ {contact['phone']} → "
+            f"{hit.channel.upper()} (заполнено {filled}/{len(slots)}, "
+            f"{hit.channel} {sent[hit.channel]})"
+        )
+
+    rate = (present_hits / probed * 100) if probed else 0.0
+    log.info("─" * 70)
+    log.info(
+        f"Личные каналы ({label}): заполнено {filled} из {len(slots)} слотов "
+        f"(MAX {sent['max']}, Telegram {sent['telegram']})"
+    )
+    log.info(
+        f"Разведка: проб {probed}, успех {present_hits} ({rate:.0f}%). "
+        f"Один успех стоит {1 / max(present_hits, 1):.1f} проб. "
+        f"Это и есть решение по бюджету: при доле {rate:.0f}% на "
+        f"{config.DISCOVERY_MAX_PROBES} проб хватит на "
+        f"{int(config.DISCOVERY_MAX_PROBES * rate / 100)} личных отправок."
+    )
+    if filled < len(slots):
+        log.info(
+            f"Недобор слотов: {len(slots) - filled}. Причина — кандидаты "
+            f"кончились или личные аккаунты не подтвердились. Недообранные "
+            f"контакты доступны через WABA и в списке pending_sms."
+        )
+    log.info("─" * 70)
+
+
+def _personal_candidates(filtered: list) -> list[dict]:
+    """Кого вообще можно пробить в личные каналы.
+
+    Сначала те, у кого уже есть подтверждённый аккаунт — их отправка не требует
+    пробы и гарантированно закроет слот. Затем остальные: у них проба сама
+    станет отправкой, если аккаунт найдётся.
+    """
+    known: list[dict] = []
+    unknown: list[dict] = []
+
+    try:
+        rows = db._query_rows(
+            "SELECT ct.id AS contact_id, ct.phone AS phone, ct.name AS name, "
+            "       ct.category AS category, "
+            "       MAX(CASE WHEN s.channel='max' AND s.verdict='present' "
+            "                THEN 1 ELSE 0 END) AS has_max, "
+            "       MAX(CASE WHEN s.channel='telegram' AND s.verdict='present' "
+            "                THEN 1 ELSE 0 END) AS has_tg "
+            "FROM contacts ct "
+            "LEFT JOIN contact_channel_state s ON s.contact_id = ct.id "
+            "WHERE COALESCE(ct.is_test,0)=0 AND COALESCE(ct.is_invalid,0)=0 "
+            "GROUP BY ct.id"
+        )
+    except Exception as e:
+        log.warning(f"кандидаты личных каналов не прочитаны: {e}")
+        return []
+
+    sent_phones: set[str] = set()
+    try:
+        sent_phones = set(db.get_sent_phones())
+    except Exception as e:
+        log.warning(f"история отправок для личных кандидатов недоступна: {e}")
+
+    pool_phones = {c.get("phone") for c in filtered if c.get("phone")}
+
+    for r in rows:
+        phone = r["phone"]
+        if not phone or phone in sent_phones:
+            continue
+        item = {
+            "contact_id": r["contact_id"],
+            "phone": phone,
+            "name": r["name"] or "—",
+            "category": r["category"] or "—",
+        }
+        if r["has_max"] or r["has_tg"]:
+            known.append(item)
+        elif not pool_phones or phone in pool_phones:
+            unknown.append(item)
+
+    known.sort(key=lambda c: c["phone"])
+    unknown.sort(key=lambda c: c["phone"])
+    log.info(
+        f"Кандидаты личных каналов: {len(known)} с подтверждённым аккаунтом, "
+        f"{len(unknown)} под пробу"
+    )
+    return known + unknown
+
+
 def _run_phase(
     phase_ch: str,
     items: list[dict],
@@ -2146,11 +2886,29 @@ def _run_phase(
                 f"фаза прервана, остаток в очереди"
             )
             break
+        # Остановка по ЦЕЛИ ДОСТАВОК, а не по числу попыток.
+        # Пока считается только принятие (HTTP 2xx), WABA набирает «успех» на
+        # каждом запросе и останавливается, не доставив ничего: Meta подтверждает
+        # доставку вебхуком с задержкой, поэтому к началу фазы счётчик
+        # доставок отстаёт. Фаза идёт ВНИЗ ПО СПИСКУ и смотрит на цель после
+        # каждой отправки — тогда лишние попытки не тратятся зря.
+        _tgt = int(getattr(config, "TARGET_DELIVERED_PER_DAY", 0) or 0)
+        if _tgt > 0:
+            _dlv_now = delivered_today_total()
+            if _dlv_now >= _tgt:
+                log.info(
+                    f"ЦЕЛЬ ПО ДОСТАВКАМ достигнута ({_dlv_now}/{_tgt}) — "
+                    f"фаза {phase_ch.upper()} прервана"
+                )
+                break
         if any(v > 0 for v in backoffs.values()):
             _wait_for_backoffs(backoffs, log)
 
-        state.increment_attempts(cur)
-        state.save_state(cur)
+        # Попытки здесь больше НЕ растут: счётчик двигает _persist_success,
+        # то есть ровно одна реальная отправка = одна попытка. Считать проходы
+        # цикла было неверно: контакт, отсеянный фильтром наличия аккаунта,
+        # занимал попытку, не отправив ничего, и SAFETY CAP душил фазы отката
+        # ещё до того, как до них дошла очередь.
 
         if _pool is not None:
             # Сначала доливаем конвейер (после проверок контакта!), затем
@@ -2389,6 +3147,36 @@ def _sweep_silence_into_rescue(minutes: int, unknown_minutes: int | None = None)
     return n
 
 
+def _build_exec_order(phase_order: list[str]) -> list[str]:
+    """Порядок ВЫПОЛНЕНИЯ фаз из порядка ПРИОРИТЕТОВ.
+
+    config.PHASE_ORDER отвечает на вопрос «кому какой канал лучше»
+    (max → telegram → waba), а не «что запускать первым».
+
+    Главное: ЛИЧНЫЕ КАНАЛЫ ИДУТ ПЕРВЫМИ. 09.10 WABA отработал первым и забрал
+    86 контактов, 40% из которых оказались без WhatsApp (20 BAD_CONTACT), а у
+    части наверняка был Telegram — квота ушла впустую, пока личные каналы
+    (20 MAX + 50 Telegram) остались нетронутыми. Мы платили квотой WhatsApp за
+    право НЕ узнать, что у человека есть мессенджер.
+
+    Итоговый порядок: personal (разведка) → waba → personal (добор слотов).
+    Второй проход личных каналов занимает миллисекунды, если лимит уже выбран.
+    """
+    personal_first = any(ch in ("max", "telegram") for ch in phase_order)
+    if personal_first and "waba" in phase_order:
+        return ["personal", "waba", "personal"]
+    if personal_first:
+        merged: list[str] = []
+        for ch in phase_order:
+            if ch in ("max", "telegram"):
+                if "personal" not in merged:
+                    merged.append("personal")
+            else:
+                merged.append(ch)
+        return merged
+    return list(phase_order)
+
+
 def _run_all_phases(
     filtered: list,
     stop_requested: dict,
@@ -2459,25 +3247,32 @@ def _run_all_phases(
                 exhausted_total=db.count_exhausted_rescues(),
                 waba_tier=state.get_waba_tier(_cur),
                 code_version=getattr(config, "CODE_VERSION", "unknown"),
+                plan=_build_run_plan(_cur, _planned),
             )
         except Exception as e:
             log.debug(f"digest_start не отправился: {e}")
 
-    for phase_no, phase_ch in enumerate(phase_order):
+    # ── Порядок ВЫПОЛНЕНИЯ отличается от порядка ПРИОРИТЕТОВ ──
+    # Логика и обоснование — в _build_exec_order() ниже.
+    exec_order = _build_exec_order(phase_order)
+
+    for phase_no, phase_ch in enumerate(exec_order):
         if stop_requested["v"]:
             break
 
-        # ── Фаза PROBE: перед первой фазой отката выясняем, у кого вообще
-        # есть аккаунт. Без неё откат уходит во все 150 неудачных контактов
-        # подряд и жжёт личный лимит Telegram/MAX на заведомо отсутствующие
-        # аккаунты (в истории 440 провалов против 163 успехов).
+        # ── Фаза PROBE Telegram — ПЕРВОЙ.
+        # Живой случай 2026-10-10: условие было `phase_ch in _probe_channels()`
+        # — то есть `phase_ch in {'telegram','max'}`. Но в порядке выполнения
+        # фаза личных каналов называется 'personal', и туда сводятся оба
+        # мессенджера. Условие не срабатывало НИКОГДА: проба молча не
+        # запускалась, и каскад уходил в личные каналы вслепую.
         #
-        # Проба бесплатна: отрицательный вердикт приходит синхронным 400 и
-        # квоту не списывает (см. bulkmessage/probe.py). Вызывается ОДИН раз
-        # за круг и только если в фазовом порядке есть личный канал.
-        if (phase_ch in _probe_channels()
+        # Telegram проверяем первым: отдельного лимита на проверку номера
+        # у него нет, и вердикты накапливаются бесплатно по квоте сообщений.
+        _is_first_phase = (phase_no == 0)
+        if (_is_first_phase and "telegram" in _probe_channels()
                 and not _probe_done_for_run()):
-            _run_probe_phase(stop_requested, phase_stats)
+            _run_probe_phase(stop_requested, phase_stats, channel="telegram")
             _mark_probe_done_for_run()
 
         if phase_no > 0:
@@ -2489,7 +3284,13 @@ def _run_all_phases(
             # отправляли НИЧЕГО — цепочка молча вырождалась в один WABA-проход.
             # Пауза нужна, чтобы долетели статусы; наполнять очередь должна
             # тишина, а не пауза.
-            prev_phase = phase_order[phase_no - 1]
+            # Предыдущая фаза берётся из ПОРЯДКА ВЫПОЛНЕНИЯ, а не из
+            # config.PHASE_ORDER. Порядки разошлись: конфиг задаёт приоритет
+            # каналов (max,telegram,waba), а выполняется waba → personal. По
+            # старому коду после WABA фаза personal ждала бы RESCUE_SETTLE и
+            # сторож получил бы неверный таймаут — молчание после WABA
+            # отсчитывается PHASE_GRACE_MINUTES, это другая величина.
+            prev_phase = exec_order[phase_no - 1]
             wait_min = int(
                 getattr(config, "PHASE_GRACE_MINUTES", 5)
                 if prev_phase == "waba"
@@ -2513,6 +3314,29 @@ def _run_all_phases(
             _sweep_silence_into_rescue(max(
                 0, int(getattr(config, "RESCUE_SETTLE_MINUTES", 5))))
 
+        # ── Фаза личных каналов по расписанию ──
+        # Заменяет отдельные фазы MAX и Telegram: обе отправки идут одним
+        # таймлайном со случайными интервалами, иначе первая фаза съест всё
+        # окно (живой случай 09.10: фазы TG и MAX не отправили ничего).
+        #
+        # Стоит ПОСЛЕ блока грейса и сторожа, а не до него. Иначе тишина после
+        # WABA не успевала бы превратиться в очередь отката, и каскад молча
+        # выродился бы в один WABA-проход: молчание вебхука = провал, а без
+        # сторожа провалы в откат не попадают.
+        if phase_ch == "personal":
+            _label = "разведка" if phase_no == 0 else "добор"
+            _pb = contacts_budget_left()
+            if _pb == 0:
+                log.info(
+                    "Личные каналы: бюджет контактов исчерпан "
+                    f"({_contacts_messaged_this_run()}) — фаза пропущена"
+                )
+                continue
+            _run_personal_slot_phase(
+                filtered, stop_requested, phase_stats, label=_label,
+                contacts_limit=_pb)
+            continue
+
         if phase_ch == "waba":
             # Ждём открытия активного окна (10:00 МСК) перед первой фазой.
             if _wait_until_active_window(log):
@@ -2522,6 +3346,22 @@ def _run_all_phases(
                 log.info("WABA: квота исчерпана — фаза пропущена")
                 continue
             targets = _collect_fresh_waba_targets(filtered, cur)
+            # Бюджет контактов: WABA получает остаток после пробы и любых
+            # предыдущих шагов, иначе «15 контактов» превращается в 15 WABA
+            # плюс все личные слоты сверху.
+            _wb = contacts_budget_left()
+            if _wb == 0:
+                log.info(
+                    "WABA: бюджет контактов исчерпан "
+                    f"({_contacts_messaged_this_run()}) — фаза пропущена"
+                )
+                continue
+            if _wb is not None and len(targets) > _wb:
+                log.info(
+                    f"WABA: режу цели с {len(targets)} до {_wb} "
+                    "(потолок контактов на прогон)"
+                )
+                targets = targets[:_wb]
             # Дневной кап канала (250) — верхняя граница по лимитам Meta.
             _cap_waba = int(state.channel_effective_cap(cur, "waba"))
             # Лимит запуска (--waba-limit N): для первых боевых прогонов,
@@ -2636,8 +3476,9 @@ def run() -> None:
     # Проба аккаунтов — один раз за запуск. В длинном прогоне круги
     # повторяются, но вердикты не меняются (TTL сутки), поэтому повторная
     # проба только жгла бы время без новой информации.
-    global _PROBE_DONE
+    global _PROBE_DONE, _MAX_PROBE_DONE
     _PROBE_DONE = False
+    _MAX_PROBE_DONE = False
 
     config.configure_logging()
     db.init_db()
@@ -3186,6 +4027,15 @@ def run() -> None:
             _RUN_CYCLE += 1
 
             if run_hours <= 0:
+                # Последняя фаза круга — разведка MAX. Только здесь, и
+                # только под конец: к этому моменту уже известно, у кого нет
+                # ни Telegram (проба фазы 1), ни WhatsApp (провалы WABA).
+                # MAX жёстче Telegram по санкциям, а проверка номера там —
+                # отдельная активность с потолком 10–20/день, поэтому
+                # проверять надо точечно, а не весь пул.
+                if "max" in _probe_channels() and not _max_probe_done_for_run():
+                    _run_probe_phase(stop_requested, phase_stats, channel="max")
+                    _mark_max_probe_done_for_run()
                 break
             left = _run_seconds_left()
             if left <= 0:
@@ -3212,6 +4062,19 @@ def run() -> None:
         log.info("─" * 70)
         log.info(f"Фазы отработаны (кругов: {_RUN_CYCLE}): "
                  f"{phase_stats or '—'}")
+        # Отчёт именно по ЭТОМУ прогону. Накопленный профиль пула отвечает на
+        # другой вопрос и в финале прогону только мешает: владелец видел
+        # «есть Telegram 267 / всего 4442» после отправки 2 сообщений и не
+        # понимал, куда делись его контакты.
+        try:
+            from . import probe as _probe
+            # _RUN_STARTED_AT хранится как unix-время, а SQL ждёт ISO.
+            _since = datetime.fromtimestamp(
+                _RUN_STARTED_AT, tz=timezone.utc
+            ).isoformat() if _RUN_STARTED_AT else None
+            _probe.report_run_summary(_since)
+        except Exception as _rse:
+            log.debug(f"отчёт по прогону не отработал: {_rse}")
         # Поимённый отчёт по доставке — то, чего в логах раньше не было.
         try:
             _report_all_channels_delivery()
@@ -3224,6 +4087,23 @@ def run() -> None:
             )
         except Exception:
             pass
+
+        # Кого за день не дотянули — фиксируем для будущей отправки через
+        # SMS (решение владельца 2026-10-09). Список НЕ отправляется сам:
+        # SMS платный, и решение принимается отдельно. Идемпотентно, повторный
+        # прогон строк не размножает.
+        try:
+            from .store import pending_sms as _psms
+            _added = _psms.collect_today()
+            _info = _psms.summary()
+            log.info(
+                f"Список для SMS (pending_sms): +{_added} за сегодня, "
+                f"всего в ожидании "
+                f"{_info['by_status'].get('pending', 0)} — "
+                f"см. py main.py pending-sms"
+            )
+        except Exception as _pe:
+            log.warning(f"список для SMS не наполнен: {_pe}")
         log.info("─" * 70)
 
     finally:

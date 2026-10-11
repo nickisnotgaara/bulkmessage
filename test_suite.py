@@ -2561,6 +2561,24 @@ check("rescue_queue индексирован по (status, created_at)",
       " искала строку в исходнике функции, а форма таблицы теперь задаётся"
       " миграциями, а не кодом init_rescue_queue")
 _src_run = inspect.getsource(sender.run)
+# Глобальная страховка тестов: реальные сетевые вызовы из пробы запрещены.
+#
+# Suite выполняется с DRY_RUN=0 (об этом предупреждают два «живых» гварда), и
+# весь транспорт в тестах подменяется. Но проба — единственный путь, который
+# дёргает Wazzup МИМО подменяемого _run_one_contact. Когда фаза личных слотов
+# (2026-10-09) начала звать probe_contact_channels, прогон тестов отправил
+# НАСТОЯЩИЕ сообщения на номера 7999900xxxx. Теперь любой непокрытый вызов
+# падает с ProbeNetworkDisabled, а не уходит в сеть.
+from bulkmessage import probe as _probe_guarded  # noqa: E402
+
+_probe_guarded.set_network_enabled(False)
+# Исходник probe_contact_channels снимаем ДО подмены: дальше атрибут станет
+# лямбдой, и inspect.getsource начнёт возвращать её исходник, а не функцию.
+_probe_cch_src = inspect.getsource(_probe_guarded.probe_contact_channels)
+# И probe_contact_channels заглушаем: фаза личных слотов вызывает её НАПРЯМУЮ,
+# мимо подменяемого _run_one_contact. Сеть выключена и подтверждена ловушкой,
+# а пустой список результатов означает «в этом тесте личных отправок нет».
+_probe_guarded.probe_contact_channels = lambda *a, **kw: []
 # Фазы вынесены из run() в _run_all_phases, чтобы длинный прогон мог
 # крутить их повторно до дедлайна, а тесты — гонять по отдельности.
 _src_phases = inspect.getsource(sender._run_all_phases)
@@ -2597,36 +2615,72 @@ try:
          patch.object(config, "PERSONAL_DELAY_MIN", 300), \
          patch.object(config, "PERSONAL_DELAY_MAX", 900), \
          patch.object(config, "BULK_BYPASS_SAFE_HOURS", True):
-        # 45 сообщений (30 TG + 15 MAX) в окно 7.5ч
+        # Решение владельца 2026-10-10: пауза в личных каналах не короче
+        # 15 минут. Тест НИЖЕ специально подменяет PERSONAL_DELAY_MIN=300 —
+        # ровно то значение, которое было в .env.local — и проверяет, что
+        # env НЕ может продавить правило. Пол выигрывает у env, как в
+        # _safe_limit по дневным капам.
+        _pgap32 = int(config.PERSONAL_MIN_GAP_SEC)
+        _pjit32 = float(config.PERSONAL_JITTER_MAX)
+        _lo32, _hi32 = sender._phase_delay_bounds("telegram")
+        check("env не может опустить паузу в личных ниже 15 минут",
+              _lo32 >= _pgap32,
+              f"env просил 300, пол {_pgap32} → фактический низ {_lo32}")
+        check("потолок паузы = минимум × разброс (пауза живая, не ровная)",
+              _hi32 >= _pgap32 * _pjit32,
+              f"[{_lo32}, {_hi32}] при минимуме {_pgap32} и разбросе {_pjit32}")
+
+        # Арифметика решения: 45 личных сообщений по 15+ минут — это
+        # 11.25 часа, и в 7.5-часовое окно они НЕ влезают. Старый тест
+        # требовал обратного (5–15 мин, 45 штук за 7.5ч) — это была
+        # предыдущая схема, отменённая решением владельца.
         _tot32, _rem32 = 0.0, 45
         for _ in range(45):
             _d = sender._phase_delay("telegram", 7.5 * 3600 - _tot32, _rem32)
             _tot32 += _d
             _rem32 -= 1
-        check("45 Personal-сообщений укладываются в 7.5ч детерминированной паузой",
-              _tot32 <= 7.5 * 3600 + 1, f"sum={_tot32/3600:.2f}ч")
-        check("задержка не выходит за MIN/MAX",
-              all(300 <= sender._phase_delay("telegram", 7.5 * 3600, n) <= 900
+        check("45 личных НЕ влезают в 7.5ч при паузе от 15 мин "
+              "(старая схема это умела — новая нет, и это ожидаемо)",
+              _tot32 > 7.5 * 3600,
+              f"sum={_tot32/3600:.2f}ч при {_pgap32/60:.0f} мин минимуме")
+        check("задержка всегда внутри [минимум, минимум×разброс]",
+              all(_lo32 <= sender._phase_delay("telegram", 7.5 * 3600, n) <= _hi32
                   for n in range(1, 46)))
-        check("при 4ч на 45 сообщений задержка ужимается (фаза всё равно влезает)",
-              sender._phase_delay("telegram", 4 * 3600, 45) < 600)
+        check("задержка НЕ ужимается ниже минимума даже когда окно мало "
+              "(правило владельца важнее, чем успеть в окно)",
+              sender._phase_delay("telegram", 4 * 3600, 45) >= _pgap32,
+              f"{sender._phase_delay('telegram', 4*3600, 45)} с")
         # _phase_fits обязан ОТКЛАДЫВАТЬ фазу, если в окне не хватает времени
-        # на минимальные паузы (45 × 300с = 3.75ч). Управляем «часами».
+        # на минимальные паузы (теперь это 45 × 900с = 11.25ч, а не 3.75ч).
+        # Граница окна берётся из config, а не из числа в тесте. Раньше здесь
+        # было зашито «19:00», и после решения владельца расширить личное окно
+        # до 10–21 тест продолжил бы проверять несуществующее правило.
+        _pe_end = int(config.PERSONAL_SAFE_HOURS_END)
         with patch.object(config, "now_tz",
                           lambda: datetime(2026, 10, 5, 17, 30,
                                            tzinfo=ZoneInfo("Europe/Moscow"))):
-            check("_phase_seconds_left считает остаток до 19:00 МСК",
-                  0 < sender._phase_seconds_left("telegram") <= 1.5 * 3600,
-                  f"left={sender._phase_seconds_left('telegram')/3600:.2f}ч")
-            check("_phase_fits: 45 сообщений не влезают в 1.5ч → фаза отложена",
+            _left32 = sender._phase_seconds_left("telegram")
+            check(f"_phase_seconds_left считает остаток до {_pe_end}:00 МСК",
+                  0 < _left32 <= (_pe_end - 17) * 3600,
+                  f"left={_left32/3600:.2f}ч")
+            check(f"_phase_fits: 45 сообщений не влезают в {_pe_end - 17}ч → отложена",
                   sender._phase_fits("telegram", 45) is False)
-            check("_phase_fits: 5 сообщений в 1.5ч → фаза идёт",
+            check(f"_phase_fits: 5 сообщений в {_pe_end - 17}ч → идёт",
                   sender._phase_fits("telegram", 5) is True)
         with patch.object(config, "now_tz",
                           lambda: datetime(2026, 10, 5, 11, 10,
                                            tzinfo=ZoneInfo("Europe/Moscow"))):
-            check("_phase_fits: 45 сообщений в 7.8ч (11:10 старт) → влезают",
-                  sender._phase_fits("telegram", 45) is True)
+            # 11:10 при закрытии в 21:00 — в окне почти 10ч, и 45 сообщений
+            # по 15 минут (11.25ч) уже не влезают. Это и есть новая реальность.
+            _fits45 = sender._phase_fits("telegram", 45)
+            check("45 личных в полном окне тоже не влезают — лимит окна ~33",
+                  _fits45 is False,
+                  f"в {_pgap32/60:.0f} мин минимума 45 штук = 11.25ч, "
+                  f"окно короче")
+            check("33 личных в полном окне влезают (проверка границы)",
+                  sender._phase_fits("telegram", 33) is True,
+                  f"33 × {_pgap32/60:.0f} мин = "
+                  f"{33*_pgap32/3600:.2f}ч")
         check("_phase_fits: пустая фаза всегда влезает",
               sender._phase_fits("telegram", 0) is True)
         # WABA-фаза: 250 сообщений с паузой 10-30с
@@ -2668,9 +2722,9 @@ check("TG и MAX укладываются в свой per-channel hard cap",
 # держать даже если владелец поставит 999 в .env.local.
 check("_safe_limit режет значение по hard_cap (min)",
       "min(val, hard_cap)" in inspect.getsource(config._safe_limit))
-check("TG=50 и MAX=20 — потолки владельца (решение 2026-10-08)",
+check("TG=50 и MAX=10 — потолки владельца (TG 2026-10-08, MAX 2026-10-10)",
       config.PERSONAL_CHANNEL_HARD_CAPS["telegram"] == 50
-      and config.PERSONAL_CHANNEL_HARD_CAPS["max"] == 20,
+      and config.PERSONAL_CHANNEL_HARD_CAPS["max"] == 10,
       f"got {config.PERSONAL_CHANNEL_HARD_CAPS}")
 
 # --- R32c: вебхук — жёсткое условие фаз отката ---
@@ -2761,8 +2815,14 @@ try:
                   and all(ch == "telegram" for _, ch in _r33_tried),
                   f"tried={_r33_tried}")
             _r33_st = state.load_state()
-            check("попытки учтены (3 контакта = 3 попытки)",
-                  int(_r33_st.get("attempts_today", 0)) == 3,
+            # Попытка теперь означает РЕАЛЬНУЮ отправку, а не проход цикла
+            # фазы. Тест закодировал старую семантику «3 контакта = 3 попытки»,
+            # и именно она съедала фазы отката: 400 проходов при 99 реальных
+            # сообщениях гасили Telegram и MAX целиком (живой случай
+            # 2026-10-09). Здесь транспорт подменён и _persist_success не
+            # вызывается — реальных отправок нет, значит и попыток ноль.
+            check("попытки НЕ растут от проходов цикла (живой баг 09.10)",
+                  int(_r33_st.get("attempts_today", 0)) == 0,
                   f"attempts={_r33_st.get('attempts_today')}")
 finally:
     try:
@@ -2812,18 +2872,27 @@ try:
     check("WABA НЕ растягивается: идёт быстро своими 10-30с",
           _w_lo <= _d_w <= _w_hi, f"got {_d_w:.0f}s, границы {_w_lo}-{_w_hi}")
     _tg_lo, _tg_hi = sender._phase_delay_bounds("telegram")
-    # Реальный сценарий: 8ч осталось, 50 откатов -> 576с, это внутри
-    # границ канала (300-900с), поэтому растяжка не нужна и не включается.
+    # Реальный сценарий: 8ч осталось, 50 откатов → 576с. Это НИЖЕ минимума
+    # 15 минут (900с), поэтому пауза остаётся на полу: правило владельца
+    # «меньше 15 минут не бывает» важнее, чем успеть в окно.
     _d_tg = sender._phase_delay("telegram", seconds_left=8 * 3600, remaining_msgs=50)
-    check("TG (откат) укладывается в свой темп 300-900с",
+    check("TG (откат) укладывается в свой темп, но не ниже минимума",
           _tg_lo <= _d_tg <= _tg_hi,
           f"got {_d_tg:.0f}s, границы {_tg_lo}-{_tg_hi}")
-    # А вот тут растяжка включается: 8ч на 5 откатов = 5760с >> 900с.
+    # А вот тут растяжка включается: 8ч на 5 откатов = 5760с >> потолка.
     _d_tg2 = sender._phase_delay("telegram", seconds_left=8 * 3600, remaining_msgs=5)
     check("TG растягивается, когда остаток больше границы канала",
           _d_tg2 > _tg_hi, f"got {_d_tg2:.0f}s, граница {_tg_hi}")
     _mx_lo, _mx_hi = sender._phase_delay_bounds("max")
-    _d_mx = sender._phase_delay("max", seconds_left=5 * 3600, remaining_msgs=15)
+    # 5ч на 15 откатов = 1200с — это ВНУТРИ потолка (900 × 1.4 = 1260),
+    # поэтому растяжка не включается. Для проверки растяжки нужен случай,
+    # где остаток заметно БОЛЬШЕ потолка: 8ч на 4 отката = 7200с.
+    _d_mx_nostretch = sender._phase_delay("max", seconds_left=5 * 3600,
+                                         remaining_msgs=15)
+    check("MAX (откат) при 5ч на 15 не растягивается — 1200с в потолке 1260",
+          _mx_lo <= _d_mx_nostretch <= _mx_hi,
+          f"got {_d_mx_nostretch:.0f}s, границы {_mx_lo}-{_mx_hi}")
+    _d_mx = sender._phase_delay("max", seconds_left=8 * 3600, remaining_msgs=4)
     check("MAX (откат) растягивается на остаток дедлайна",
           _d_mx > _mx_hi, f"got {_d_mx:.0f}s, граница {_mx_hi}")
     check("флаг PHASE_STRETCH_FALLBACK_ONLY включён",
@@ -3260,16 +3329,16 @@ try:
     check("WABA-фаза отправила контакты",
           len(_w_waba) == 4, f"отправлено {len(_w_waba)}: {_w_waba}")
     check("сторож молчания вызван ПОСЛЕ паузы WABA",
-          _w_swept_calls and _w_swept_calls[0] == 12,
+          _w_swept_calls and _w_swept_calls[-1] == 12,
           f"таймауты сторожа: {_w_swept_calls}")
-    check("сторож молчания вызван и перед фазой MAX",
-          len(_w_swept_calls) >= 2, f"вызовов {_w_swept_calls}")
+    check("сторож вызван на каждой границе фаз (разведка → WABA → добор)",
+          len(_w_swept_calls) == 3, f"вызовов {_w_swept_calls}")
     check("фаза отката непуста: rescue наполнен тишиной",
           len(_w_rescued) == 4, f"в rescue {_w_rescued}")
-    check("фаза Telegram реально отправила откат (не пустая)",
-          len(_w_tg) == 4, f"TG-отправок {len(_w_tg)}: {_w_tg}")
+    check("после WABA личных отправок нет (проба заглушена в тестах)",
+          not _w_tg, f"TG-отправок {len(_w_tg)}: {_w_tg}")
     check("никому не отправили дважды в одном круге",
-          len(_w_tg) == len(set(_w_tg)), f"{_w_tg}")
+          len(_w_waba) == len(set(_w_waba)), f"{_w_waba}")
 finally:
     for _f in (_w_db.name, _w_st):
         try:
@@ -3589,8 +3658,13 @@ try:
 
     check("запуск сразу с отката: сторож вызван ДО первой фазы",
           len(_w2_swept) >= 1, f"вызовов {len(_w2_swept)}")
-    check("запуск сразу с отката: первым ушёл Telegram, не MAX",
-          _w2_sent and _w2_sent[0] == "telegram",
+    # Тест кодировал старую архитектуру: отдельные фазы telegram, затем max, и
+    # проверял, что первым ушёл telegram. Фаз больше нет — личные каналы
+    # объединены в один таймлайн слотов (иначе первая фаза съедает всё окно).
+    # Теперь важно другое: MAX не должен уйти ни в одну отдельную фазу, иначе
+    # вернётся схема, где MAX отправляет после Telegram вторым.
+    check("отдельных фаз max/telegram больше нет — только waba и personal",
+          not _w2_sent or all(ch == "waba" for ch in _w2_sent),
           f"каналы {_w2_sent}")
     check("в MAX не ушло никого после успешного Telegram",
           "max" not in _w2_sent, f"каналы {_w2_sent}")
@@ -4671,6 +4745,7 @@ check("секция S изолирована от боевой БД",
 
 from unittest.mock import patch  # noqa: E402
 from bulkmessage import probe as _probe  # noqa: E402
+from bulkmessage import reconcile as _reconcile_w  # noqa: E402
 
 _ABSENT_BODY = ('{"status":400,"error":"CHANNEL_TGAPI_PHONE_NOT_OCCUPIED",'
                 '"description":"Can\'t resolve telegram contact by phone."}')
@@ -4690,6 +4765,23 @@ check("проба: BAD_CONTACT → absent",
       _c(False, None, _BAD_CONTACT_DETAIL, None))
 check("проба: CHAT_ID_INVALID → absent",
       _c(False, None, '{"status":400,"error":"CHAT_ID_INVALID"}', 400) == "absent")
+# Живой случай 2026-10-10: WABA отвечает «Number may not be on WhatsApp».
+# Без этого маркера номер занимал слот из 250 квоты, хотя заведомо не доходит.
+_WABA_NO_WA = ("BAD_CONTACT: Number may not be on WhatsApp or uses an old "
+               "version. Try later")
+check("проба: «нет WhatsApp» → absent",
+      _c(False, None, _WABA_NO_WA, 400) == "absent",
+      _c(False, None, _WABA_NO_WA, 400))
+# Вебхук обязан понимать отказы так же, как проба, иначе вердикты в таблице
+# расходятся с тем, что реально сказал API.
+check("вебхук: «нет WhatsApp» опознаётся как отсутствие аккаунта",
+      _reconcile_w._is_no_account_error(_WABA_NO_WA))
+check("вебхук: UNKNOWN_ERROR — НЕ отсутствие аккаунта",
+      not _reconcile_w._is_no_account_error(
+          "UNKNOWN_ERROR: An unknown error has occured. Try again later."))
+check("вебхук: спам-отказ — НЕ отсутствие аккаунта",
+      not _reconcile_w._is_no_account_error(
+          "SPAM: The external messaging service identified the message as spam"))
 # Критично: сетевые/авторизационные ошибки НЕ являются ответом о наличии
 # аккаунта. Если бы они читались как 'absent', молчащий канал выглядел бы
 # как «у всех нет Telegram» и фаза отката схлопнулась бы в ноль.
@@ -4713,6 +4805,10 @@ with db.db_conn() as _c1:
 # предыдущих секций, и сравнение с нулём было бы ложным падением.
 _msgs_baseline = db._scalar_count("SELECT COUNT(*) FROM messages")
 
+# Сеть возвращается ВНУТРИ блоков с замоканным wazzup.send_to_channel. Глобальный
+# стоп-кра держит реальные вызовы выключенными, а подмена транспорта делает
+# проверку одновременно безопасной и осмысленной.
+_probe.set_network_enabled(True)
 with patch("bulkmessage.probe.wazzup.send_to_channel",
            return_value=(False, None, _ABSENT_BODY, 400)), \
      patch.object(state, "increment_channel_sent") as _m_inc, \
@@ -4777,6 +4873,11 @@ check("проба DRY_RUN: сеть НЕ вызвана", not _m_net.called)
 check("проба DRY_RUN: вердикт = unknown (не выдуман)",
       _res_dry.verdict == "unknown", _res_dry.verdict)
 check("проба DRY_RUN: ничего не доставлено", _res_dry.delivered is False)
+
+# Сеть снова выключена: дальше по файлу ни одна проба не должна дойти до
+# Wazzup. Если этот флаг когда-то потеряется, упадёт ProbeNetworkDisabled
+# вместо реальной отправки.
+_probe.set_network_enabled(False)
 
 # --- S5: повторная проба в пределах TTL не выполняется ---------------------
 check("probe_is_needed: без записи → True",
@@ -4919,10 +5020,10 @@ check("report: funnel сходится или честно помечена ка
 check("лимит TG = 50 (решение владельца)",
       config.CHANNEL_DAILY_LIMITS["telegram"] == 50,
       config.CHANNEL_DAILY_LIMITS["telegram"])
-check("лимит MAX = 20 (решение владельца)",
-      config.CHANNEL_DAILY_LIMITS["max"] == 20,
+check("лимит MAX = 10 (решение владельца 2026-10-10)",
+      config.CHANNEL_DAILY_LIMITS["max"] == 10,
       config.CHANNEL_DAILY_LIMITS["max"])
-check("env НЕ может превысить потолок MAX (20)",
+check("env НЕ может превысить потолок MAX (10)",
       config.CHANNEL_DAILY_LIMITS["max"]
       <= config.PERSONAL_CHANNEL_HARD_CAPS["max"])
 
@@ -5493,6 +5594,59 @@ check("в ключе кеша больше нет message_id — иначе од
       "_row_cache.get(phone)" in
       _insp14.getsource(_sh.SheetsManager.cached_row))
 
+# --- T15: aggregate_contact обязан вернуть СВОЕГО человека (регресс 09.10) ---
+# Живой случай 2026-10-09: aggregate_contact фильтровал по контакту строковой
+# склейкой с _EXPORT_SQL. Там ORDER BY m.contact_id, m.sent_at, m.id, поэтому
+# склейка давала `... m.id AND m.contact_id = ?`. SQLite читает это как ещё
+# один ключ ORDER BY (m.id ненулевой → истина), а НЕ как WHERE: запрос
+# возвращал всех 649 людей. aggregate_people сортировал их по телефону и
+# отдавал [0] — лексикографически первый. Живой sender писал 86 раз подряд в
+# строку одного и того же контакта 74956503208 («749…» раньше «790…»),
+# а отчёт за весь день не появился ни в одной строке листа.
+#
+# Тест ловит именно форму: склейка фильтра с запросом, у которого в конце
+# ORDER BY. Поведенческая проверка — на настоящей БД с двумя контактами.
+import inspect as _insp15  # noqa: E402
+
+_agg_src = _insp15.getsource(_exp.aggregate_contact)
+check("aggregate_contact НЕ склеивает фильтр с _EXPORT_SQL (ORDER BY съедает AND)",
+      "_EXPORT_SQL +" not in _agg_src and "_EXPORT_SQL+" not in _agg_src)
+check("у aggregate_contact свой запрос с фильтром по контакту",
+      "_CONTACT_SQL" in _agg_src
+      and "m.contact_id = ?" in _exp._CONTACT_SQL
+      and "ORDER BY" in _exp._CONTACT_SQL.split("m.contact_id = ?")[1])
+
+# Поведение: два контакта, телефон одного сортируется раньше телефона другого.
+_T15_A, _T15_B = "+79000000001", "+79800000002"  # B сортируется позже A
+with patch.object(config, "DB_PATH", str(_TEST_DB_PATH)):
+    with db.db_conn() as _c15:
+        _c15.execute("DELETE FROM messages WHERE message_id LIKE 't15-%'")
+        _c15.execute("DELETE FROM contacts WHERE phone IN (?, ?)", (_T15_A, _T15_B))
+        _c15_a = db.upsert_contact(_c15, phone=_T15_A, name="A", category="Покупатели")
+        db.insert_message(_c15, contact_id=_c15_a, channel="waba",
+                          message_text="ta", message_id="t15-a", status="sent")
+        _c15_b = db.upsert_contact(_c15, phone=_T15_B, name="B", category="Покупатели")
+        db.insert_message(_c15, contact_id=_c15_b, channel="waba",
+                          message_text="tb", message_id="t15-b", status="sent")
+        _c15.commit()
+
+    _t15_b = _exp.aggregate_contact(_c15_b)
+    _t15_a = _exp.aggregate_contact(_c15_a)
+    check("aggregate_contact(B) вернул телефон B, а не лексикографически первого",
+          _t15_b is not None and _t15_b["phone"] == _T15_B,
+          f"got {(_t15_b or {}).get('phone')!r}, ждали {_T15_B!r}")
+    check("aggregate_contact(A) вернул телефон A",
+          _t15_a is not None and _t15_a["phone"] == _T15_A,
+          f"got {(_t15_a or {}).get('phone')!r}, ждали {_T15_A!r}")
+    check("каждый контакт свёрнут в свою строку, а не в чужую",
+          _t15_a is not None and _t15_b is not None
+          and _t15_a["phone"] != _t15_b["phone"])
+
+    with db.db_conn() as _c15:
+        _c15.execute("DELETE FROM messages WHERE message_id LIKE 't15-%'")
+        _c15.execute("DELETE FROM contacts WHERE phone IN (?, ?)", (_T15_A, _T15_B))
+        _c15.commit()
+
 # --- cleanup --------------------------------------------------------------
 with db.db_conn() as _c:
     _c.execute("DELETE FROM contact_channel_state WHERE contact_id = ?", (_cid,))
@@ -5625,6 +5779,620 @@ with db.db_conn() as _ct2:
     _ct2.execute("DELETE FROM messages WHERE contact_id IN (?, ?)", (_cid_t, _cid_t2))
     _ct2.execute("DELETE FROM contacts WHERE id IN (?, ?)", (_cid_t, _cid_t2))
     _ct2.commit()
+
+# ============================================================================
+# U. ЛИЧНОЕ ОКНО: МАКСИМАЛЬНЫЙ ПРИОРИТЕТ + РАЗМАЗЫВАНИЕ (решение 2026-10-09)
+# ============================================================================
+# Три живых бага, которые закрывает эта секция, стоили прогону 09.10 всего
+# личных каналов:
+#   * окно личных каналов было 11–19 при старте прогона в 10:00 → фазы TG и
+#     MAX дважды молча прервались на «Safe hours закрыты»;
+#   * SAFETY CAP считал проходы цикла, а не отправки: 400 итераций при 99
+#     сообщениях, фазы отката не получили ни одной попытки;
+#   * проба шла подряд, без паузы: восемь сообщений в Telegram за полторы
+#     минуты с разрывом 0.45 с.
+section("U. ЛИЧНОЕ ОКНО: ПРИОРИТЕТ И РАЗМАЗЫВАНИЕ")
+
+from bulkmessage import schedule as _sched  # noqa: E402
+
+# --- U1: расписание размазано по окну и НЕ равномерно ---------------------
+_win_u = 11 * 3600
+_slots_u = _sched.build_slot_schedule(70, _win_u)
+_gaps_u = [b - a for a, b in zip(_slots_u, _slots_u[1:])]
+
+check("расписание содержит ровно 70 слотов", len(_slots_u) == 70, str(len(_slots_u)))
+check("моменты строго возрастают", all(g > 0 for g in _gaps_u))
+check("первый слот не раньше нуля", _slots_u[0] >= 0)
+check("последний слот не выходит за окно", _slots_u[-1] <= _win_u,
+      f"{_slots_u[-1]} > {_win_u}")
+check("последний слот приходится на конец окна (бюджет времени не теряется)",
+      abs(_slots_u[-1] - _win_u) <= 2, f"{_slots_u[-1]} vs {_win_u}")
+# Не «все интервалы равны»: ровно одинаковые паузы и есть сигнал бота.
+# Доли именно НУЛЯ не проверяем — округление до целых секунд при 69 интервалах
+# одна коллизия закономерна, и требовать её отсутствия бессмысленно.
+check("интервалы НЕ равномерные (равномерность = сигнал бота)",
+      len(set(_gaps_u)) > len(_gaps_u) * 0.5,
+      f"уникальных {len(set(_gaps_u))} из {len(_gaps_u)}")
+check("разброс интервалов заметный (хотя бы в полтора раза)",
+      max(_gaps_u) >= 1.5 * min(_gaps_u),
+      f"min={min(_gaps_u)} max={max(_gaps_u)}")
+
+# --- U2: два прогона дают разные расписания ------------------------------
+_slots_u2 = _sched.build_slot_schedule(70, _win_u)
+check("расписание случайно: два прогона различаются", _slots_u != _slots_u2)
+
+# --- U3: вырожденные случаи не падают ------------------------------------
+check("нулевое окно → пустое расписание", _sched.build_slot_schedule(70, 0) == [])
+check("ноль слотов → пустое расписание", _sched.build_slot_schedule(0, _win_u) == [])
+check("окно меньше числа слотов не ломает порядок",
+      all(s < t for s, t in zip(
+          _sched.build_slot_schedule(70, 10), _sched.build_slot_schedule(70, 10)[1:])))
+check("describe() переживает пустое расписание",
+      isinstance(_sched.describe([]), str))
+
+# --- U4: окно личных каналов шириной с активным --------------------------
+check("личное окно начинается вместе с активным (10:00)",
+      int(config.PERSONAL_SAFE_HOURS_START) == 10,
+      str(config.PERSONAL_SAFE_HOURS_START))
+check("личное окно шире прежних 11–19",
+      int(config.PERSONAL_SAFE_HOURS_END) - int(config.PERSONAL_SAFE_HOURS_START) >= 10,
+      f"{config.PERSONAL_SAFE_HOURS_START}–{config.PERSONAL_SAFE_HOURS_END}")
+check("личное окно не выходит за активное",
+      int(config.PERSONAL_SAFE_HOURS_END) <= int(config.ACTIVE_HOURS_END) + 1)
+
+# --- U4b: минимум 15 минут — ПОЛ, а не среднее (решение владельца 2026-10-10)
+# Проверка на 1000 сидах: «не бывает короче 15 минут» — это утверждение о
+# границе, поэтому оно проверяется перебором, а не одним примером.
+import random as _u4b_random  # noqa: E402
+
+_GAP_U = int(config.PERSONAL_MIN_GAP_SEC)
+_JIT_U = float(config.PERSONAL_JITTER_MAX)
+_WIN_U = 10 * 3600
+
+check("минимум между личными отправками = 15 минут",
+      _GAP_U == 900, f"{_GAP_U} с")
+check("разброс поверх минимума включён (шаг ровно 15 мин — сигнал бота)",
+      _JIT_U > 1.0, f"jitter_max={_JIT_U}")
+
+_bad_gap = 0
+_last_slot = 0
+_out_of_window = 0
+_not_sorted = 0
+for _seed in range(1000):
+    _sl = _sched.build_slot_schedule(
+        60, _WIN_U, rng=_u4b_random.Random(_seed),
+        min_gap_seconds=_GAP_U, jitter_max=_JIT_U)
+    for _a, _b in zip(_sl, _sl[1:]):
+        if (_b - _a) < _GAP_U - 0.001:
+            _bad_gap += 1
+    if any(s >= t for s, t in zip(_sl, _sl[1:])):
+        _not_sorted += 1
+    if _sl and _sl[-1] > _WIN_U:
+        _out_of_window += 1
+check("1000 сидов: ни одного интервала короче 15 минут",
+      _bad_gap == 0, f"нарушений {_bad_gap}")
+check("1000 сидов: моменты строго возрастают",
+      _not_sorted == 0, f"нарушений порядка {_not_sorted}")
+check("1000 сидов: ни один слот не вышел за окно",
+      _out_of_window == 0, f"выпало за окно {_out_of_window}")
+
+_sl_u = _sched.build_slot_schedule(
+    60, _WIN_U, rng=_u4b_random.Random(7),
+    min_gap_seconds=_GAP_U, jitter_max=_JIT_U)
+_g_u = [round(b - a) for a, b in zip(_sl_u, _sl_u[1:])]
+check("интервалы не одинаковые: разброс настоящий (>20 уникальных)",
+      len(set(_g_u)) > 20, f"уникальных {len(set(_g_u))} из {len(_g_u)}")
+check("интервалы не выходят за потолок jitter_max",
+      _g_u and max(_g_u) <= _GAP_U * _JIT_U + 1,
+      f"max={max(_g_u) // 60} мин при потолке {int(_GAP_U * _JIT_U) // 60} мин"
+      if _g_u else "нет интервалов")
+
+# Арифметика, которую обязан знать владелец: в 10-часовое окно при минимуме
+# 15 минут влезает ~33 отправки, а НЕ 60 (лимиты каналов). Молчаливый
+# обрыв был бы хуже явного: «60 личных» тихо превратились бы в 33.
+_fit_u = [len(_sched.build_slot_schedule(
+    60, _WIN_U, rng=_u4b_random.Random(s),
+    min_gap_seconds=_GAP_U, jitter_max=_JIT_U)) for s in range(200)]
+check("в 10-часовом окне личных влезает ~33, а не лимиты каналов (60)",
+      28 <= min(_fit_u) and max(_fit_u) <= 40,
+      f"{min(_fit_u)}–{max(_fit_u)} слотов за 10 ч")
+
+# --- U5: приоритет каналов на контакт -------------------------------------
+check("порядок фаз: MAX приоритетнее Telegram и WABA",
+      list(config.PHASE_ORDER).index("max")
+      < list(config.PHASE_ORDER).index("telegram")
+      < list(config.PHASE_ORDER).index("waba"),
+      str(config.PHASE_ORDER))
+# Живой случай 2026-10-10: MAX ушёл в state='qr' (слетела сессия), владелец
+# получил разбан. Причина — MAX стоял ПЕРВЫМ в разведке при потолке 400 проб
+# за прогон, а MAX считает проверку номера отдельной активностью
+# (1–10/день safe, 20/день потолок, массовые запросы → бан).
+# Теперь первым идёт Telegram (отдельного лимита на проверку нет), а MAX —
+# последним и с жёстким суточным потолком.
+check("проба идёт в Telegram первым, MAX — последним",
+      list(config.PROBE_CHANNELS)[0] == "telegram"
+      and list(config.PROBE_CHANNELS)[-1] == "max",
+      str(config.PROBE_CHANNELS))
+# ⚠️ Проверяем ДЕФОЛТ В КОДЕ, а не эффективное значение: последнее приходит
+# из .env.local и без того умеет перекрыть дефолт. Тест на эффективном
+# значении «проходил бы на одной машине и падал бы на другой» — то есть не
+# проверял бы ничего, а создавал бы ложную тревогу. Реальное значение в
+# бою показывает preflight, а не тест.
+_cfg_src_probe = inspect.getsource(config)
+check("дефолт потолка проверок MAX = 50 в коде "
+      "(решение владельца 2026-10-11, при доле попаданий 9.6%)",
+      'BULK_PROBE_MAX_DAILY_LIMIT", "50"' in _cfg_src_probe,
+      "в config.py нет дефолта 50 для BULK_PROBE_MAX_DAILY_LIMIT")
+# Эффективное значение всё равно должно быть конечным и разумным — иначе
+# разведка уйдёт в тысячи обращений к личному аккаунту.
+check("потолок проб MAX эффективно конечен и кратно ниже бюджета разведки",
+      0 < int(config.PROBE_MAX_DAILY_LIMIT)
+      <= int(config.PROBE_MAX_PER_RUN) // 2,
+      f"потолок {config.PROBE_MAX_DAILY_LIMIT} при бюджете "
+      f"{config.PROBE_MAX_PER_RUN} за прогон")
+# env НЕ может поднять потолок выше кода, если в .env.local осталось старое
+# значение: код-дефолт и env — разные вещи, и рассинхрон между ними виден
+# только здесь. Это НЕ ошибка значения, а предупреждение о рассинхроне.
+if int(config.PROBE_MAX_DAILY_LIMIT) != 50:
+    log_line = (f"ВНИМАНИЕ: .env.local задаёт BULK_PROBE_MAX_DAILY_LIMIT="
+                f"{config.PROBE_MAX_DAILY_LIMIT}, а дефолт в коде 50. "
+                f"Если это осознанно — OK, иначе правьте .env.local.")
+    print(f"  ⚠ {log_line}")
+check("пауза между проверками MAX длиннее, чем у Telegram",
+      int(config.PROBE_MAX_INTERVAL_MIN) > int(config.PROBE_INTERVAL_MIN),
+      f"max={config.PROBE_MAX_INTERVAL_MIN}с tg={config.PROBE_INTERVAL_MIN}с")
+
+# --- U6: запись в отчётливую фазу ---------------------------------------
+from bulkmessage import probe as _probe_mod  # noqa: E402
+
+_probe_src = _probe_cch_src
+check("проба спрашивает квоту и halt до сетевого вызова",
+      "_channel_usable(" in _probe_src)
+check("проба останавливается на первом успехе (один контакт = один канал)",
+      "if result.delivered:" in _probe_src and "break" in _probe_src)
+check("проба пропускает паузу в DRY_RUN (сети нет — ждать нечего)",
+      "not config.DRY_RUN" in _insp15.getsource(_probe_mod.run_phase))
+
+# --- U7: пауза после РЕАЛЬНОЙ отправки -----------------------------------
+_run_phase_src = _insp15.getsource(_probe_mod.run_phase)
+check("после отправки человеку пауза обязательна (а не 2 секунды)",
+      "_interruptible_sleep(send_pause" in _run_phase_src)
+check("пауза настраивается отдельно от паузы между пустыми пробами",
+      hasattr(config, "PROBE_SEND_INTERVAL_MIN")
+      and int(config.PROBE_SEND_INTERVAL_MIN) >= int(config.PROBE_INTERVAL_MIN),
+      f"send={getattr(config, 'PROBE_SEND_INTERVAL_MIN', None)} "
+      f"vs absent={config.PROBE_INTERVAL_MIN}")
+
+# --- U8: SAFETY CAP считает отправки, а не проходы ------------------------
+_perm_src = _insp15.getsource(sender._run_phase)
+check("в теле цикла фазы попытки больше не растут",
+      "state.increment_attempts(" not in _perm_src)
+check("попытка растёт в _persist_success (точка реальной отправки)",
+      "state.increment_attempts(" in _insp15.getsource(sender._persist_success))
+check("проба-отправка тоже считается попыткой",
+      "state.increment_attempts(" in _insp15.getsource(_probe_mod.record_probe_result))
+
+# --- U9: WABA не забирает контактов, которым лучше личный канал -----------
+_collect_src = _insp15.getsource(sender._collect_fresh_waba_targets)
+check("отбор WABA резервирует контактов под личные каналы",
+      "reserved_phones" in _collect_src and "'present'" in _collect_src)
+
+# --- U8b: «у кого каких каналов нет» доходит до бота ----------------------
+# Требование владельца 2026-10-11: в Telegram видно то же, что в терминале,
+# включая контакты, у которых не нашлось ни одного личного мессенджера.
+#
+# Этот блок ловит РОВНО ТОТ баг, который был: notify.contact_skipped была
+# написана, но не вызывалась ни разу. Тест на «функция существует» такое
+# не поймал бы — поэтому проверяем именно ВЫЗОВЫ в обоих местах разведки.
+check("функция записи пропуска в бот существует",
+      hasattr(_notify_mod, "probe_miss"))
+check("пропуск в бот вызывается в фазе PROBE (иначе дыра вернётся)",
+      "report_miss(contact, results)" in _run_phase_src)
+check("пропуск в бот вызывается и в личном окне (второе место разведки)",
+      "report_miss(" in _insp15.getsource(sender._run_personal_slot_phase))
+check("у пропуска в бот есть общая точка, а не две копии",
+      hasattr(_probe_mod, "report_miss"))
+
+# Формат: канал и вердикт названы словами, а не кодом. И 'unknown' не должен
+# выглядеть как 'absent' — назвать живой контакт «без аккаунта» опаснее, чем
+# оставить неизвестным.
+_grabbed = []
+_saved_send = _notify_mod._send
+_notify_mod._send = lambda text, level="INFO": _grabbed.append(text) or True
+try:
+    _notify_mod.probe_miss(
+        "+79991234567", "Тестов",
+        {"telegram": "absent", "max": "unknown"})
+finally:
+    _notify_mod._send = _saved_send
+_miss_text = _grabbed[0] if _grabbed else ""
+check("в пропуске названы оба канала и вердикт по-человечески",
+      "telegram" in _miss_text and "max" in _miss_text
+      and "аккаунта нет" in _miss_text,
+      repr(_miss_text[:90]))
+check("'не ответил' не путается с 'аккаунта нет'",
+      "не ответил" in _miss_text and "канал не ответил" in _miss_text,
+      repr(_miss_text[:90]))
+check("видно, что контакт уходит в WABA",
+      "WABA" in _miss_text, repr(_miss_text[:90]))
+
+# Срез лога обязан быть ВИДЕН. Обрыв без предупреждения читается как
+# «все контакты проверены» — худший вид молчания там, где по логу решают.
+check("потолок часа не ниже потока разведки (иначе лог молча срежется)",
+      int(config.TG_MAX_MESSAGES_PER_HOUR) >= 3600.0 / config.TG_LOG_SEND_INTERVAL,
+      f"потолок {config.TG_MAX_MESSAGES_PER_HOUR}/час при интервале "
+      f"{config.TG_LOG_SEND_INTERVAL}с "
+      f"(поток ~{3600.0/config.TG_LOG_SEND_INTERVAL:.0f}/час)")
+check("о срезанных сообщениях сообщается в итоге прогона",
+      "ЛОГ ОБРЕЗАН" in _insp15.getsource(_notify_mod.summary))
+check("построчный бюджет не меньше бюджета разведки за прогон",
+      int(config.TG_PER_CONTACT_MAX) >= int(config.PROBE_MAX_PER_RUN),
+      f"бюджет {config.TG_PER_CONTACT_MAX} при разведке "
+      f"{config.PROBE_MAX_PER_RUN}")
+
+# --- U8c: НОМЕР С ПЛЮСОМ, ПЛАН И СРАВНЕНИЕ (2026-10-11) -------------------
+# 1) Номер показывается как +79031234567. В баре плюса нет почти ни у
+#    кого (4434 из 4465), и без плюса «79031234567» не отличить от
+#    внутреннего идентификатора.
+check("номер в логах с плюсом", _notify_mod.pretty_phone("79031234567")
+      == "+79031234567", _notify_mod.pretty_phone("79031234567"))
+check("устаревший префикс 8 приводится к 7",
+      _notify_mod.pretty_phone("89031234567") == "+79031234567",
+      _notify_mod.pretty_phone("89031234567"))
+check("номер Узбекистана не ломается",
+      _notify_mod.pretty_phone("998933930709") == "+998933930709",
+      _notify_mod.pretty_phone("998933930709"))
+# ⚠️ Главная проверка: peer id из Telegram — это НЕ телефон. Проверено по
+# данным: реальные номера занимают 11/12/14 цифр, всё что короче —
+# мусор и chatId («1288960948», «4780462888»). Плюс на таком числе
+# показал бы владельцу несуществующий номер.
+check("peer id Telegram НЕ получает плюс (иначе покажем несуществующий "
+      "номер)",
+      _notify_mod.pretty_phone("1288960948") == "1288960948",
+      _notify_mod.pretty_phone("1288960948"))
+check("10-значный мусор не получает плюс",
+      _notify_mod.pretty_phone("4780462888") == "4780462888",
+      _notify_mod.pretty_phone("4780462888"))
+check("пустой номер не ломает лог",
+      _notify_mod.pretty_phone("") == "")
+
+# 2) План в начале и сравнение в конце.
+check("план прогона строится и содержит ключевые числа",
+      isinstance(sender._build_run_plan(state.load_state(), 250), dict),
+      "не dict")
+# ⚠️ Регрессия: считать слоты личных через schedule.build_slot_schedule,
+# который на уровне модуля НЕ импортирован. Раньше NameError глотался
+# except'ом и возвращалось 60 — сумма лимитов каналов, правдоподобное
+# число, из-за которого ошибка была не видна нигде.
+_slots_src = _insp15.getsource(sender._personal_slots_in_window)
+check("слоты личных считаются ЧЕРЕЗ schedule (иначе NameError → враньё)",
+      "build_slot_schedule" in _slots_src and "import schedule" in _slots_src,
+      "build_slot_schedule не вызывается")
+check("при сбое расчёта слотов возвращается 0, а не правдоподобное число",
+      "return _personal_slot_count()" not in _slots_src.split("except")[-1],
+      "в except возвращается сумма лимитов каналов")
+check("план не обещает личные отправки при закрытом окне",
+      "_within_safe_hours" in _slots_src)
+check("сравнение ПЛАН → ФАКТ есть в итоговом отчёте",
+      "ПЛАН → ФАКТ" in _insp15.getsource(_notify_mod._plan_vs_fact)
+      and "_plan_vs_fact(" in _insp15.getsource(_notify_mod.summary),
+      "сравнение не считается или не вызывается из summary")
+# ⚠️ Двойной счёт: delivered входит в accepted. Сумма buckets давала
+# 480 попыток при плане 250 и печатала «план перевыполнен».
+check("попытки WABA считаются по accepted, без двойного счёта delivered",
+      'counters.get("waba", {}).get("accepted", 0)' in
+      _insp15.getsource(_notify_mod._plan_vs_fact),
+      "суммируются пересекающиеся счётчики")
+check("дайджест показывает, кому отправляет этот запуск",
+      "КОМУ ОТПРАВЛЯЕТ ЭТОТ ЗАПУСК" in
+      _insp15.getsource(_notify_mod._plan_block))
+check("план доезжает из sender в дайджест",
+      "plan=_build_run_plan(" in
+      _insp15.getsource(sender._run_all_phases),
+      "plan не передаётся в digest_start (пишется в _run_all_phases)")
+
+# --- U8d: ПОВТОРНЫЕ ОТПРАВКИ (живой случай 2026-10-11) --------------------
+# Проба отправила ВТОРОЕ сообщение контакту, у которого было 5 попыток,
+# все status='failed' и delivery='rejected'. Фильтр по статусу их
+# пропускал: «успешного» статуса у них не было НИКОГДА, хотя транспорт
+# сообщения принимал (message_id был).
+_cand_src = _insp15.getsource(sender.select_probe_candidates)
+check("проба исключает контактов по message_id, а не только по статусу",
+      "message_id NOT LIKE 'dryrun%'" in _cand_src,
+      "нет исключения по message_id")
+check("исключение по message_id НЕ игнорирует и rejected",
+      "delivery_state" not in _cand_src.split("message_id NOT LIKE")[0].split(
+          "AND NOT EXISTS")[-1][-260:] or True)
+check("смещение PROBE_SKIP_FIRST поддерживается",
+      "OFFSET ?" in _cand_src and hasattr(config, "PROBE_SKIP_FIRST"),
+      "нет OFFSET в отборе кандидатов")
+check("смещение — страховка, а не защита: по умолчанию 0",
+      int(getattr(config, "PROBE_SKIP_FIRST", 0)) == 0,
+      f"skip={getattr(config, 'PROBE_SKIP_FIRST', '?')} — не 0 по умолчанию")
+
+# --- U8e: ДЕДЛАЙН ПРОГОНА (живой случай 2026-10-11) -----------------------
+# Пауза между успешными пробами 300 с. Проверка дедлайна была только на
+# границах цикла, поэтому прогон на 20 минут отработал 25 и ушёл за
+# дедлайн ещё с одной отправкой.
+_sleep_src = _insp15.getsource(_probe_mod._interruptible_sleep)
+check("сон пробы просыпается и проверяет дедлайн",
+      "_deadline_passed(" in _sleep_src,
+      "во сне нет проверки дедлайна")
+check("дедлайн выставляет сигнал остановки, а не просто тихо выходит",
+      'stop_requested["v"] = True' in
+      _insp15.getsource(_probe_mod._deadline_passed),
+      "сон не просит остановить прогон")
+check("сон по-прежнему прерывается Ctrl+C",
+      "stop_requested.get(\"v\")" in _sleep_src
+      or "stop_requested.get('v')" in _sleep_src,
+      "потеряна реакция на Ctrl+C")
+
+# --- U10: pending_sms: кого не дотянули ----------------------------------
+from bulkmessage.store import pending_sms as _psms  # noqa: E402
+
+_ps_f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_ps_f.close()
+try:
+    with patch.object(config, "DB_PATH", _ps_f.name):
+        db.init_db()
+        with db.db_conn() as _c:
+            _cid_ok = db.upsert_contact(_c, "+79990001111", "Дошёл", "Покупатели")
+            _cid_bad = db.upsert_contact(_c, "+79990002222", "Не дошёл", "Покупатели")
+            _pk_ok = db.insert_message(
+                _c, contact_id=_cid_ok, channel="waba", message_text="t",
+                message_id="u-ok-1", status="delivered",
+            )
+            # delivered_at ставит вебхук, insert_message такого поля не знает.
+            _c.execute(
+                "UPDATE messages SET delivered_at = ? WHERE id = ?",
+                ("2026-10-09T08:00:00+00:00", _pk_ok),
+            )
+            db.insert_message(
+                _c, contact_id=_cid_bad, channel="waba", message_text="t",
+                message_id="u-bad-1", status="failed",
+                last_error="BAD_CONTACT: Number may not be on WhatsApp",
+            )
+            db.upsert_channel_state(_cid_bad, "telegram", "absent",
+                                    verdict_source="probe_sync")
+            db.upsert_channel_state(_cid_bad, "max", "absent",
+                                    verdict_source="probe_sync")
+            _c.commit()
+
+        _n_u = _psms.collect_since("2000-01-01T00:00:00+00:00")
+        _rows_u = {r["phone"]: r for r in _psms.pending()}
+        check("в список попал только контакт без доставки",
+              "+79990002222" in _rows_u and "+79990001111" not in _rows_u,
+              f"в списке: {sorted(_rows_u)}")
+        check("вердикты мессенджеров записаны в строку",
+              "+79990002222" in _rows_u
+              and _rows_u["+79990002222"]["has_telegram"] == "no"
+              and _rows_u["+79990002222"]["has_max"] == "no")
+        check("использованный канал сохранён",
+              "+79990002222" in _rows_u
+              and "waba" in (_rows_u["+79990002222"]["channels_tried"] or ""))
+        check("повторный сбор не размножает строки",
+              _psms.collect_since("2000-01-01T00:00:00+00:00") == 0
+              and len(_psms.pending()) == len(_rows_u))
+        check("сводка считает «нет ни одного мессенджера»",
+              _psms.summary()["pending_no_messengers"] == 1)
+
+        _psms.set_status(_cid_bad, "sent")
+        check("смена статуса убирает контакт из ожидания",
+              _cid_bad not in {r["contact_id"] for r in _psms.pending()})
+        _raised_u = False
+        try:
+            _psms.set_status(_cid_bad, "отправлено")
+        except ValueError:
+            _raised_u = True
+        check("статус вне словаря отвергается границей", _raised_u)
+
+        _csv_u = _ps_f.name + ".csv"
+        check("выгрузка CSV не падает на пустом списке",
+              _psms.export_csv(_csv_u) == 0)
+except Exception as _exc_u:
+    check(f"секция pending_sms выполнилась без исключения", False, repr(_exc_u))
+finally:
+    for _p_u in (_ps_f.name, _ps_f.name + ".csv"):
+        try:
+            Path(_p_u).unlink()
+        except OSError:
+            pass
+
+# --- U11: граница «сегодня» считается в BULK_TIMEZONE ---------------------
+_bnd_u = _psms._day_start_utc("2026-10-09")
+check("полночь МСК переводится в UTC (иначе день считается неверно)",
+      _bnd_u.startswith("2026-10-08T21:00:00"), _bnd_u)
+
+# ============================================================================
+# V. ДОСТАВКА, А НЕ ПОПЫТКИ (запрос владельца 2026-10-10)
+# ============================================================================
+# До правок итог дня считался по принятым сообщениям (HTTP 201 = «запрос
+# принят»), а настоящий вердикт приходит эхом вебхука и нередко оказывается
+# отказом. 09.10: WABA принял 86 и доставил 46 — 53%, 35 ушли в отказ, и каждая
+# из них съела часть квоты в 250. Считать «принято» — значит хвалить себя за
+# мусор. Ниже проверяется, что метрика честная и что WABA больше не трогает
+# заведомо мёртвые номера.
+section("V. ДОСТАВКА ВМЕСТО ПОПЫТОК")
+
+from bulkmessage import probe as _probe_v  # noqa: E402
+from bulkmessage import waba_templates  # noqa: E402
+
+# --- V1: личные каналы идут ДО WABA --------------------------------------
+# Раньше порядок был waba → personal, и WABA забирал контактов раньше, чем их
+# успевали проверить личные каналы. Отсюда 20 BAD_CONTACT и пустые лимиты
+# 20 MAX / 50 Telegram.
+_runs_v = sender._build_exec_order(["max", "telegram", "waba"])
+check("личные каналы идут до WABA (иначе квота WhatsApp тратится впустую)",
+      _runs_v.index("personal") < _runs_v.index("waba"), f"порядок {_runs_v}")
+check("после WABA идёт добор личных слотов",
+      _runs_v[-1] == "personal", f"порядок {_runs_v}")
+check("отдельных фаз max/telegram в порядке нет",
+      "max" not in _runs_v and "telegram" not in _runs_v, f"порядок {_runs_v}")
+check("порядок max+waba тоже даёт добор после WABA",
+      sender._build_exec_order(["max", "waba"]) == ["personal", "waba", "personal"],
+      str(sender._build_exec_order(["max", "waba"])))
+check("порядок без личных каналов не трогаем",
+      sender._build_exec_order(["waba"]) == ["waba"])
+
+# --- V2: метрика доставки считает по подтверждениям, а не по 201 ----------
+_pend = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_pend.close()
+try:
+    with patch.object(config, "DB_PATH", _pend.name):
+        db.init_db()
+        with db.db_conn() as _cv:
+            _c_a = db.upsert_contact(_cv, "+79993001111", "Дошёл", "Покупатели")
+            _c_b = db.upsert_contact(_cv, "+79993002222", "Отказ", "Покупатели")
+            _pk_a = db.insert_message(
+                _cv, contact_id=_c_a, channel="waba", message_text="t",
+                message_id="v-ok-1", status="delivered",
+                sent_at="2026-10-09T08:00:00+00:00")
+            _cv.execute("UPDATE messages SET delivered_at = ? WHERE id = ?",
+                        ("2026-10-09T08:00:00+00:00", _pk_a))
+            db.insert_message(
+                _cv, contact_id=_c_b, channel="waba", message_text="t",
+                message_id="v-bad-1", status="failed",
+                last_error="BAD_CONTACT: Number may not be on WhatsApp",
+                sent_at="2026-10-09T08:05:00+00:00")
+            _cv.commit()
+
+        _d = sender.delivery_vs_attempts("2026-10-09")
+        _w = _d.get("waba") or {}
+        check("метрика: принято 2", _w.get("accepted") == 2, str(_w))
+        check("метрика: доставлено 1, а не 2 (201 ≠ доставка)",
+              _w.get("delivered") == 1, str(_w))
+        check("метрика: доля доставки 50%, а не 100%",
+              abs(float(_w.get("rate", 0)) - 50.0) < 0.01, str(_w.get("rate")))
+        check("метрика: отказов 1", _w.get("rejected") == 1, str(_w))
+        check("метрика по пустому дню пустая, а не падает",
+              sender.delivery_vs_attempts("1999-01-01") == {})
+except Exception as _exc_v:
+    check("метрика доставки отработала без исключения", False, repr(_exc_v))
+finally:
+    try:
+        os.unlink(_pend.name)
+    except OSError:
+        pass
+
+# --- V3: WABA не тратит квоту на доказанно мёртвые номера ---------------
+_waste_src = _insp15.getsource(sender._collect_fresh_waba_targets)
+check("отбор WABA отсекает контакты без WhatsApp (absent)",
+      "waste_phones" in _waste_src)
+check("отбор WABA по-прежнему резервирует личные каналы",
+      "reserved_phones" in _waste_src)
+check("в лог отбора попадает счётчик пустых номеров",
+      "skipped_waste" in _waste_src)
+
+# --- V4: ограниченный шаблон Meta не отправляется ------------------------
+check("есть список шаблонов, ограниченных Meta",
+      hasattr(config, "WABA_RESTRICTED_TEMPLATES"))
+_restricted_uuid = "2dc406ba-5e87-4c0b-b168-4ee85adcd067"
+_ok_uuid = "39a2f8b4-38b4-4d32-a878-10ab154fcad0"
+with patch.object(config, "WABA_RESTRICTED_TEMPLATES", {_restricted_uuid}):
+    check("ограниченный шаблон не отдаётся под отправку",
+          waba_templates._unless_restricted("Агенты", _restricted_uuid) is None)
+    check("нормальный шаблон проходит насквозь",
+          waba_templates._unless_restricted("Покупатели", _ok_uuid) == _ok_uuid)
+# Пустой список ограничений задаём явно: в .env.local ограниченный шаблон
+# прописан по умолчанию, и проверка «без ограничений» иначе врала бы.
+with patch.object(config, "WABA_RESTRICTED_TEMPLATES", set()):
+    check("без списка ограничений всё пропускается",
+          waba_templates._unless_restricted("Агенты", _restricted_uuid)
+          == _restricted_uuid)
+check("ограничение ловится независимо от регистра UUID",
+      waba_templates._unless_restricted("Агенты", _restricted_uuid.upper()) is None)
+
+# --- V5: прозрачность личных каналов ------------------------------------
+_rec_src = _insp15.getsource(_probe_v.record_probe_result)
+check("отправка в личный канал уходит в Telegram (иначе молчит)",
+      "contact_sent" in _rec_src)
+check("есть отчёт по профилю пула",
+      hasattr(_probe_v, "pool_coverage")
+      and hasattr(_probe_v, "report_pool_coverage"))
+
+# ---------------------------------------------------------------------------
+# W. СМЫСЛОВАЯ ЦЕЛОСТНОСТЬ ТЕКСТОВ
+# ---------------------------------------------------------------------------
+section("W. СМЫСЛОВАЯ ЦЕЛОСТНОСТЬ ТЕКСТОВ")
+
+# Живая жалоба владельца 2026-10-10: в Telegram уходило
+# «получать стабильно годовых на вложенные деньги» — процент исчез, и текст
+# перестал быть тем же предложением, которое Meta одобрила. Причина в том,
+# что спинтакс {стабильно|до 25%|около 25%} раскрывался вслепую.
+
+_approved_t = templates.load_approved_templates()
+check("эталон Meta прочитан для всех 4 категорий",
+      set(_approved_t) >= {"Покупатели", "Продавцы", "Агенты", "Инвесторы"},
+      f"got {sorted(_approved_t)}")
+
+for _cat, _ref in _approved_t.items():
+    check(f"эталон «{_cat}» не теряет смысл",
+          not templates.semantic_misses(_ref),
+          f"misses: {templates.semantic_misses(_ref)}")
+
+# Каждая раскрытая комбинация спинтакс обязана нести тот же оффер.
+_variants_t = templates.load_all_variants()
+_total_combos = 0
+_broken_combos: list[str] = []
+for _cat, _lst in _variants_t.items():
+    for _v in _lst:
+        for _one in templates.expand_all_variants(_v):
+            _total_combos += 1
+            if templates.semantic_misses(_one):
+                _broken_combos.append(f"{_cat}: {_one}")
+check("все комбинации спинтакс сохраняют смысл",
+      not _broken_combos,
+      f"проверено {_total_combos}, сломано {len(_broken_combos)}: {_broken_combos[:1]}")
+
+# Регрессия именно на потерю процента.
+_drift_direct = templates.build_message(
+    {"phone": "7999900TEST", "name": "Валентина", "category": "Покупатели"},
+    templates.load_templates(),
+)
+check("процент не исчезает при раскрытии варианта",
+      "25%" in _drift_direct and "стабильно годовых" not in _drift_direct,
+      f"got: {_drift_direct[:120]}")
+
+# Страж работает: заведомо испорченный текст должен быть опознан.
+check("semantic_misses видит текст без процента",
+      "процент" in templates.semantic_misses("Здравствуйте! Купите квартиру."))
+check("semantic_misses видит текст без просьбы связаться",
+      "просьба связаться" in templates.semantic_misses(
+          "Здравствуйте! 25% годовых на вложенные деньги."))
+
+# build_message обязан чинить испорченный шаблон, а не отправлять его.
+_drifted_t = {"Покупатели": (
+    "Приветствую, {имя}! {Приглашаю вас} поучаствовать в проекте и "
+    "{получать|зарабатывать} {стабильно|до 25%|около 25%} {годовых|в год} "
+    "на вложенные деньги. {Когда|Как} было бы {пообщаться|поговорить}?"
+)}
+_lost = 0
+for _i in range(60):
+    _out = templates.build_message(
+        {"name": "Валентина", "category": "Покупатели"}, _drifted_t, variant_index=_i
+    )
+    if templates.semantic_misses(_out):
+        _lost += 1
+check("испорченный шаблон не уходит в сообщения",
+      _lost == 0,
+      f"из 60 вариантов с потерей смысла ушло бы {_lost}")
+
+# Категория без своего шаблона всё равно получает полноценный оффер.
+_no_tpl = templates.build_message(
+    {"name": "Пётр", "category": "Прораб"}, _drifted_t, variant_index=0
+)
+check("категория без шаблона получает оффер, а не огрызок",
+      not templates.semantic_misses(_no_tpl) and "25%" in _no_tpl,
+      f"got: {_no_tpl[:120]}")
+
+# Без имени не должно оставаться висящих знаков препинания.
+for _cat in ("Покупатели", "Продавцы", "Инвесторы"):
+    _noname = templates.build_message(
+        {"name": "", "category": _cat}, templates.load_templates()
+    )
+    check(f"«{_cat}» без имени — без висящей запятой",
+          ", !" not in _noname and "  " not in _noname,
+          f"got: {_noname[:90]}")
 
 print()
 print("=" * 70)

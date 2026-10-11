@@ -29,19 +29,46 @@ from .sheets import SHEETS
 # Что попадает в лист. Строки без message_id НЕ выгружаются: это попытки
 # без отправки (отказ каскада, синхронный 400, ошибка транспорта), и именно
 # они раньше раздували таблицу.
-_EXPORT_SQL = """
-SELECT m.contact_id, m.channel, m.delivery_state, m.status, m.sent_at,
-       m.delivered_at, m.read_at, m.answered_at, m.last_error, m.message_id,
-       m.message_text, m.updated_at, m.created_at,
-       c.phone, c.name, c.category,
-       (SELECT r.message FROM replies r
-         WHERE r.contact_id = m.contact_id
-         ORDER BY r.created_at DESC LIMIT 1) AS reply
+_SELECT_COLUMNS = """
+    m.contact_id, m.channel, m.delivery_state, m.status, m.sent_at,
+    m.delivered_at, m.read_at, m.answered_at, m.last_error, m.message_id,
+    m.message_text, m.updated_at, m.created_at,
+    c.phone, c.name, c.category,
+    (SELECT r.message FROM replies r
+      WHERE r.contact_id = m.contact_id
+      ORDER BY r.created_at DESC LIMIT 1) AS reply
+"""
+
+_FROM_JOIN = """
 FROM messages m
 JOIN contacts c ON c.id = m.contact_id
+"""
+
+_EXPORT_SQL = f"""
+SELECT {_SELECT_COLUMNS}
+{_FROM_JOIN}
 WHERE m.message_id IS NOT NULL
   AND m.message_id NOT LIKE 'dryrun_%'
 ORDER BY m.contact_id, m.sent_at, m.id
+"""
+
+# Живое обновление листа берёт ОДНОГО человека. Раньше оно склеивало фильтр
+# строкой к _EXPORT_SQL — и получалось
+#   ... ORDER BY m.contact_id, m.sent_at, m.id AND m.contact_id = ?
+# SQLite читает `m.id AND m.contact_id = ?` как ещё один ключ ORDER BY
+# (m.id ненулевой → истина), а не как условие WHERE. Запрос возвращал ВСЕХ
+# людей, aggregate_people сортировал их по телефону и отдавал [0] —
+# то есть лексикографически первый телефон. Живой случай 2026-10-09: 86
+# записей подряд легли в строку 374 контакта 74956503208, потому что
+# «749…» сортируется раньше «790…».
+# У запроса ниже собственная форма: склеивать в него строку нельзя.
+_CONTACT_SQL = f"""
+SELECT {_SELECT_COLUMNS}
+{_FROM_JOIN}
+WHERE m.contact_id = ?
+  AND m.message_id IS NOT NULL
+  AND m.message_id NOT LIKE 'dryrun_%'
+ORDER BY m.sent_at, m.id
 """
 
 # Вердикты «есть ли у человека аккаунт» — из contact_channel_state. Именно они
@@ -189,7 +216,7 @@ def aggregate_contact(contact_id: int) -> Optional[dict]:
     with db_conn() as conn:
         conn.row_factory = sqlite3.Row
         attempts = [dict(r) for r in conn.execute(
-            _EXPORT_SQL + " AND m.contact_id = ?", (contact_id,)).fetchall()]
+            _CONTACT_SQL, (contact_id,)).fetchall()]
         verdict_row = conn.execute(
             "SELECT MAX(CASE WHEN channel IN ('waba','whatsapp') THEN verdict END) AS wa,"
             "       MAX(CASE WHEN channel='telegram' THEN verdict END) AS tg,"
@@ -241,17 +268,41 @@ def _write_bulk(ws, header: list[str], rows: list[list[str]]) -> int:
     26 имён, хотя код знал только про 18. Поиск строки по заголовку после
     этого давал бы индексы не туда. Перезапись без resize оставляет хвост
     и лишние строки — их и убирает resize.
+
+    Две ошибки, обе наблюдались живьём 2026-10-09 и обе молчали:
+
+    1. Каждая пачка адресовалась как ``A2:<end>`` — то есть ЛЮБАЯ пачка
+       начиналась со строки 2 и затирала первую. Номер своей строки пачка
+       не знала.
+    2. Аргументы зовутся по старому порядку gspread (``range_name`` первым).
+       В gspread 6 подпись стала ``update(values, range_name)``, и работает
+       только совместительная перестановка с предупреждением. На 7 такой вызов
+       упадёт целиком. Аргументы именованные, чтобы порядок не значил ничего.
     """
     ws.resize(max(len(rows) + 1, 2), len(header))
-    ws.update("A1", [header])
+    ws.update(values=[header], range_name="A1")
     if not rows:
         return 0
     batch = 500
+    last_col = chr(ord("A") + len(header) - 1)
     for start in range(0, len(rows), batch):
         chunk = rows[start:start + batch]
-        end_row = 2 + start + len(chunk) - 1
-        last_col = chr(ord("A") + len(header) - 1)
-        ws.update(f"A2:{last_col}{end_row}", chunk, value_input_option="USER_ENTERED")
+        first_row = 2 + start
+        last_row = first_row + len(chunk) - 1
+        ws.update(
+            values=chunk,
+            range_name=f"A{first_row}:{last_col}{last_row}",
+            value_input_option="USER_ENTERED",
+        )
+    # Отчёт «записано N строк» ничего не значит, если N не доехало. Живой
+    # случай: 649 строк рапортовались записанными, а в таблице стояло 500 —
+    # вторая пачка не применилась, и никто об этом не узнал.
+    written = len(ws.get_all_values()) - 1
+    if written != len(rows):
+        raise RuntimeError(
+            f"Google Sheets принял {len(rows)} строк, а в таблице их {written}. "
+            f"Проверь доступ и квоту API; лист сейчас неполный."
+        )
     return len(rows)
 
 
