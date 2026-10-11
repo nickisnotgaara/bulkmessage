@@ -242,10 +242,16 @@ if __name__ == "__main__":
     elif mode == "reset-state":
         from bulkmessage.preflight import reset_state
         sys.exit(reset_state())
+    elif mode == "pending-sms":
+        # Список тех, до кого не дотянулись. Только чтение и выгрузка —
+        # отправка SMS платная и запускается отдельно, вручную.
+        from bulkmessage.pending_sms_cli import main as run_pending_sms
+        sys.exit(run_pending_sms())
     else:
         print(
             f"Unknown mode: {mode}. Use 'sender'|'tracker'|'preflight'|'report'"
-            f"|'migrate'|'import-contacts'|'seed-channel-state'|'reset-state'.",
+            f"|'migrate'|'import-contacts'|'seed-channel-state'|'reset-state'"
+            f"|'pending-sms'.",
             file=sys.stderr,
         )
         sys.exit(1)

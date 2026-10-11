@@ -58,7 +58,7 @@ from .migrations import (
 
 # Репозитории импортируются последними: они зависят от connection/enums,
 # но не от самого пакета (иначе получился бы циклический импорт).
-from . import contacts, messages, channel_state, queue, quota  # noqa: E402
+from . import contacts, messages, channel_state, pending_sms, queue, quota  # noqa: E402
 
 __all__ = [
     # соединение
@@ -89,6 +89,7 @@ __all__ = [
     "contacts",
     "messages",
     "channel_state",
+    "pending_sms",
     "queue",
     "quota",
 ]

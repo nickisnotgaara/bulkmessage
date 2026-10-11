@@ -217,6 +217,40 @@ def get_sent_phones(conn: sqlite3.Connection | None = None) -> set[str]:
     return _messages.contacted_phones()
 
 
+def get_attempted_channels(conn: sqlite3.Connection | None = None) -> dict[str, set[str]]:
+    """Номер → каналы, в которые УЖЕ ПЫТАЛИСЬ отправить.
+
+    Правило «написали — навсегда» действует ПО КАНАЛУ (решение владельца
+    2026-10-12): попытка в Telegram не закрывает WhatsApp, потому что человек
+    может иметь только один мессенджер из трёх. Контакт вычеркивается, когда
+    закрыты все каналы — это уже считает пул (``store.contacts.sendable``).
+
+    Фасад над ``store.messages.attempted_channels_by_phone``: SQL живёт в
+    репозитории, здесь копии правила быть не должно.
+
+    Параметр ``conn`` — ради совместимости вызовов, не используется (см.
+    :func:`get_sent_phones`).
+    """
+    from .store import messages as _messages
+
+    return _messages.attempted_channels_by_phone()
+
+
+def count_pool_contacts(conn: sqlite3.Connection | None = None) -> int:
+    """Сколько контактов вообще доступно для рассылки.
+
+    Живёт здесь, а не в вызывающем коде, потому что критерий «доступен»
+    (не тест, не невалид) обязан быть ОДНИМ во всех местах: иначе отчёт
+    «пуск 4465, в работе 250» начинает расходиться с «из чего выбирали».
+    """
+    from .store import contacts as _contacts
+
+    try:
+        return _contacts.pool_size()
+    except Exception:  # noqa: BLE001 — план не должен ронять старт прогона
+        return 0
+
+
 def get_sent_phone_channels(conn: sqlite3.Connection) -> set[tuple[str, str]]:
     """Пары (phone, channel), по которым сообщение реально ушло через Wazzup24
     (status sent/delivered/read/answered). Используется для per-channel скипа:

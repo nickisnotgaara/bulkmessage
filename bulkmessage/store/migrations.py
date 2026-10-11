@@ -688,6 +688,46 @@ def _m0009_consent_constraint(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m0010_pending_sms(conn: sqlite3.Connection) -> None:
+    """Кому не дотянулись — список для будущей отправки через SMS.
+
+    Решение владельца 2026-10-09. Мессенджеры исчерпали себя у части контактов:
+    WABA отказал, Telegram и MAX аккаунта не имеют. Таких людей нельзя
+    отслеживать по ``rescue_queue`` — та очередь живёт своей логикой попыток и
+    TTL, а SMS это не откат, а отдельная платная отправка.
+
+    Строка = человек (не попытка): индекс по contact_id уникальный, повторный
+    прогон ничего не размножает.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_sms (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_id     INTEGER NOT NULL,
+            phone          TEXT NOT NULL,
+            reason         TEXT,
+            channels_tried TEXT,
+            has_whatsapp   TEXT,
+            has_telegram   TEXT,
+            has_max        TEXT,
+            last_attempt_at TEXT,
+            status         TEXT NOT NULL DEFAULT 'pending'
+                           CHECK (status IN ('pending','sent','skipped')),
+            created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at     TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_sms_contact "
+        "ON pending_sms(contact_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_sms_status "
+        "ON pending_sms(status)"
+    )
+
+
 MIGRATIONS: list[tuple[int, str, Migration]] = [
     (1, "baseline", _m0001_baseline),
     (2, "clean_delivery_state", _m0002_clean_delivery_state),
@@ -698,6 +738,7 @@ MIGRATIONS: list[tuple[int, str, Migration]] = [
     (7, "index_parity", _m0007_index_parity),
     (8, "replies_foreign_key", _m0008_replies_foreign_key),
     (9, "consent_constraint", _m0009_consent_constraint),
+    (10, "pending_sms", _m0010_pending_sms),
 ]
 
 

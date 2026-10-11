@@ -9,6 +9,7 @@ Phase 3.1: поддержка spin-tax (variant_index) для избежания
 
 from __future__ import annotations
 
+import itertools
 import random
 import re
 from pathlib import Path
@@ -133,6 +134,116 @@ def normalize_category(raw) -> str:
     return s
 
 
+_APPROVED_CACHE: Optional[dict[str, str]] = None
+
+
+def load_approved_templates(path: Optional[str] = None) -> dict[str, str]:
+    """Дословные тексты, одобренные в Meta: {категория: текст}.
+
+    Это эталон СМЫСЛА, а не источник текста для отправки. Spin-tax живёт в
+    Message_script.md, но всё, что он раскрывает, обязано оставаться
+    эквивалентом тексту отсюда — иначе человек получает другое предложение,
+    чем то, за которое Meta одобрила шаблон (живая жалоба владельца 2026-10-10:
+    «получать стабильно годовых на вложенные деньги» — процент просто исчез).
+
+    Кэш: файл читается на каждый контакт, а меняется только вручную.
+    """
+    global _APPROVED_CACHE
+    if path is None and _APPROVED_CACHE is not None:
+        return _APPROVED_CACHE
+
+    p = Path(path or config.APPROVED_TEMPLATES_PATH)
+    approved: dict[str, str] = {}
+    if p.exists():
+        text = p.read_text(encoding="utf-8")
+        current_category: Optional[str] = None
+        current_lines: list[str] = []
+        for raw_line in text.split("\n"):
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                cat_name = stripped.lstrip("#").strip()
+                if cat_name in config.TEMPLATE_MAP:
+                    if current_category and current_lines:
+                        approved[current_category] = " ".join(current_lines)
+                    current_category = cat_name
+                    current_lines = []
+                # остальные «#» — комментарии, текстом не считаются
+                continue
+            if current_category and stripped.startswith("1)"):
+                current_lines.append(re.sub(r"^1\)\s*", "", stripped))
+        if current_category and current_lines:
+            approved[current_category] = " ".join(current_lines)
+
+    if path is None:
+        _APPROVED_CACHE = approved
+    return approved
+
+
+# Что обязано дожить до человека в ЛЮБОМ варианте текста. Каждый пункт —
+# часть предложения, потеря которой делает сообщение бессмысленным.
+_SEMANTIC_RULES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("процент", re.compile(r"\d+\s*%")),
+    ("вложение", re.compile(r"вложенн|вложенные деньги|вложенных деньг", re.IGNORECASE)),
+    ("просьба связаться", re.compile(r"связаться|поговорить|созвониться", re.IGNORECASE)),
+    ("предмет разговора", re.compile(r"детали|подробност|сотрудничеств", re.IGNORECASE)),
+)
+
+
+# Оффер для категорий без своего шаблона (308 контактов «Знакомый/Услуги/
+# Прораб»). Не выдумывает фактов о сделке — обещает только то, что общее
+# для всех категорий. Раньше здесь был огрызок без запроса на связь.
+_GENERIC_OFFER = (
+    "Здравствуйте, {имя}! Мы с вами общались, я по-прежнему занимаюсь "
+    "перепродажами и инвестициями в недвижимость. Приглашаю вас поучаствовать "
+    "в проекте и зарабатывать 25% годовых на вложенные деньги. Когда было бы "
+    "удобно связаться и рассказать детали?"
+)
+
+
+def expand_all_variants(text: str, limit: int = 500) -> list[str]:
+    """Все комбинации spin-tax в тексте.
+
+    Нужна для проверки ДО прогона: дрейф живёт не в исходной строке, а в
+    конкретной раскрытой комбинации, поэтому перебирать их нужно все.
+    Пустой список — комбинаций больше limit, декартово произведение
+    бессмысленно (значит в шаблоне слишком много независимых слотов).
+    """
+    groups = _SPINTAX_PATTERN.findall(text)
+    if not groups:
+        return [text]
+    options = [[o.strip() for o in g.split("|") if o.strip()] for g in groups]
+    total = 1
+    for opts in options:
+        total *= len(opts)
+    if total > limit or any(not opts for opts in options):
+        return []
+
+    out: list[str] = []
+    for combo in itertools.product(*options):
+        chosen = iter(combo)
+
+        def _sub(match: "re.Match[str]", _it=chosen) -> str:
+            try:
+                return next(_it)
+            except StopIteration:
+                return match.group(0)
+
+        out.append(_SPINTAX_PATTERN.sub(_sub, text))
+    return out
+
+
+def semantic_misses(text: str) -> list[str]:
+    """Какие обязательные смысловые куски отсутствуют в тексте.
+
+    Пустой список — текст несёт то же предложение, что и одобренный шаблон.
+    """
+    if not text:
+        return [label for label, _ in _SEMANTIC_RULES]
+    return [label for label, pattern in _SEMANTIC_RULES if not pattern.search(text)]
+
+
 def _safe_name(raw) -> str:
     """Извлекает безопасное имя из контакта.
 
@@ -191,7 +302,9 @@ def build_message(
     def _clean_greeting(t: str) -> str:
         t = t.replace("Здравствуй , ", "Здравствуйте, ")
         t = t.replace("Здравствуй, ", "Здравствуйте, ")
-        return t.strip()
+        # Без имени остаётся висящее ", !" — читается как поломка текста.
+        t = re.sub(r"^([^,!]{1,30}), !", r"\1! ", t)
+        return re.sub(r"\s{2,}", " ", t).strip()
 
     raw: Optional[str] = None
     if normalized in templates:
@@ -202,15 +315,32 @@ def build_message(
                 raw = templates[tpl_key]
                 break
 
+    approved = load_approved_templates()
+    canonical = approved.get(normalized)
+
     if raw is None:
-        raw = (
-            f"Здравствуйте, {{имя}}. Приглашаю поучаствовать в проекте под 25% годовых."
-        )
+        raw = canonical or _GENERIC_OFFER
 
     # Phase 3.1: если есть inline spin-tax {opt1|opt2|opt3} — раскрываем.
-    raw = _expand_spintax(raw, variant_index=variant_index)
+    text = _clean_greeting(
+        _format_template(_expand_spintax(raw, variant_index=variant_index), name)
+    )
 
-    return _clean_greeting(_format_template(raw, name))
+    # Страж смысла. Spin-tax раскрывается вслепую, и вариант легко теряет
+    # половину предложения («получать стабильно годовых» — процент исчез).
+    # Тогда берём одобренный текст целиком: лучше один и тот же текст,
+    # чем разные обещания под одним и тем же одобрением Meta.
+    misses = semantic_misses(text)
+    if misses:
+        for source in (canonical, _GENERIC_OFFER):
+            if not source:
+                continue
+            fallback = _clean_greeting(_format_template(source, name))
+            if not semantic_misses(fallback):
+                text = fallback
+                break
+
+    return text
 
 
 # ---------------------------------------------------------------------------

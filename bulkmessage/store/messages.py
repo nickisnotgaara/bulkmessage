@@ -40,7 +40,7 @@ Sheets считало попытки и симуляции, а писали 362 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence
 
 from .connection import count, read_only, scalar, transaction
 from .enums import Channel, DeliveryState, MessageStatus
@@ -103,6 +103,84 @@ def contacted_phones() -> set[str]:
                 SENT_STATUSES,
             ).fetchall()
         }
+
+
+# ───────────────────── правило «в этот канал уже пытались» (per-channel) ───────
+#
+# Решение владельца 2026-10-12: запрет повтора действует ПО КАНАЛУ, а не на
+# контакт целиком. «Попытались доставить в трёх каналах — скипаем» означает:
+# контакт вычеркнут, когда закрыты ВСЕ каналы, а не когда закрыт любой один.
+#
+# Почему это важно и почему раньше теряли людей: у человека может быть только
+# один мессенджер из трёх. Попытка в Telegram ничего не говорит о WhatsApp.
+# Старое правило вычёркивало его целиком после первой попытки — и 689 человек
+# выпадали из пула, ни разу не получив сообщение ни в каком канале.
+#
+# Критерий «пытались» — ОБЪЕДИНЕНИЕ двух правил, осторожность сохранена:
+#   * ``message_id IS NOT NULL`` — транспорт принял запрос (попытка была);
+#   * ``status IN SENT_STATUSES`` — запас из 98 контактов, потерявших
+#     идентификатор (см. докстринг модуля). Для повторной отправки в тот же
+#     канал они считаются закрытыми: человек мог получить сообщение, а второе
+#     станет жалобой, а жалоба в личном канале = перманентный бан номера.
+
+#: Каналы, отправка в которые идёт через Wazzup.
+WAZZUP_SEND_CHANNELS: tuple[str, ...] = (
+    "waba", "whatsapp", "telegram", "max",
+)
+
+#: «В этот канал уже пытались». Псевдоним колонки контакта — ``c``.
+ATTEMPTED_PREDICATE = (
+    "((m.message_id IS NOT NULL AND m.message_id NOT LIKE 'dryrun%') "
+    "OR m.status IN (?, ?, ?, ?))"
+)
+
+
+def exhausted_channels_predicate(
+    channels: Sequence[str], contact_col: str = "c.id"
+) -> tuple[str, tuple]:
+    """SQL-предикат «контакт исчерпан» для правила по каналам.
+
+    Возвращает ``(sql, params)``. Контакт исчерпан, когда число РАЗНЫХ каналов,
+    в которые уже была попытка, покрывает весь список ``channels``.
+
+    Пустой список каналов означает «истощать не по чему» — тогда контакт
+    никогда не считается исчерпанным, и это правильно: нечего закрывать, значит
+    нечего и исчерпать.
+    """
+    chans = tuple(channels)
+    if not chans:
+        return "0", ()
+    placeholders = ", ".join("?" * len(chans))
+    sql = (
+        "(SELECT COUNT(DISTINCT m.channel) FROM messages m "
+        "WHERE m.contact_id = " + contact_col + " "
+        "AND m.channel IN (" + placeholders + ") "
+        "AND " + ATTEMPTED_PREDICATE + ") >= ?"
+    )
+    params: tuple = tuple(chans) + tuple(SENT_STATUSES) + (len(chans),)
+    return sql, params
+
+
+def attempted_channels_by_phone() -> dict[str, set[str]]:
+    """Номер → каналы, в которые УЖЕ ПЫТАЛИСЬ отправить.
+
+    Основа для точечного отсева в каскаде: канал из этого множества
+    выбрасывается для конкретного контакта, остальные остаются доступными.
+    """
+    with read_only() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT ct.phone AS phone, m.channel AS channel "
+            "FROM messages m JOIN contacts ct ON ct.id = m.contact_id "
+            "WHERE " + ATTEMPTED_PREDICATE,
+            tuple(SENT_STATUSES),
+        ).fetchall()
+    out: dict[str, set[str]] = {}
+    for r in rows:
+        phone = r["phone"]
+        channel = r["channel"]
+        if phone and channel:
+            out.setdefault(phone, set()).add(channel)
+    return out
 
 
 def record_attempt(
@@ -391,6 +469,10 @@ def last_contacted_at() -> Optional[str]:
 __all__ = [
     "SENT_STATUSES",
     "CONTACTED_PREDICATE",
+    "WAZZUP_SEND_CHANNELS",
+    "ATTEMPTED_PREDICATE",
+    "exhausted_channels_predicate",
+    "attempted_channels_by_phone",
     "record_attempt",
     "record_send",
     "set_delivery_state",

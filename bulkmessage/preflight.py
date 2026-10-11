@@ -335,13 +335,37 @@ def run_preflight() -> int:
     # 5. WABA templates (UUID format required!)
     print("\n── 5. WABA TEMPLATES (4 categories, UUID format) ──")
     templates_by_cat = waba_templates.list_known_templates()
+    ready_cats = []
+    bad_cats = []
     for cat, tid in templates_by_cat.items():
         is_uuid = waba_templates.is_valid_template_id(tid)
-        all_ok &= _check(
-            f"  {cat}",
-            bool(tid) and is_uuid,
+        if tid and is_uuid:
+            ready_cats.append(cat)
+        else:
+            bad_cats.append(cat)
+        print(
+            f"  {'✅' if (tid and is_uuid) else '⚠️ '} {cat}: "
             f"template_id={tid or 'NOT CONFIGURED!'}"
-            + ("" if is_uuid else " ❌ NOT UUID!"),
+            + ("" if is_uuid else " — нет рабочего шаблона Meta")
+        )
+    # Отдельный случай — блокирующий. Часть категорий без шаблона НЕ мешает:
+    # WABA работает по остальным, а контакты этих категорий отсекаются
+    # на этапе отбора (без шаблона отправка заведомо не пройдёт).
+    if ready_cats and bad_cats:
+        print(
+            f"  ℹ️  WABA работает по {len(ready_cats)} из "
+            f"{len(templates_by_cat)} категорий. Без шаблона: {bad_cats} — "
+            f"эти контакты уйдут в pending_sms. Заменить шаблон: Meta "
+            f"Business Manager → WhatsApp → Message Templates → 'API ID'."
+        )
+        all_ok &= _check(
+            "WABA templates (хотя бы один рабочий)", True,
+            f"{len(ready_cats)}/{len(templates_by_cat)} категорий",
+        )
+    else:
+        all_ok &= _check(
+            "WABA templates", bool(ready_cats),
+            f"{len(ready_cats)}/{len(templates_by_cat)} категорий с UUID",
         )
 
     # 6. Database
@@ -371,8 +395,14 @@ def run_preflight() -> int:
     # 8. Spintax templates
     print("\n── 8. SPINTAX TEMPLATES ──")
     try:
-        from .templates import load_all_variants
+        from .templates import (
+            expand_all_variants,
+            load_all_variants,
+            load_approved_templates,
+            semantic_misses,
+        )
         variants = load_all_variants()
+        approved = load_approved_templates()
         for cat, lst in variants.items():
             inline_count = sum(
                 1
@@ -384,6 +414,33 @@ def run_preflight() -> int:
                 len(lst) >= 1,
                 f"{len(lst)} variants, {inline_count} contain inline spin-tax",
             )
+
+            # Смысловая целостность каждой раскрытой комбинации. Без этой
+            # проверки дрейф попадал в живые сообщения: спинтакс раскрывался
+            # вслепую и мог убрать процент или подменить просьбу связаться
+            # (жалоба владельца 2026-10-10).
+            broken: list[str] = []
+            total_combos = 0
+            for v in lst:
+                expanded = expand_all_variants(v)
+                total_combos += len(expanded)
+                for one in expanded:
+                    if semantic_misses(one):
+                        broken.append(one)
+            detail = f"{total_combos} combinations checked"
+            if broken:
+                detail += f" | BROKEN: {len(broken)} lose meaning, e.g. {broken[0][:110]}"
+            all_ok &= _check(f"  {cat}: смысл не теряется", not broken, detail)
+
+            reference = approved.get(cat)
+            ref_detail = "эталон есть"
+            if reference is None:
+                ref_detail = "НЕТ одобренного эталона (Message_script_approved.md)"
+            else:
+                misses = semantic_misses(reference)
+                if misses:
+                    ref_detail = f"эталон теряет смысл: {misses}"
+            all_ok &= _check(f"  {cat}: эталон Meta", bool(reference) and not semantic_misses(reference or ""), ref_detail)
     except Exception as e:
         all_ok &= _check("spintax load", False, str(e)[:80])
 
