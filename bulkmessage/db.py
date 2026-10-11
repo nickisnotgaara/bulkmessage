@@ -217,6 +217,25 @@ def get_sent_phones(conn: sqlite3.Connection | None = None) -> set[str]:
     return _messages.contacted_phones()
 
 
+def get_attempted_channels(conn: sqlite3.Connection | None = None) -> dict[str, set[str]]:
+    """Номер → каналы, в которые УЖЕ ПЫТАЛИСЬ отправить.
+
+    Правило «написали — навсегда» действует ПО КАНАЛУ (решение владельца
+    2026-10-12): попытка в Telegram не закрывает WhatsApp, потому что человек
+    может иметь только один мессенджер из трёх. Контакт вычеркивается, когда
+    закрыты все каналы — это уже считает пул (``store.contacts.sendable``).
+
+    Фасад над ``store.messages.attempted_channels_by_phone``: SQL живёт в
+    репозитории, здесь копии правила быть не должно.
+
+    Параметр ``conn`` — ради совместимости вызовов, не используется (см.
+    :func:`get_sent_phones`).
+    """
+    from .store import messages as _messages
+
+    return _messages.attempted_channels_by_phone()
+
+
 def count_pool_contacts(conn: sqlite3.Connection | None = None) -> int:
     """Сколько контактов вообще доступно для рассылки.
 

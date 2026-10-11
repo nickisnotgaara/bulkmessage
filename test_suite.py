@@ -2540,6 +2540,59 @@ finally:
     except OSError:
         pass
 
+# --- R30b: ОДИН ограниченный шаблон Meta НЕ убивает категории с рабочим ---
+# Регрессия 2026-10-11: условие preflight было `valid_count < total_count`,
+# поэтому шаблон «Агенты», ограниченный Meta, выключал WABA ЦЕЛИКОМ.
+# Активными оставались только telegram/max — то есть канал, дающий ~100 из
+# ~130 доставленных в сутки, молча работал в ноль.
+#
+# Проверяем по СОДЕРЖИМОМУ отбора, а не по тексту условия: контакт рабочей
+# категории обязан выжить, контакт ограниченной — обязан выпасть.
+_r30b_state = state.load_state()
+_r30b_state = dict(_r30b_state)
+_r30b_state["last_waba_sent"] = {}
+_r30b_state.setdefault("halted_channels", {})
+
+_r30b_uuid_ok = "39a2f8b4-38b4-4d32-a878-10ab154fcad0"        # Покупатели
+_r30b_uuid_restricted = "2dc406ba-5e87-4c0b-b168-4ee85adcd067"  # Агенты
+_r30b_contacts = [
+    {"phone": "+79993330055", "name": "ok", "category": "Покупатели"},
+    {"phone": "+79993330056", "name": "blocked", "category": "Агенты"},
+]
+from bulkmessage import waba_templates as _r30b_wt  # noqa: E402
+
+
+def _r30b_pick(cat):
+    if cat == "Покупатели":
+        return _r30b_uuid_ok
+    if cat == "Агенты":
+        return _r30b_wt._unless_restricted(cat, _r30b_uuid_restricted)
+    return None
+
+
+with patch.object(_r30b_wt, "pick_waba_template", _r30b_pick), \
+     patch.object(config, "WABA_RESTRICTED_TEMPLATES",
+                  {_r30b_uuid_restricted}):
+    _r30b_fresh = sender._collect_fresh_waba_targets(
+        _r30b_contacts, _r30b_state)
+    _r30b_phones = [c["phone"] for c in _r30b_fresh]
+
+check("контакт рабочей категории НЕ теряется из-за чужого шаблона",
+      "+79993330055" in _r30b_phones, f"got {_r30b_phones}")
+check("контакт категории с ограниченным шаблоном отсечён",
+      "+79993330056" not in _r30b_phones, f"got {_r30b_phones}")
+check("отбор не схлопывается в ноль, пока есть хоть один рабочий шаблон",
+      len(_r30b_fresh) == 1, f"got {len(_r30b_fresh)}")
+
+# Preflight-гейт: выключать WABA можно только когда не работает НИ ОДИН
+# шаблон, и только при непустом списке категорий.
+_gate_src = inspect.getsource(sender.run)
+check("WABA гасится только при valid_count == 0",
+      "valid_count == 0" in _gate_src)
+check("пустой список категорий не считается «сломаны все шаблоны»",
+      "total_count and valid_count == 0" in _gate_src,
+      "иначе прогон с пустым templates_map погасит WABA ложно")
+
 # --- R31: фазы 2/3 тянут из rescue_queue FIFO и лимитированы ---
 # Проверка индекса идёт по СХЕМЕ, а не по исходнику функции: форма таблиц
 # теперь задаётся миграциями, и наличие индекса — факт базы, а не деталь
@@ -2919,7 +2972,7 @@ _repo_src = inspect.getsource(_rc.sendable)
 check("отбор контактов идёт через репозиторий базы, а не читает Excel",
       "repo_contacts.sendable" in _sel_src and "load_contacts" not in _sel_src)
 check("правило «писали» живёт в store/messages и применяется отбором",
-      "CONTACTED_PREDICATE" in _repo_src and
+      "exhausted_channels_predicate" in _repo_src and
       "contacted_phones" in inspect.getsource(_rm.contacted_phones))
 check("отбор контактов уважает cooldown",
       "is_phone_in_cooldown" in _sel_src)
@@ -5389,17 +5442,39 @@ check("критерий отбора шире отчётного (запас п�
       f"отбор={len(repo_messages.contacted_phones())}, "
       f"отчёт={len(repo_messages.sent_phones())}")
 
-# Контакт, получивший сообщение, не должен попасть в пул ни в одном канале.
+# Запрет повтора действует ПО КАНАЛУ (решение владельца 2026-10-12): человек
+# может иметь только один мессенджер из трёх, поэтому закрываются те каналы,
+# куда уже пытались, а не контакт целиком.
 _touched = repo_contacts.upsert("+79007654321", "Отправленный", "Покупатели")
 check("свежий контакт доступен для рассылки", "+79007654321" in _pool_phones())
 repo_messages.record_send(_touched, "telegram", "текст", "wazz-t11-1")
 repo_messages.record_send(_touched, "waba", "текст", "wazz-t11-2")
-check("получивший в двух каналах не попадает в пул ни в одном",
-      "+79007654321" not in _pool_phones())
+
+check("получивший в 2 каналах из 4 ОСТАЁТСЯ в пуле",
+      "+79007654321" in _pool_phones(),
+      "у него ещё открыты whatsapp и max — иначе теряем живые лиды")
+
+_touched_ch = repo_messages.attempted_channels_by_phone().get(
+    "+79007654321", set())
+check("но закрыты РОВНО те каналы, куда уже писали",
+      _touched_ch == {"telegram", "waba"}, f"got {sorted(_touched_ch)}")
+
 check("он же числится отправленным по любому каналу",
       "+79007654321" in repo_messages.contacted_phones())
 check("в отчётном счётчике он тоже есть",
       "+79007654321" in repo_messages.sent_phones())
+
+# Исчерпан контакт, когда закрыты ВСЕ каналы отправки — только тогда выпадает.
+for _ch11 in ("whatsapp", "max"):
+    repo_messages.record_send(_touched, _ch11, "текст", f"wazz-t11-{_ch11}")
+check("исчерпавший все 4 канала выпадает из пула",
+      "+79007654321" not in _pool_phones())
+
+# Пустой список каналов = исчерпать не по чему. Проверяем явно: иначе
+# предикат с пустым IN() тихо исключил бы весь пул разом.
+_sql11, _params11 = repo_messages.exhausted_channels_predicate([])
+check("пустой список каналов не исчерпывает никого", _sql11 == "0")
+check("и не ломает подстановку параметров", _params11 == ())
 
 # Неудачная попытка отправки НЕ исключает контакт: человек ничего не получил.
 _failed = repo_contacts.upsert("+79007654322", "Только неудача", "Покупатели")

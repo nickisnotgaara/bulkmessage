@@ -278,6 +278,45 @@ def _next_backoff(kind: ErrorKind, current: int) -> int:
     return 0
 
 
+# Кэш «номер → каналы, куда уже пытались». Загружается один раз за процесс:
+# _run_one_contact зовётся на каждый контакт каждого цикла, и перечитывать
+# таблицу целиком каждый раз — это тысячи лишних SELECT за прогон.
+_ATTEMPTED_CHANNELS: Optional[dict[str, set[str]]] = None
+
+
+def _attempted_channels_for(phone: str) -> set[str]:
+    """Каналы, в которые по этому номеру УЖЕ была попытка.
+
+    Правило «написали — навсегда» действует по каналу, а не на контакт
+    (решение владельца 2026-10-12): человек может иметь только один
+    мессенджер из трёх. Закрывается ровно тот канал, куда уже пытались.
+    """
+    global _ATTEMPTED_CHANNELS
+    if _ATTEMPTED_CHANNELS is None:
+        try:
+            _ATTEMPTED_CHANNELS = db.get_attempted_channels()
+        except Exception as e:
+            # Не глотаем: без этого кэша каскад решил бы, что попыток не
+            # было, и пошёл бы слать повторно — а повтор в личный канал это
+            # жалоба и бан номера. Лучше упасть на старте, чем слать.
+            log.error(
+                f"история попыток по каналам не прочитана: {type(e).__name__}: {e}. "
+                f"Прогон остановлен: без неё защита от повторов не работает."
+            )
+            raise
+    return _ATTEMPTED_CHANNELS.get(phone) or set()
+
+
+def _mark_attempted(phone: str, channel: str) -> None:
+    """Отметить канал закрытым в кэше — сразу после успешной отправки.
+
+    Иначе в длинном прогоне кэш устареет: контакт, получивший сообщение в
+    начале прогона, снова стал бы «не получавшим» к следующему циклу.
+    """
+    if _ATTEMPTED_CHANNELS is not None:
+        _ATTEMPTED_CHANNELS.setdefault(phone, set()).add(channel)
+
+
 def _persist_success(phone: str, name: str, category: str, channel: str,
                      text: str, message_id: str, current_state: dict) -> Optional[int]:
     """Атомарная запись успешной отправки: СНАЧАЛА state, ПОТОМ DB.
@@ -290,6 +329,9 @@ def _persist_success(phone: str, name: str, category: str, channel: str,
     следующий запуск re-sent → дубль у получателя (НЕПРИЕМЛЕМО).
     """
     state.increment_channel_sent(current_state, channel)
+    # Кэш защиты от повторов обновляем СРАЗУ: этот канал для этого номера
+    # теперь закрыт, и следующий цикл прогона обязан это видеть.
+    _mark_attempted(phone, channel)
     # Попытка считается по РЕАЛЬНОЙ отправке, а не по проходу цикла фазы.
     # Живой случай 2026-10-09: счётчик стоял в теле цикла, и 400 проходов дали
     # 99 реальных сообщений — SAFETY CAP съел фазы Telegram и MAX целиком, а
@@ -786,6 +828,21 @@ def _run_one_contact(
             f"cascade → {cascade}"
         )
 
+    # Правило «написали — навсегда» действует ПО КАНАЛУ (решение владельца
+    # 2026-10-12). Человек может иметь только один мессенджер из трёх, поэтому
+    # попытка в Telegram НЕ закрывает ему WhatsApp: закрывается ровно тот
+    # канал, куда уже пытались. Повтор в тот же канал недопустим — жалоба в
+    # личном канале означает перманентный бан номера.
+    already = _attempted_channels_for(phone)
+    if already:
+        _closed = [ch for ch in cascade if ch in already]
+        if _closed:
+            log.info(
+                f"SKIP каналов {phone} ({name}) — уже была попытка: {_closed}. "
+                f"Остаются доступными: {[ch for ch in cascade if ch not in already]}"
+            )
+        cascade = [ch for ch in cascade if ch not in already]
+
     # Pre-filter: bad_phones + per-phone cooldown + halted
     cascade = [
         ch for ch in cascade
@@ -796,7 +853,8 @@ def _run_one_contact(
     ]
     if not cascade:
         log.info(
-            f"SKIP {phone} ({name}, {category}) — все каналы в bad_phones/cooldown/halted"
+            f"SKIP {phone} ({name}, {category}) — закрыты все каналы "
+            f"(уже была попытка / bad_phones / cooldown / halted)"
         )
         return False
 
@@ -1967,6 +2025,45 @@ def _collect_fresh_waba_targets(
         f"без WhatsApp {len(waste_phones)} (повторная попытка бессмысленна)"
     )
 
+    # Категории с РАБОЧИМ шаблоном Meta. Считаем один раз, а не на контакт:
+    # pick_waba_template() ходит в БД, а контактов тысячи.
+    # Шаблон может быть невалидным не только «не настроен», но и ОГРАНИЧЕН
+    # Meta (BULK_WABA_RESTRICTED_TEMPLATES) — тогда pick вернёт None.
+    template_ready: set[str] = set()
+    from . import waba_templates  # lazy import, как в _run_one_contact
+    try:
+        for cat in config.ALLOWED_CATEGORIES:
+            if waba_templates.is_valid_template_id(
+                waba_templates.pick_waba_template(cat)
+            ):
+                template_ready.add(cat)
+    except Exception as e:
+        # НЕ глотаем. Раньше здесь стоял except, который превращал в том числе
+        # NameError в пустой template_ready — пул WABA молча схлопывался в
+        # ноль, и прогон выглядел «нормальным», просто без WABA. Ошибка
+        # отбора пула обязана валить прогон, а не тихо уменьшать цель.
+        log.error(
+            f"НЕ УДАЛОСЬ прочитать шаблоны WABA: {type(e).__name__}: {e}. "
+            f"Прогон остановлен: без этого отбора пул WABA был бы неверным."
+        )
+        raise
+    blocked_cats = sorted(config.ALLOWED_CATEGORIES - template_ready)
+    if blocked_cats:
+        log.info(
+            f"Категории без рабочего шаблона Meta исключены из пула WABA: "
+            f"{blocked_cats}. Остальные категории идут в WABA как обычно."
+        )
+    if not template_ready:
+        # Ни одного рабочего шаблона — пул WABA будет пустым. Это не тихий
+        # ноль: preflight выше уже должен был выключить канал. Если канал
+        # всё же включился, значит список категорий пуст (тестовый прогон)
+        # и судить не о чем.
+        log.warning(
+            "Ни один шаблон Meta не читается — пул WABA будет пустым. Если это "
+            "боевой прогон, проверь WABA_TEMPLATE_*_ID в .env.local "
+            "(py main.py preflight)."
+        )
+
     for c in contacts:
         phone = c.get("phone")
         if not phone or phone in queued:
@@ -1990,9 +2087,12 @@ def _collect_fresh_waba_targets(
         if bad_phones.is_bad(phone, "waba"):
             skipped_bad += 1
             continue
-        # Нет одобренного шаблона Meta -> отправка вернёт ошибку шаблона.
+        # Нет одобренного шаблона Meta -> отправка вернёт BUILD_TEMPLATE_ERROR
+        # и зря съест попытку из 250. Проверяем и «нет такого шаблона», и
+        # «шаблон есть, но Meta его ограничила» — обе причины отсекают
+        # контакт одинаково.
         if templates.normalize_category(
-                c.get("category", "")) not in config.ALLOWED_CATEGORIES:
+                c.get("category", "")) not in template_ready:
             skipped_no_template += 1
             continue
         fresh.append(c)
@@ -2764,17 +2864,21 @@ def _personal_candidates(filtered: list) -> list[dict]:
         log.warning(f"кандидаты личных каналов не прочитаны: {e}")
         return []
 
-    sent_phones: set[str] = set()
-    try:
-        sent_phones = set(db.get_sent_phones())
-    except Exception as e:
-        log.warning(f"история отправок для личных кандидатов недоступна: {e}")
+    # Правило «написали — навсегда» действует ПО КАНАЛУ: человека исключаем
+    # из личных кандидатов только если закрыты ОБА личных канала. Написали в
+    # Telegram — MAX для него ещё свободен (у человека может быть только
+    # один мессенджер из двух).
+    personal_channels = {"telegram", "max"}
+    attempted_by_phone = db.get_attempted_channels()
 
     pool_phones = {c.get("phone") for c in filtered if c.get("phone")}
 
     for r in rows:
         phone = r["phone"]
-        if not phone or phone in sent_phones:
+        if not phone:
+            continue
+        closed = attempted_by_phone.get(phone, set())
+        if personal_channels.issubset(closed):
             continue
         item = {
             "contact_id": r["contact_id"],
@@ -3561,10 +3665,17 @@ def run() -> None:
                 len(sms_templates_map),
             )
 
-    # Pre-flight: проверяем что для ВСЕХ категорий есть валидный WABA template UUID.
-    # Если хоть один шаблон невалидный — WABA будет фейлиться с BUILD_TEMPLATE_ERROR
-    # на КАЖДОМ контакте (теряем API quota и время). Поэтому отключаем WABA
-    # динамически на этот запуск и продолжаем через TG/MAX.
+    # Pre-flight: проверяем шаблоны WABA.
+    # Раньше условие было `valid_count < total_count`, то есть ОДИН плохой
+    # шаблон выключал WABA целиком — а это канал, дающий ~100 из ~130
+    # доставленных в сутки. Причина отключения ложная: контакт с плохим
+    # шаблоном и так отсекается по своей категории (см. sender.py:782
+    # «WABA skip: нет template для категории» и отбор пула в
+    # _collect_fresh_waba_targets). Ошибка на одном контакте не
+    # распространяется на остальные.
+    #
+    # Выключаем WABA только когда не работает НИ ОДИН шаблон — тогда фаза
+    # была бы чистым расходом квоты в 250 попыток.
     from . import waba_templates as wabat
     waba_template_status = {}
     for cat in templates_map.keys():
@@ -3575,13 +3686,12 @@ def run() -> None:
         }
     valid_count = sum(1 for s in waba_template_status.values() if s["valid"])
     total_count = len(waba_template_status)
-    if getattr(config, "USE_WABA", 0) and config.USE_WABA >= 1 and valid_count < total_count:
-        bad_cats = [cat for cat, s in waba_template_status.items() if not s["valid"]]
+    if getattr(config, "USE_WABA", 0) and config.USE_WABA >= 1 and total_count and valid_count == 0:
         log.warning(
-            f"WABA TEMPLATES: {valid_count}/{total_count} категорий имеют "
-            f"валидный UUID. Плохие: {bad_cats}. "
+            f"WABA TEMPLATES: 0/{total_count} категорий имеют валидный UUID. "
             f"WABA будет SKIPPED для всех контактов этой сессии (cascade пойдёт "
-            f"через TG/MAX). Это защищает от BUILD_TEMPLATE_ERROR на каждом контакте."
+            f"через TG/MAX). Это защищает от BUILD_TEMPLATE_ERROR на каждом "
+            f"контакте."
         )
         log.warning(
             "Чтобы включить WABA: получи UUID одобренных шаблонов из Meta "
@@ -3590,6 +3700,16 @@ def run() -> None:
         )
         if "waba" in channels:
             channels = [c for c in channels if c != "waba"]
+    elif total_count and valid_count < total_count:
+        bad_cats = [cat for cat, s in waba_template_status.items() if not s["valid"]]
+        log.warning(
+            f"WABA TEMPLATES: {valid_count}/{total_count} категорий имеют "
+            f"валидный UUID. WABA ОСТАЁТСЯ ВКЛЮЧЁННЫМ для {valid_count} "
+            f"категорий. Контакты категорий {bad_cats} будут отсечены на "
+            f"этапе отбора (без шаблона отправка заведомо не пройдёт) и "
+            f"уйдут в pending_sms. Заменить шаблон: Meta Business Manager → "
+            f"WhatsApp → Message Templates → 'API ID'."
+        )
 
     log.info(f"Шаблонов: {list(templates_map.keys())}")
     log.info(f"Активные каналы (через Wazzup): {channels}")

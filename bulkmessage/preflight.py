@@ -335,13 +335,37 @@ def run_preflight() -> int:
     # 5. WABA templates (UUID format required!)
     print("\n── 5. WABA TEMPLATES (4 categories, UUID format) ──")
     templates_by_cat = waba_templates.list_known_templates()
+    ready_cats = []
+    bad_cats = []
     for cat, tid in templates_by_cat.items():
         is_uuid = waba_templates.is_valid_template_id(tid)
-        all_ok &= _check(
-            f"  {cat}",
-            bool(tid) and is_uuid,
+        if tid and is_uuid:
+            ready_cats.append(cat)
+        else:
+            bad_cats.append(cat)
+        print(
+            f"  {'✅' if (tid and is_uuid) else '⚠️ '} {cat}: "
             f"template_id={tid or 'NOT CONFIGURED!'}"
-            + ("" if is_uuid else " ❌ NOT UUID!"),
+            + ("" if is_uuid else " — нет рабочего шаблона Meta")
+        )
+    # Отдельный случай — блокирующий. Часть категорий без шаблона НЕ мешает:
+    # WABA работает по остальным, а контакты этих категорий отсекаются
+    # на этапе отбора (без шаблона отправка заведомо не пройдёт).
+    if ready_cats and bad_cats:
+        print(
+            f"  ℹ️  WABA работает по {len(ready_cats)} из "
+            f"{len(templates_by_cat)} категорий. Без шаблона: {bad_cats} — "
+            f"эти контакты уйдут в pending_sms. Заменить шаблон: Meta "
+            f"Business Manager → WhatsApp → Message Templates → 'API ID'."
+        )
+        all_ok &= _check(
+            "WABA templates (хотя бы один рабочий)", True,
+            f"{len(ready_cats)}/{len(templates_by_cat)} категорий",
+        )
+    else:
+        all_ok &= _check(
+            "WABA templates", bool(ready_cats),
+            f"{len(ready_cats)}/{len(templates_by_cat)} категорий с UUID",
         )
 
     # 6. Database

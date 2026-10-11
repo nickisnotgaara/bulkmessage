@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence
 
 from .. import config
 from . import messages
@@ -89,16 +89,23 @@ def total() -> int:
         return count(conn, "SELECT COUNT(*) FROM contacts")
 
 
-def sendable(limit: Optional[int] = None, *, require_opt_in: Optional[bool] = None) -> list[dict]:
+def sendable(
+    limit: Optional[int] = None,
+    *,
+    require_opt_in: Optional[bool] = None,
+    channels: Optional[Sequence[str]] = None,
+) -> list[dict]:
     """Контакты, годные для боевой рассылки — граница пула.
 
     Исключаются:
 
       * тестовые (``is_test=1``) и не-телефоны (``is_invalid=1``) — их завели
         стенды и тесты, они не должны получать сообщения;
-      * те, кому УЖЕ писали в любом канале — вечный запрет, повторных касаний
-        нет (решение владельца). Критерий живёт в ``store.messages``, здесь
-        подставляется готовый предикат, чтобы правило не расходилось;
+      * те, у кого закрыты ВСЕ каналы отправки. Правило действует ПО КАНАЛУ
+        (решение владельца 2026-10-12): попытка в Telegram не закрывает
+        WhatsApp, потому что человек может иметь только один мессенджер из
+        трёх. Критерий живёт в ``store.messages``, здесь подставляется готовый
+        предикат, чтобы правило не расходилось;
       * без согласия на рассылку (ч.1 ст.18 ФЗ-38). ``denied`` запрещает
         всегда; ``unknown`` разрешает, если не включён opt-in-режим.
 
@@ -106,18 +113,24 @@ def sendable(limit: Optional[int] = None, *, require_opt_in: Optional[bool] = No
     (там ``granted``/``unknown``/``denied``), поэтому функция возвращала ноль
     строк всегда, а тест это пропускал: он проверял исключение ``is_test`` из
     пустого множества.
+
+    ``channels`` — каналы, закрытие которых исчерпывает контакт. По умолчанию
+    все четыре канала Wazzup. Пустой список = контакт не исчерпается никогда.
     """
     if require_opt_in is None:
         require_opt_in = bool(getattr(config, "CONSENT_REQUIRED_FOR_COLD", 0))
     allowed = Consent.sendable_values(require_opt_in)
+    exhausted_sql, exhausted_params = messages.exhausted_channels_predicate(
+        channels or messages.WAZZUP_SEND_CHANNELS
+    )
     sql = (
         "SELECT c.id, c.phone, c.name, c.category FROM contacts c "
         "WHERE COALESCE(c.is_test, 0) = 0 "
         "  AND COALESCE(c.is_invalid, 0) = 0 "
         "  AND c.consent IN (" + ", ".join("?" * len(allowed)) + ") "
-        "  AND NOT " + messages.CONTACTED_PREDICATE
+        "  AND NOT " + exhausted_sql
     )
-    params: tuple = tuple(allowed) + messages.SENT_STATUSES
+    params: tuple = tuple(allowed) + exhausted_params
     if limit:
         sql += " LIMIT ?"
         params = params + (limit,)
@@ -125,26 +138,35 @@ def sendable(limit: Optional[int] = None, *, require_opt_in: Optional[bool] = No
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
-def pool_size(*, require_opt_in: Optional[bool] = None) -> int:
+def pool_size(
+    *,
+    require_opt_in: Optional[bool] = None,
+    channels: Optional[Sequence[str]] = None,
+) -> int:
     """Сколько контактов осталось неотправленных.
 
     Число, ради которого затевался переход с Excel: раньше пул считался как
     «строки файла минус отправленные», и его нельзя было показать одной
     командой. Ноль означает, что рассылка закончится — об этом нужно сказать
     прямо, а не молча уйти в пустой лог.
+
+    Считаются контакты, у которых НЕ закрыты все каналы (см. :func:`sendable`).
     """
     if require_opt_in is None:
         require_opt_in = bool(getattr(config, "CONSENT_REQUIRED_FOR_COLD", 0))
     allowed = Consent.sendable_values(require_opt_in)
+    exhausted_sql, exhausted_params = messages.exhausted_channels_predicate(
+        channels or messages.WAZZUP_SEND_CHANNELS
+    )
     sql = (
         "SELECT COUNT(*) FROM contacts c "
         "WHERE COALESCE(c.is_test, 0) = 0 "
         "  AND COALESCE(c.is_invalid, 0) = 0 "
         "  AND c.consent IN (" + ", ".join("?" * len(allowed)) + ") "
-        "  AND NOT " + messages.CONTACTED_PREDICATE
+        "  AND NOT " + exhausted_sql
     )
     with read_only() as conn:
-        return count(conn, sql, tuple(allowed) + messages.SENT_STATUSES)
+        return count(conn, sql, tuple(allowed) + exhausted_params)
 
 
 def mark_flags(
