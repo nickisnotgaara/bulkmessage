@@ -2889,7 +2889,12 @@ finally:
 # ---------------------------------------------------------------------------
 section("S. ДЛИННЫЙ ПРОГОН (--run-hours)")
 check("config.RUN_HOURS существует", hasattr(config, "RUN_HOURS"))
-check("RUN_HOURS выключен по умолчанию", float(config.RUN_HOURS) == 0.0,
+# Живой случай 2026-10-13: прогон без --run-hours отработал ОДИН круг за
+# 19 минут и вышел (68 отправок при лимите 250). Ноль по умолчанию сделал
+# «прогон недоделан» нормой, поэтому дефолт теперь 10 часов, а однократный
+# проход остаётся ЯВНЫМ выбором.
+check("RUN_HOURS по умолчанию НЕ ноль (иначе прогон выходит за 19 минут)",
+      float(config.RUN_HOURS) > 0.0,
       f"got {config.RUN_HOURS}")
 check("config.RUN_LOOP_PAUSE_MINUTES существует",
       hasattr(config, "RUN_LOOP_PAUSE_MINUTES"))
@@ -3384,8 +3389,13 @@ try:
     check("сторож молчания вызван ПОСЛЕ паузы WABA",
           _w_swept_calls and _w_swept_calls[-1] == 12,
           f"таймауты сторожа: {_w_swept_calls}")
-    check("сторож вызван на каждой границе фаз (разведка → WABA → добор)",
-          len(_w_swept_calls) == 3, f"вызовов {_w_swept_calls}")
+    check("сторож вызван на границе каждой ОТПРАВЛЯЮЩЕЙ фазы "
+          "(WABA → добор личных)",
+          len(_w_swept_calls) == 2, f"вызовов {_w_swept_calls}")
+    # Фаза «probe» отправок не делает — она выясняет, у кого есть аккаунт.
+    # Сторож после неё не нужен: он ловит молчание ПОСЛЕ отправки, которой
+    # в этой фазе не было. Раньше первой шла «personal» — она отправляла
+    # откаты, поэтому сторож был оправдан. Теперь первой идёт разведка.
     check("фаза отката непуста: rescue наполнен тишиной",
           len(_w_rescued) == 4, f"в rescue {_w_rescued}")
     check("после WABA личных отправок нет (проба заглушена в тестах)",
@@ -5994,17 +6004,29 @@ check("в 10-часовом окне личных влезает ~33, а не л
       f"{min(_fit_u)}–{max(_fit_u)} слотов за 10 ч")
 
 # --- U5: приоритет каналов на контакт -------------------------------------
-check("порядок фаз: MAX приоритетнее Telegram и WABA",
-      list(config.PHASE_ORDER).index("max")
+# Живой случай 2026-10-13: при порядке max,telegram,waba прогон стартовал
+# в 10:00 и за 19 минут отправил 68 сообщектолько в WABA (37 доставок),
+# ноль в Telegram и MAX при лимите 250. Причина: фазы MAX/TG берут ТОЛЬКО
+# откаты из rescue_queue, а на холодном старте очередь пуста — WABA ещё не
+# отработал и не провалился. Единственный источник откатов до WABA —
+# прошлая фаза отката, то есть личные каналы брали пустой пул и стояли
+# вхолостую, пока весь объём уходил в WABA.
+# Теперь WABA идёт ПЕРВЫМ: у него собственный свежий пул, и он даёт основной
+# объём. Личные каналы добирают остаток как откат — их потолки (50/10) и
+# пауза 15 минут всё равно не позволяют им дать основной объём.
+check("порядок фаз: WABA первым, MAX последним "
+      "(живой случай 2026-10-13: max,telegram,waba дал 0 личных отправок)",
+      list(config.PHASE_ORDER).index("waba")
       < list(config.PHASE_ORDER).index("telegram")
-      < list(config.PHASE_ORDER).index("waba"),
+      < list(config.PHASE_ORDER).index("max"),
       str(config.PHASE_ORDER))
 # Живой случай 2026-10-10: MAX ушёл в state='qr' (слетела сессия), владелец
 # получил разбан. Причина — MAX стоял ПЕРВЫМ в разведке при потолке 400 проб
 # за прогон, а MAX считает проверку номера отдельной активностью
 # (1–10/день safe, 20/день потолок, массовые запросы → бан).
-# Теперь первым идёт Telegram (отдельного лимита на проверку нет), а MAX —
-# последним и с жёстким суточным потолком.
+# Проба по-прежнему идёт в Telegram первым (отдельного лимита на проверку нет),
+# а MAX — последним и с жёстким суточным потолком. Порядок ПРОБЫ не связан с
+# порядком ФАЗ отправки: разведка проверяет наличие аккаунта, фазы шлют.
 check("проба идёт в Telegram первым, MAX — последним",
       list(config.PROBE_CHANNELS)[0] == "telegram"
       and list(config.PROBE_CHANNELS)[-1] == "max",
@@ -6313,22 +6335,48 @@ section("V. ДОСТАВКА ВМЕСТО ПОПЫТОК")
 from bulkmessage import probe as _probe_v  # noqa: E402
 from bulkmessage import waba_templates  # noqa: E402
 
-# --- V1: личные каналы идут ДО WABA --------------------------------------
-# Раньше порядок был waba → personal, и WABA забирал контактов раньше, чем их
-# успевали проверить личные каналы. Отсюда 20 BAD_CONTACT и пустые лимиты
-# 20 MAX / 50 Telegram.
-_runs_v = sender._build_exec_order(["max", "telegram", "waba"])
-check("личные каналы идут до WABA (иначе квота WhatsApp тратится впустую)",
-      _runs_v.index("personal") < _runs_v.index("waba"), f"порядок {_runs_v}")
+# --- V1: порядок фаз исполнения ---------------------------------------------
+# ИСТОРИЯ ТЕСТА, дважды закреплявшего неверное поведение:
+#   * 09.10 был порядок waba → personal, и WABA забирал контактов раньше, чем
+#     их успевали проверить личные каналы (20 BAD_CONTACT, пустые лимиты);
+#   * после инверсии стало max,telegram,waba, и личные фазы шли ПЕРВЫМИ.
+#
+# Вторая инверсия дала свой живой случай 2026-10-13: прогон стартовал в 10:00
+# и за 19 минут отправил 68 сообщений ТОЛЬКО в WABA — ноль в Telegram и MAX
+# при лимите 250. Причина в том, что фаза personal берёт ТОЛЬКО откаты из
+# rescue_queue, а на холодном старте очередь пуста (WABA ещё не отработал).
+# Первая фаза брала пустой пул, стояла вхолостую, а весь объём уходил в WABA.
+#
+# ТЕПЕРЬ: разведка PROBE → WABA → добор личных слотов. Разведка даёт
+# вердикты, WABA берёт свежие контакты (у него свой пул), личные добирают
+# отказы — и очередь к этому моменту уже непустая.
+check("разведка идёт ПЕРВОЙ (иначе личные берут пустой пул откатов)",
+      sender._build_exec_order(["waba", "telegram", "max"])[0] == "probe",
+      str(sender._build_exec_order(["waba", "telegram", "max"])))
+check("WABA идёт до добора личных слотов",
+      sender._build_exec_order(["waba", "telegram", "max"]).index("waba")
+      < sender._build_exec_order(["waba", "telegram", "max"]).index("personal"),
+      str(sender._build_exec_order(["waba", "telegram", "max"])))
 check("после WABA идёт добор личных слотов",
-      _runs_v[-1] == "personal", f"порядок {_runs_v}")
+      sender._build_exec_order(["waba", "telegram", "max"])[-1] == "personal",
+      str(sender._build_exec_order(["waba", "telegram", "max"])))
 check("отдельных фаз max/telegram в порядке нет",
-      "max" not in _runs_v and "telegram" not in _runs_v, f"порядок {_runs_v}")
-check("порядок max+waba тоже даёт добор после WABA",
-      sender._build_exec_order(["max", "waba"]) == ["personal", "waba", "personal"],
+      "max" not in sender._build_exec_order(["waba", "telegram", "max"])
+      and "telegram" not in sender._build_exec_order(["waba", "telegram", "max"]),
+      str(sender._build_exec_order(["waba", "telegram", "max"])))
+# Старый порядок max,telegram,waba остаётся рабочим: разведка → WABA → добор.
+# Совместимость сохранена, чтобы .env.local у людей не ломал прогон.
+check("старый порядок max,telegram,waba тоже даёт разведку → WABA → добор",
+      sender._build_exec_order(["max", "telegram", "waba"])
+      == ["probe", "waba", "personal"],
+      str(sender._build_exec_order(["max", "telegram", "waba"])))
+check("порядок max+waba даёт добор после WABA",
+      sender._build_exec_order(["max", "waba"])[-1] == "personal",
       str(sender._build_exec_order(["max", "waba"])))
+# Без личных каналов разведка бессмысленна — вердикты некому применять.
 check("порядок без личных каналов не трогаем",
-      sender._build_exec_order(["waba"]) == ["waba"])
+      sender._build_exec_order(["waba"]) == ["probe", "waba"],
+      str(sender._build_exec_order(["waba"])))
 
 # --- V2: метрика доставки считает по подтверждениям, а не по 201 ----------
 _pend = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
