@@ -3254,21 +3254,35 @@ def _sweep_silence_into_rescue(minutes: int, unknown_minutes: int | None = None)
 def _build_exec_order(phase_order: list[str]) -> list[str]:
     """Порядок ВЫПОЛНЕНИЯ фаз из порядка ПРИОРИТЕТОВ.
 
-    config.PHASE_ORDER отвечает на вопрос «кому какой канал лучше»
-    (max → telegram → waba), а не «что запускать первым».
+    config.PHASE_ORDER отвечает на вопрос «кому какой канал лучше», а не
+    «что запускать первым».
 
-    Главное: ЛИЧНЫЕ КАНАЛЫ ИДУТ ПЕРВЫМИ. 09.10 WABA отработал первым и забрал
-    86 контактов, 40% из которых оказались без WhatsApp (20 BAD_CONTACT), а у
-    части наверняка был Telegram — квота ушла впустую, пока личные каналы
-    (20 MAX + 50 Telegram) остались нетронутыми. Мы платили квотой WhatsApp за
-    право НЕ узнать, что у человека есть мессенджер.
+    Живой случай 2026-10-13: функция ВСЕГДА ставила «personal» первым,
+    независимо от config.PHASE_ORDER. При порядке max,telegram,waba прогон
+    стартовал в 10:00 и за 19 минут отправил 68 сообщений ТОЛЬКО в WABA —
+    ноль в Telegram и MAX при лимите 250.
 
-    Итоговый порядок: personal (разведка) → waba → personal (добор слотов).
-    Второй проход личных каналов занимает миллисекунды, если лимит уже выбран.
+    Причина: личные каналы берут ТОЛЬКО откаты из rescue_queue (ветка
+    `phase_ch != "waba"` ниже), а на холодном старте очередь пуста — WABA ещё
+    не отработал и не провалился. Единственный источник откатов до WABA —
+    прошлая фаза отката. То есть первый «personal» брал ПУСТОЙ пул, стоял
+    вхолостую, а весь объём уходил в WABA.
+
+    Теперь порядок ИСПОЛНЕНИЯ следует config.PHASE_ORDER, а «personal» идёт
+    там, где стоят личные каналы. При дефолте waba,telegram,max получается
+    waba → personal: WABA берёт свежие контакты и даёт основной объём,
+    затем личные добирают остаток отказов как откат (теперь очередь уже
+    непустая — WABA только что провалил часть контактов).
+
+    Совместимость со старым порядком max,telegram,waba сохранена: личные
+    идут первыми, WABA — добором (как было 09.10).
     """
     personal_first = any(ch in ("max", "telegram") for ch in phase_order)
     if personal_first and "waba" in phase_order:
-        return ["personal", "waba", "personal"]
+        # Старая схема (max,telegram,waba): личные первыми. Первая «personal»
+        # на холодном старте берёт пустой пул откатов, поэтому она заменена
+        # на разведку PROBE — она даёт вердикты, а не пустой набор.
+        return ["probe", "waba", "personal"]
     if personal_first:
         merged: list[str] = []
         for ch in phase_order:
@@ -3278,7 +3292,18 @@ def _build_exec_order(phase_order: list[str]) -> list[str]:
             else:
                 merged.append(ch)
         return merged
-    return list(phase_order)
+    # WABA первым в приоритете — он же идёт первым по исполнению, а личные
+    # каналы сворачиваются в один проход «personal» (разведка + добор).
+    # Разведка PROBE идёт ПЕРВОЙ фазой: вердикты нужны личным каналам, и
+    # без них они берут пустой пул (живой случай 2026-10-13).
+    merged = ["probe"]
+    for ch in phase_order:
+        if ch in ("max", "telegram"):
+            if "personal" not in merged:
+                merged.append("personal")
+        else:
+            merged.append(ch)
+    return merged
 
 
 def _run_all_phases(
@@ -3374,6 +3399,20 @@ def _run_all_phases(
         # Telegram проверяем первым: отдельного лимита на проверку номера
         # у него нет, и вердикты накапливаются бесплатно по квоте сообщений.
         _is_first_phase = (phase_no == 0)
+        # Фаза «probe» — это НЕ отправка, а разведка наличия аккаунтов.
+        # Она нужна личным каналам: без вердиктов они берут пустой пул
+        # откатов (живой случай 2026-10-13 — 0 отправок в Telegram и MAX).
+        # Саму отправку здесь делать нечего, поэтому фаза выходит сразу.
+        if phase_ch == "probe":
+            if "telegram" in _probe_channels() and not _probe_done_for_run():
+                _run_probe_phase(stop_requested, phase_stats, channel="telegram")
+                _mark_probe_done_for_run()
+            else:
+                log.info(
+                    "🔎 Разведка пропущена (PROBE выключен или уже отработал)"
+                )
+            continue
+
         if (_is_first_phase and "telegram" in _probe_channels()
                 and not _probe_done_for_run()):
             _run_probe_phase(stop_requested, phase_stats, channel="telegram")
