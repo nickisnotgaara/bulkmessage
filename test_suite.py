@@ -6443,8 +6443,15 @@ with patch.object(config, "WABA_RESTRICTED_TEMPLATES", set()):
     check("без списка ограничений всё пропускается",
           waba_templates._unless_restricted("Агенты", _restricted_uuid)
           == _restricted_uuid)
-check("ограничение ловится независимо от регистра UUID",
-      waba_templates._unless_restricted("Агенты", _restricted_uuid.upper()) is None)
+# Проверка регистронезависимости идёт ТОЖЕ под явным patch: раньше она
+# полагалась на реальное содержимое .env.local, где UUID 2dc406ba был
+# прописан в списке ограниченных. 13.10 владелец показал статус шаблона
+# «Активный» — Meta его не отклоняла, UUID убран из списка, и проверка
+# падала не из-за бага, а из-за изменившегося окружения.
+with patch.object(config, "WABA_RESTRICTED_TEMPLATES", {_restricted_uuid}):
+    check("ограничение ловится независимо от регистра UUID",
+          waba_templates._unless_restricted("Агенты", _restricted_uuid.upper())
+          is None)
 
 # --- V5: прозрачность личных каналов ------------------------------------
 _rec_src = _insp15.getsource(_probe_v.record_probe_result)
